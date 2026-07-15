@@ -19,6 +19,17 @@ pub struct LoadResult {
     /// path, since a corrupt ledger can never satisfy the fast-path
     /// equality checks.
     pub corrupt: bool,
+    /// Whether the file exists but could not be read for a reason other
+    /// than "not found" (permissions, EIO, path is a directory, ...). The
+    /// returned `registry` is an empty placeholder, not a faithful read of
+    /// whatever is actually on disk. Callers that are about to overwrite
+    /// the ledger (the sync/prune slow paths, under the lock) must treat
+    /// this as fatal and abort *without* saving -- saving would silently
+    /// clobber a ledger that may well still be intact. This is distinct
+    /// from `corrupt`: a corrupt (unparseable) file has already been moved
+    /// aside by this call, so it is safe to proceed with the empty
+    /// registry in that case.
+    pub read_error: bool,
 }
 
 /// Loads the registry at `path`.
@@ -48,6 +59,7 @@ pub fn load(path: &Path) -> LoadResult {
             return LoadResult {
                 registry: Registry::empty(Config::default().range),
                 corrupt: false,
+                read_error: false,
             };
         }
         Err(err) => {
@@ -58,6 +70,7 @@ pub fn load(path: &Path) -> LoadResult {
             return LoadResult {
                 registry: Registry::empty(Config::default().range),
                 corrupt: false,
+                read_error: true,
             };
         }
     };
@@ -66,6 +79,7 @@ pub fn load(path: &Path) -> LoadResult {
         Ok(registry) => LoadResult {
             registry,
             corrupt: false,
+            read_error: false,
         },
         Err(parse_err) => {
             let corrupt_path = corrupt_sibling_path(path);
@@ -83,6 +97,7 @@ pub fn load(path: &Path) -> LoadResult {
             LoadResult {
                 registry: Registry::empty(Config::default().range),
                 corrupt: true,
+                read_error: false,
             }
         }
     }
@@ -164,6 +179,7 @@ mod tests {
         let result = load(&path);
 
         assert!(!result.corrupt);
+        assert!(!result.read_error);
         assert!(result.registry.projects.is_empty());
         assert!(result.registry.reservations.is_empty());
     }
@@ -179,6 +195,10 @@ mod tests {
         let result = load(&path);
 
         assert!(!result.corrupt);
+        assert!(
+            result.read_error,
+            "a non-NotFound read failure must be reported so callers can abort instead of saving"
+        );
         assert!(result.registry.projects.is_empty());
         // Unlike the corrupt-JSON path, a read error must not rename or
         // remove anything: the ledger may still be intact on disk.
@@ -200,6 +220,7 @@ mod tests {
         let result = load(&path);
 
         assert!(result.corrupt);
+        assert!(!result.read_error);
         assert!(result.registry.projects.is_empty());
         assert!(
             !path.exists(),
@@ -225,6 +246,7 @@ mod tests {
         let result = load(&path);
 
         assert!(!result.corrupt);
+        assert!(!result.read_error);
         assert_eq!(result.registry, registry);
     }
 

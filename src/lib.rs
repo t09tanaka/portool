@@ -5,6 +5,7 @@
 //! in later modules layered on top.
 
 pub mod alloc;
+pub mod cmd;
 pub mod config;
 pub mod envfile;
 pub mod error;

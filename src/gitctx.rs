@@ -61,18 +61,28 @@ impl GitCtx {
     /// has since vanished is reported with its raw (un-canonicalized) path
     /// instead of being dropped.
     pub fn worktree_list(&self) -> Result<Vec<PathBuf>> {
-        let output = run_git(&self.worktree_root, &["worktree", "list", "--porcelain"])
-            .ok_or_else(|| Error::General("failed to run 'git worktree list'".to_string()))?;
-
-        let mut paths = Vec::new();
-        for line in output.lines() {
-            if let Some(raw) = line.strip_prefix("worktree ") {
-                let path = PathBuf::from(raw);
-                paths.push(std::fs::canonicalize(&path).unwrap_or(path));
-            }
-        }
-        Ok(paths)
+        worktree_list_at(&self.worktree_root)
     }
+}
+
+/// Lists every worktree belonging to the project reachable from `dir`, by
+/// running `git worktree list --porcelain` with `dir` as the working
+/// directory (spec §6.1). `dir` may be a worktree root, or the project's
+/// git-common-dir itself (git supports being pointed directly at a gitdir)
+/// -- this is what lets [`crate::cmd::prune`] enumerate a project's
+/// worktrees without a live worktree root to run `git` from.
+pub fn worktree_list_at(dir: &Path) -> Result<Vec<PathBuf>> {
+    let output = run_git(dir, &["worktree", "list", "--porcelain"])
+        .ok_or_else(|| Error::General("failed to run 'git worktree list'".to_string()))?;
+
+    let mut paths = Vec::new();
+    for line in output.lines() {
+        if let Some(raw) = line.strip_prefix("worktree ") {
+            let path = PathBuf::from(raw);
+            paths.push(std::fs::canonicalize(&path).unwrap_or(path));
+        }
+    }
+    Ok(paths)
 }
 
 /// Runs `git -C <cwd> <args>`, returning stdout as a `String` on success
@@ -230,6 +240,19 @@ mod tests {
         let ctx = GitCtx::discover(&repo).unwrap();
 
         assert_eq!(ctx.branch, None);
+    }
+
+    #[test]
+    fn worktree_list_at_accepts_the_common_dir_itself() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+
+        let ctx = GitCtx::discover(&repo).unwrap();
+        let list = worktree_list_at(&ctx.common_dir).unwrap();
+
+        assert_eq!(list, vec![std::fs::canonicalize(&repo).unwrap()]);
     }
 
     #[test]

@@ -1,9 +1,8 @@
-//! `portool` CLI entry point.
-//!
-//! This currently defines only the `clap` command surface; all handlers
-//! are placeholders replaced by the command implementations (Task 3).
+//! `portool` CLI entry point: `clap` parsing, dispatch to [`portool::cmd`],
+//! and exit-code mapping only.
 
 use clap::{Parser, Subcommand};
+use portool::cmd;
 use std::process::exit;
 
 #[derive(Parser)]
@@ -57,29 +56,18 @@ enum Command {
 fn main() {
     let cli = Cli::parse();
 
-    match cli.command {
+    let result = match cli.command {
         Command::Init {
             hook_only,
             gitignore_only,
-        } => {
-            let _ = (hook_only, gitignore_only);
-            eprintln!("not implemented");
-            exit(1);
-        }
-        Command::Sync { quiet } => {
-            let _ = quiet;
-            eprintln!("not implemented");
-            exit(1);
-        }
-        Command::Ls { json, all } => {
-            let _ = (json, all);
-            eprintln!("not implemented");
-            exit(1);
-        }
-        Command::Prune { all, dry_run } => {
-            let _ = (all, dry_run);
-            eprintln!("not implemented");
-            exit(1);
-        }
+        } => cmd::init::run(hook_only, gitignore_only),
+        Command::Sync { quiet } => cmd::sync::run(quiet),
+        Command::Ls { json, all } => cmd::ls::run(json, all),
+        Command::Prune { all, dry_run } => cmd::prune::run(all, dry_run),
+    };
+
+    if let Err(err) = result {
+        eprintln!("portool: error: {err}");
+        exit(err.exit_code());
     }
 }
