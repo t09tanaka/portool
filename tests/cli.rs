@@ -78,6 +78,13 @@ impl TestEnv {
         self.state.join("portool").join("registry.json")
     }
 
+    /// Writes `config.toml` into this test's isolated `XDG_CONFIG_HOME`.
+    fn write_config(&self, contents: &str) {
+        let dir = self.config.join("portool");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("config.toml"), contents).unwrap();
+    }
+
     fn registry(&self) -> serde_json::Value {
         let contents = fs::read_to_string(self.registry_path()).expect("registry.json missing");
         serde_json::from_str(&contents).expect("registry.json is not valid JSON")
@@ -602,4 +609,70 @@ fn detached_head_records_a_null_branch() {
     let branch =
         &registry["projects"][common_dir_key(&repo)]["worktrees"][worktree_key(&repo)]["branch"];
     assert!(branch.is_null());
+}
+
+// --- 12. hook-missing hint: exact stderr wording (frozen decision 10) -----
+
+#[test]
+fn sync_without_installed_hook_prints_the_exact_hint_line() {
+    let env = TestEnv::new();
+    let repo = env.path("repo");
+    init_repo(&repo);
+
+    // No `portool init` has been run, so the post-checkout hook is not
+    // installed and sync must warn on stderr with this exact line (no
+    // `portool: ` prefix -- that prefix is reserved for `error:`).
+    let output = env.run(&repo, &["sync"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr,
+        "hint: run 'portool init' to install the post-checkout hook\n"
+    );
+}
+
+// --- 13. exit code 2: no subrange could ever fit even one block -----------
+
+#[test]
+fn sync_exits_2_when_block_size_exceeds_subrange_size() {
+    let env = TestEnv::new();
+    // No manifest -> default block size == block_align == 5, which exceeds
+    // the configured subrange_size of 3: no subrange, however many are
+    // acquired, could ever hold one block (frozen decision 4).
+    env.write_config("range = [3000, 3009]\nsubrange_size = 3\nblock_align = 5\n");
+    let repo = env.path("repo");
+    init_repo(&repo);
+
+    let output = env.run(&repo, &["sync"]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// --- 14. exit code 3: the pool has no room for even one subrange ----------
+
+#[test]
+fn sync_exits_3_when_pool_has_no_room_for_a_subrange() {
+    let env = TestEnv::new();
+    // The pool is only 10 ports wide, far narrower than the requested
+    // subrange_size of 500: the very first subrange acquisition fails.
+    env.write_config("range = [3000, 3009]\nsubrange_size = 500\n");
+    let repo = env.path("repo");
+    init_repo(&repo);
+
+    let output = env.run(&repo, &["sync"]);
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

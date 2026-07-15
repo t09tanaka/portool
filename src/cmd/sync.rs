@@ -315,7 +315,7 @@ fn warn_if_hook_missing(common_dir: &Path) {
         .map(|content| content.contains("portool sync"))
         .unwrap_or(false);
     if !installed {
-        eprintln!("portool: hint: run 'portool init' to install the post-checkout hook");
+        eprintln!("hint: run 'portool init' to install the post-checkout hook");
     }
 }
 
