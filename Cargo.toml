@@ -8,6 +8,7 @@ repository = "https://github.com/t09tanaka/portool"
 readme = "README.md"
 keywords = ["git", "worktree", "port", "ports", "dev-tools"]
 categories = ["command-line-utilities", "development-tools"]
+include = ["src/**/*", "README.md", "LICENSE"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
