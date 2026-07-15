@@ -80,6 +80,31 @@ impl Config {
             gc_days,
         })
     }
+
+    /// Loads the global config from [`crate::paths::config_path`].
+    ///
+    /// If the file doesn't exist, returns [`Config::default`]. If it exists
+    /// but fails to parse, a warning is printed to stderr and
+    /// [`Config::default`] is returned so a malformed config file never
+    /// blocks the tool.
+    pub fn load() -> Config {
+        let path = crate::paths::config_path();
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(_) => return Config::default(),
+        };
+
+        match Config::from_toml_str(&contents) {
+            Ok(cfg) => cfg,
+            Err(err) => {
+                eprintln!(
+                    "portool: warning: failed to parse {}: {err}; using defaults",
+                    path.display()
+                );
+                Config::default()
+            }
+        }
+    }
 }
 
 #[cfg(test)]
