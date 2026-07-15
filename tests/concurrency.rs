@@ -197,6 +197,11 @@ fn run_eight_concurrent_syncs() {
         );
     }
 
+    // Which exact block each worktree lands on also depends on real
+    // 127.0.0.1 TCP bind checks (spec §6.3) against whatever ports happen
+    // to be free on the machine at run time, so specific slot values are
+    // not asserted here -- only non-overlap and completeness, which hold
+    // regardless of which free slots were picked.
     let mut blocks: Vec<(u64, u64)> = worktrees_obj
         .values()
         .map(|w| {

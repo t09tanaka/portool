@@ -676,3 +676,91 @@ fn sync_exits_3_when_pool_has_no_room_for_a_subrange() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+// --- 15. prune --all reclaims a fully-deleted project's entry + subranges -
+
+#[test]
+fn prune_all_reclaims_a_fully_deleted_project_and_leaves_others_untouched() {
+    let env = TestEnv::new();
+
+    let repo_a = env.path("repo-a");
+    init_repo(&repo_a);
+    assert!(env.run(&repo_a, &["sync"]).status.success());
+
+    let repo_b = env.path("repo-b");
+    init_repo(&repo_b);
+    assert!(env.run(&repo_b, &["sync"]).status.success());
+
+    // Keys must be captured before the directory is deleted below --
+    // canonicalize needs the path to still exist.
+    let repo_a_key = common_dir_key(&repo_a);
+    let repo_b_key = common_dir_key(&repo_b);
+
+    // Simulate the whole repo-a repository being deleted (not just a
+    // worktree within it), which is what makes `prune --all`'s
+    // project-entry-removal branch (as opposed to its per-worktree branch)
+    // fire.
+    fs::remove_dir_all(&repo_a).unwrap();
+
+    // `prune --all` must work from outside any git repository.
+    let outside = env.path("outside");
+    fs::create_dir_all(&outside).unwrap();
+
+    // --dry-run reports the dead project but must not touch the ledger.
+    let output = env.run(&outside, &["prune", "--all", "--dry-run"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!("would prune project repo-a ({repo_a_key})")),
+        "stdout was: {stdout}"
+    );
+
+    let registry = env.registry();
+    assert!(
+        registry["projects"].get(&repo_a_key).is_some(),
+        "--dry-run must not remove the dead project entry"
+    );
+    assert!(
+        registry["projects"].get(&repo_b_key).is_some(),
+        "--dry-run must not touch the surviving project either"
+    );
+
+    // A real `prune --all` removes the dead project entry -- and with it
+    // its subranges -- while leaving the surviving repo's entries alone.
+    let output = env.run(&outside, &["prune", "--all"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!("pruned project repo-a ({repo_a_key})")),
+        "stdout was: {stdout}"
+    );
+
+    let registry = env.registry();
+    assert!(
+        registry["projects"].get(&repo_a_key).is_none(),
+        "the dead project entry (and its subranges) must be gone"
+    );
+
+    let repo_b_project = &registry["projects"][&repo_b_key];
+    assert!(
+        repo_b_project["worktrees"]
+            .get(worktree_key(&repo_b))
+            .is_some(),
+        "the surviving project's worktree entry must be untouched"
+    );
+    // repo-b synced second, so its subrange is the pool's second slot
+    // (3000-3499 was already claimed by repo-a).
+    assert_eq!(
+        repo_b_project["subranges"],
+        serde_json::json!([[3500, 3999]]),
+        "the surviving project's subranges must be untouched"
+    );
+}
