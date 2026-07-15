@@ -23,8 +23,9 @@ breaks:
   work — the right ports show up on their own.
 
 `portool` does exactly one job. It does not manage processes, proxy
-requests, or template your `.env` files — see the [spec's non-goals
-section](docs/spec-v0.1.md#1-設計憲法) for the full list if you're curious.
+requests, or template your `.env` files, and it doesn't provide `pin`/
+`unpin` commands yet even though the ledger schema already has room for
+pinned entries.
 
 ## Install
 
