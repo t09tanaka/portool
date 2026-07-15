@@ -24,7 +24,8 @@ pub fn run(json: bool, all: bool) -> Result<()> {
         ctx_result?;
     }
 
-    let registry = store::load(&paths::registry_path()).registry;
+    // Read-only command: never heal (rename aside) a corrupt ledger here.
+    let registry = store::load(&paths::registry_path(), false).registry;
 
     let filtered: BTreeMap<String, ProjectEntry> = if all {
         registry.projects.clone()

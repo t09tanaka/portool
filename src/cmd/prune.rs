@@ -21,7 +21,8 @@ pub fn run(all: bool, dry_run: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
 
     if dry_run {
-        let mut registry = load_registry_or_abort()?;
+        // Read-only, lock-free: never heal a corrupt ledger here.
+        let mut registry = load_registry_or_abort(false)?;
         if all {
             prune_all(&mut registry, true);
         } else {
@@ -32,7 +33,8 @@ pub fn run(all: bool, dry_run: bool) -> Result<()> {
     }
 
     let _lock = lock::acquire(&paths::lock_path(), LOCK_TIMEOUT)?;
-    let mut registry = load_registry_or_abort()?;
+    // Under the flock: safe to heal (rename aside) a corrupt ledger.
+    let mut registry = load_registry_or_abort(true)?;
 
     let changed = if all {
         prune_all(&mut registry, false)
@@ -51,8 +53,8 @@ pub fn run(all: bool, dry_run: bool) -> Result<()> {
 /// than proceed to (dry-run or real) reclamation against a placeholder
 /// empty registry, which for the real run would then overwrite a ledger
 /// that may still be intact on disk.
-fn load_registry_or_abort() -> Result<Registry> {
-    let load_result = store::load(&paths::registry_path());
+fn load_registry_or_abort(heal: bool) -> Result<Registry> {
+    let load_result = store::load(&paths::registry_path(), heal);
     if load_result.read_error {
         return Err(Error::General(
             "failed to read the ledger; aborting without writing to avoid clobbering an intact ledger".to_string(),

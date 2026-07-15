@@ -41,7 +41,14 @@ pub fn find_free_subrange(
     let mut candidate_start = pool_start;
     for (s, e) in occ {
         if candidate_start + size - 1 < s {
-            return Some((candidate_start as u16, (candidate_start + size - 1) as u16));
+            // `candidate_start` only ever grows across iterations, so once
+            // it overshoots the pool here it can never shrink back into
+            // bounds on a later iteration either.
+            return if candidate_start + size - 1 <= pool_end {
+                Some((candidate_start as u16, (candidate_start + size - 1) as u16))
+            } else {
+                None
+            };
         }
         if e >= candidate_start {
             candidate_start = e + 1;
@@ -147,6 +154,19 @@ mod tests {
     fn find_free_subrange_returns_none_when_pool_exhausted() {
         let occupied = [(3000, 3999)];
         let found = find_free_subrange((3000, 3999), &occupied, 500);
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn find_free_subrange_none_when_only_gap_overshoots_a_shrunk_pool() {
+        // Reproduces a bug where the in-loop early return lacked the
+        // `<= pool_end` bound the post-loop return has: the gap before the
+        // sole occupied range (which itself lies entirely outside this
+        // shrunk pool) is wide enough for `size`, but only by extending
+        // past `pool_end`, so no subrange should be returned. This is
+        // reachable when the pool is shrunk in config while an old
+        // allocation above the new pool end is still respected (spec §12).
+        let found = find_free_subrange((3000, 3400), &[(5000, 5499)], 500);
         assert_eq!(found, None);
     }
 

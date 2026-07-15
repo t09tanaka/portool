@@ -1,7 +1,7 @@
 //! Thin `git` command-line wrapper: project/worktree identity discovery
 //! and `git worktree list` parsing (spec §6.1). The only external
-//! processes this crate spawns are `git rev-parse` and
-//! `git worktree list --porcelain`.
+//! processes this crate spawns are `git rev-parse`, `git symbolic-ref
+//! --short -q HEAD`, and `git worktree list --porcelain`.
 
 use crate::error::{Error, Result};
 use std::path::{Path, PathBuf};

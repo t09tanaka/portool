@@ -71,7 +71,8 @@ fn load_manifest_state(worktree_root: &Path) -> Result<ManifestState> {
 /// worktree's ledger entry, manifest hash, and `.env.portool` bytes all
 /// already match -- in which case sync is a complete no-op.
 fn try_fast_path(ctx: &GitCtx) -> Result<bool> {
-    let load_result = store::load(&paths::registry_path());
+    // Read-only, lock-free: never heal a corrupt ledger here (finding 3).
+    let load_result = store::load(&paths::registry_path(), false);
     if load_result.corrupt || load_result.read_error {
         return Ok(false);
     }
@@ -109,7 +110,8 @@ fn slow_path(ctx: &GitCtx, quiet: bool) -> Result<()> {
 
     let registry_path = paths::registry_path();
     let existed_before = registry_path.exists();
-    let load_result = store::load(&registry_path);
+    // Under the flock: safe to heal (rename aside) a corrupt ledger.
+    let load_result = store::load(&registry_path, true);
     if load_result.read_error {
         return Err(Error::General(format!(
             "failed to read {}; aborting without writing to avoid clobbering an intact ledger",
@@ -276,7 +278,10 @@ fn allocate_or_reuse_block(
         .find_project(common_dir_key)
         .map(|p| p.subranges.clone())
         .unwrap_or_default();
+    // Spec §6.2: a newly acquired subrange must avoid both existing
+    // subranges and reservations.
     let mut global_subranges = registry.all_subranges();
+    global_subranges.extend(registry.reservations.iter().map(|r| r.block));
 
     let occupied: Vec<(u16, u16)> = registry
         .all_blocks()
@@ -339,4 +344,46 @@ fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
     tmp.write_all(contents)?;
     tmp.persist(path).map_err(|e| Error::from(e.error))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::registry::Reservation;
+
+    /// Spec §6.2 deviation fix: subrange acquisition must avoid
+    /// reservations, not just other projects' subranges.
+    #[test]
+    fn allocate_or_reuse_block_avoids_reservation_when_acquiring_first_subrange() {
+        let mut registry = Registry::empty((3000, 3999));
+        registry.reservations.push(Reservation {
+            block: (3000, 3499),
+            label: None,
+            pinned: true,
+        });
+        let config = Config {
+            range: (3000, 3999),
+            subrange_size: 500,
+            block_align: 5,
+            gc_days: 30,
+        };
+
+        let (block, subranges) = allocate_or_reuse_block(
+            &registry,
+            "/project/.git",
+            5,
+            Some("main"),
+            "/project",
+            &config,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            subranges,
+            vec![(3500, 3999)],
+            "the newly acquired subrange must not overlap the reservation"
+        );
+        assert_eq!(block, (3500, 3504));
+    }
 }

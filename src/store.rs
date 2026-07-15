@@ -41,18 +41,29 @@ pub struct LoadResult {
 ///   falling back to an empty registry — the ledger may well still exist,
 ///   so this must never happen silently (a subsequent [`save`] would
 ///   overwrite it with the empty one).
-/// - If the file exists but fails to parse as JSON, it is renamed aside to
-///   `<path>.corrupt-<unix seconds>`, a warning is printed to stderr, and an
-///   empty registry is returned. If the rename itself fails, a warning is
-///   printed and loading still falls back to an empty registry (the
-///   original corrupt file is left in place, to be retried next call).
+/// - If the file exists but fails to parse as JSON, `corrupt` is reported as
+///   `true` and an empty registry is returned. `heal` controls what happens
+///   to the file itself:
+///     - `heal = true` (the caller holds the write lock and is about to
+///       overwrite the ledger anyway: the sync slow path, `prune`'s locked
+///       non-dry-run path): the file is renamed aside to
+///       `<path>.corrupt-<unix seconds>` and a warning is printed to
+///       stderr. If the rename itself fails, a warning is printed and
+///       loading still falls back to an empty registry (the original
+///       corrupt file is left in place, to be retried next call).
+///     - `heal = false` (a lock-free, read-only caller: the sync fast path,
+///       `ls`, `prune --dry-run`): the file is left untouched. Renaming it
+///       here would race a concurrent locked writer that is in the middle
+///       of repairing the same file, and could silently discard hand-edited
+///       `pinned`/`reservations` entries it just wrote -- a read-only
+///       command must never mutate ledger state.
 ///
 /// The empty registry's `range` field is informational only; callers that
 /// detect a freshly-created ledger (`corrupt` or a missing file) and hold a
 /// live [`Config`] should overwrite `registry.range` with the config's pool
 /// before the first save, per the frozen decision that `range` reflects the
 /// pool at ledger-creation time.
-pub fn load(path: &Path) -> LoadResult {
+pub fn load(path: &Path, heal: bool) -> LoadResult {
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -82,6 +93,17 @@ pub fn load(path: &Path) -> LoadResult {
             read_error: false,
         },
         Err(parse_err) => {
+            if !heal {
+                eprintln!(
+                    "portool: warning: {} is corrupt ({parse_err}); treating the ledger as empty",
+                    path.display()
+                );
+                return LoadResult {
+                    registry: Registry::empty(Config::default().range),
+                    corrupt: true,
+                    read_error: false,
+                };
+            }
             let corrupt_path = corrupt_sibling_path(path);
             match fs::rename(path, &corrupt_path) {
                 Ok(()) => eprintln!(
@@ -176,7 +198,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("registry.json");
 
-        let result = load(&path);
+        let result = load(&path, true);
 
         assert!(!result.corrupt);
         assert!(!result.read_error);
@@ -192,7 +214,7 @@ mod tests {
         let path = tmp.path().join("registry.json");
         fs::create_dir(&path).unwrap();
 
-        let result = load(&path);
+        let result = load(&path, true);
 
         assert!(!result.corrupt);
         assert!(
@@ -212,12 +234,12 @@ mod tests {
     }
 
     #[test]
-    fn load_corrupt_json_moves_it_aside_and_returns_empty() {
+    fn load_corrupt_json_moves_it_aside_and_returns_empty_when_heal_is_true() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("registry.json");
         fs::write(&path, b"{ this is not valid json").unwrap();
 
-        let result = load(&path);
+        let result = load(&path, true);
 
         assert!(result.corrupt);
         assert!(!result.read_error);
@@ -237,13 +259,45 @@ mod tests {
     }
 
     #[test]
+    fn load_corrupt_json_leaves_it_in_place_when_heal_is_false() {
+        // A read-only caller (sync's fast path, `ls`, `prune --dry-run`)
+        // must never rename a corrupt ledger aside: doing so could race a
+        // concurrent locked writer that is in the middle of repairing the
+        // very same file, silently discarding hand-edited pinned /
+        // reservations entries it just wrote.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("registry.json");
+        let original_contents = b"{ this is not valid json".to_vec();
+        fs::write(&path, &original_contents).unwrap();
+
+        let result = load(&path, false);
+
+        assert!(result.corrupt);
+        assert!(!result.read_error);
+        assert!(result.registry.projects.is_empty());
+        assert!(path.exists(), "the corrupt file must be left in place");
+        assert_eq!(fs::read(&path).unwrap(), original_contents);
+
+        let siblings: Vec<String> = fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            siblings,
+            vec!["registry.json".to_string()],
+            "no corrupt-<timestamp> sibling should be created"
+        );
+    }
+
+    #[test]
     fn save_then_load_round_trips() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("registry.json");
         let registry = sample_registry();
 
         save(&path, &registry).unwrap();
-        let result = load(&path);
+        let result = load(&path, true);
 
         assert!(!result.corrupt);
         assert!(!result.read_error);
@@ -283,7 +337,7 @@ mod tests {
         save(&path, &Registry::empty((3000, 9999))).unwrap();
         save(&path, &sample_registry()).unwrap();
 
-        let result = load(&path);
+        let result = load(&path, true);
         assert_eq!(result.registry, sample_registry());
     }
 }
