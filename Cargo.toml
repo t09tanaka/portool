@@ -1,6 +1,6 @@
 [package]
 name = "portool"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Passive global port ledger for git worktrees"
 license = "MIT"
