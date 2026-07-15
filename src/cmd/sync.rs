@@ -267,13 +267,6 @@ fn allocate_or_reuse_block(
     config: &Config,
     existing_block: Option<(u16, u16)>,
 ) -> Result<BlockAllocation> {
-    if block_size > config.subrange_size {
-        // Frozen decision 4: detected before even trying to allocate a
-        // subrange, since no subrange of the configured width could ever
-        // hold this block.
-        return Err(Error::SubrangeExhausted);
-    }
-
     let mut subranges: Vec<(u16, u16)> = registry
         .find_project(common_dir_key)
         .map(|p| p.subranges.clone())
@@ -300,6 +293,16 @@ fn allocate_or_reuse_block(
             &mut bind_ok,
         ) {
             return Ok((block, subranges));
+        }
+
+        if block_size > config.subrange_size {
+            // Frozen decision 4 (spec §12: config changes affect only new
+            // acquisitions): the project's existing subranges -- possibly
+            // wider than the current config -- were already tried above.
+            // Acquiring a NEW subrange can never help here, since it would
+            // be capped at the configured width, so stop before looping
+            // forever.
+            return Err(Error::SubrangeExhausted);
         }
 
         match alloc::find_free_subrange(config.range, &global_subranges, config.subrange_size) {
@@ -385,5 +388,75 @@ mod tests {
             "the newly acquired subrange must not overlap the reservation"
         );
         assert_eq!(block, (3500, 3504));
+    }
+
+    /// Spec §12: config changes affect only new acquisitions. A project
+    /// that already owns a wide subrange must still be able to allocate a
+    /// block larger than a since-shrunk `subrange_size`, because the
+    /// allocation happens inside the existing subrange -- no NEW subrange
+    /// is ever acquired.
+    #[test]
+    fn allocate_or_reuse_block_fits_within_existing_wide_subrange_after_config_shrinks() {
+        let mut registry = Registry::empty((3000, 3999));
+        registry.projects.insert(
+            "/project/.git".to_string(),
+            ProjectEntry {
+                name: "project".to_string(),
+                subranges: vec![(3000, 3499)],
+                worktrees: std::collections::BTreeMap::new(),
+            },
+        );
+        // subrange_size shrunk to 5 well after the project acquired its
+        // 500-wide subrange; block_size (10) now exceeds it.
+        let config = Config {
+            range: (3000, 3999),
+            subrange_size: 5,
+            block_align: 5,
+            gc_days: 30,
+        };
+
+        let (block, subranges) = allocate_or_reuse_block(
+            &registry,
+            "/project/.git",
+            10,
+            Some("main"),
+            "/project",
+            &config,
+            None,
+        )
+        .expect("must allocate inside the existing, wider subrange");
+
+        assert_eq!(subranges, vec![(3000, 3499)], "no new subrange acquired");
+        assert!(
+            block.0 >= 3000 && block.1 <= 3499,
+            "block {block:?} must fall within the existing subrange"
+        );
+    }
+
+    /// Inverse of the above: a project with NO existing subranges, whose
+    /// block size exceeds the configured `subrange_size`, can never be
+    /// helped by acquiring a new subrange (frozen decision 4) and must
+    /// fail fast with `SubrangeExhausted`.
+    #[test]
+    fn allocate_or_reuse_block_errors_when_no_subranges_and_block_exceeds_subrange_size() {
+        let registry = Registry::empty((3000, 3999));
+        let config = Config {
+            range: (3000, 3999),
+            subrange_size: 3,
+            block_align: 5,
+            gc_days: 30,
+        };
+
+        let result = allocate_or_reuse_block(
+            &registry,
+            "/project/.git",
+            5,
+            Some("main"),
+            "/project",
+            &config,
+            None,
+        );
+
+        assert!(matches!(result, Err(Error::SubrangeExhausted)));
     }
 }
