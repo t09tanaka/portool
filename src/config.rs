@@ -83,15 +83,24 @@ impl Config {
 
     /// Loads the global config from [`crate::paths::config_path`].
     ///
-    /// If the file doesn't exist, returns [`Config::default`]. If it exists
-    /// but fails to parse, a warning is printed to stderr and
-    /// [`Config::default`] is returned so a malformed config file never
-    /// blocks the tool.
+    /// If the file doesn't exist, returns [`Config::default`] silently. If
+    /// it cannot be read for any other reason, or exists but fails to
+    /// parse, a warning is printed to stderr and [`Config::default`] is
+    /// returned so a problematic config file never blocks the tool.
     pub fn load() -> Config {
         let path = crate::paths::config_path();
         let contents = match std::fs::read_to_string(&path) {
             Ok(contents) => contents,
-            Err(_) => return Config::default(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Config::default();
+            }
+            Err(err) => {
+                eprintln!(
+                    "portool: warning: failed to read {}: {err}; using defaults",
+                    path.display()
+                );
+                return Config::default();
+            }
         };
 
         match Config::from_toml_str(&contents) {

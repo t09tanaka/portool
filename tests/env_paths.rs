@@ -82,6 +82,14 @@ fn xdg_and_home_resolution_and_config_load() {
     std::fs::write(paths::config_path(), "this is not valid toml =====").unwrap();
     assert_eq!(Config::load(), Config::default());
 
+    // --- Config::load falls back to defaults on a non-NotFound read
+    // --- error (config.toml is a directory), leaving it in place ------
+    std::fs::remove_file(paths::config_path()).unwrap();
+    std::fs::create_dir(paths::config_path()).unwrap();
+    assert_eq!(Config::load(), Config::default());
+    assert!(paths::config_path().is_dir());
+    std::fs::remove_dir(paths::config_path()).unwrap();
+
     // --- empty XDG_STATE_HOME is treated as unset ----------------------
     // SAFETY: see above.
     unsafe {

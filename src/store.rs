@@ -25,6 +25,11 @@ pub struct LoadResult {
 ///
 /// - If the file does not exist, returns an empty registry (spec §5: "台帳が
 ///   存在しない...場合は空台帳として再生成").
+/// - If the file cannot be read for any other reason (permissions, EIO,
+///   path is a directory, ...), a warning is printed to stderr before
+///   falling back to an empty registry — the ledger may well still exist,
+///   so this must never happen silently (a subsequent [`save`] would
+///   overwrite it with the empty one).
 /// - If the file exists but fails to parse as JSON, it is renamed aside to
 ///   `<path>.corrupt-<unix seconds>`, a warning is printed to stderr, and an
 ///   empty registry is returned. If the rename itself fails, a warning is
@@ -39,7 +44,17 @@ pub struct LoadResult {
 pub fn load(path: &Path) -> LoadResult {
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
-        Err(_) => {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return LoadResult {
+                registry: Registry::empty(Config::default().range),
+                corrupt: false,
+            };
+        }
+        Err(err) => {
+            eprintln!(
+                "portool: warning: failed to read {}: {err}; treating the ledger as empty",
+                path.display()
+            );
             return LoadResult {
                 registry: Registry::empty(Config::default().range),
                 corrupt: false,
@@ -151,6 +166,29 @@ mod tests {
         assert!(!result.corrupt);
         assert!(result.registry.projects.is_empty());
         assert!(result.registry.reservations.is_empty());
+    }
+
+    #[test]
+    fn load_non_not_found_read_error_falls_back_to_empty_without_touching_the_file() {
+        let tmp = TempDir::new().unwrap();
+        // A directory in place of registry.json is a deterministic
+        // non-NotFound read error on every Unix platform.
+        let path = tmp.path().join("registry.json");
+        fs::create_dir(&path).unwrap();
+
+        let result = load(&path);
+
+        assert!(!result.corrupt);
+        assert!(result.registry.projects.is_empty());
+        // Unlike the corrupt-JSON path, a read error must not rename or
+        // remove anything: the ledger may still be intact on disk.
+        assert!(path.is_dir(), "the unreadable path must be left in place");
+        let siblings: Vec<String> = fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(siblings, vec!["registry.json".to_string()]);
     }
 
     #[test]
