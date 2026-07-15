@@ -103,11 +103,11 @@ mod tests {
       "version": 1,
       "range": [3000, 9999],
       "projects": {
-        "/home/takuto/dev/esimdb/.git": {
-          "name": "esimdb",
+        "/home/user/dev/myapp/.git": {
+          "name": "myapp",
           "subranges": [[3000, 3499]],
           "worktrees": {
-            "/home/takuto/dev/esimdb": {
+            "/home/user/dev/myapp": {
               "block": [3000, 3004],
               "branch": "main",
               "manifest_hash": "a1b2c3d4e5f6",
@@ -150,11 +150,11 @@ mod tests {
         assert_eq!(reg.range, (3000, 9999));
         assert!(reg.reservations.is_empty());
 
-        let project = reg.find_project("/home/takuto/dev/esimdb/.git").unwrap();
-        assert_eq!(project.name, "esimdb");
+        let project = reg.find_project("/home/user/dev/myapp/.git").unwrap();
+        assert_eq!(project.name, "myapp");
         assert_eq!(project.subranges, vec![(3000, 3499)]);
 
-        let worktree = project.worktrees.get("/home/takuto/dev/esimdb").unwrap();
+        let worktree = project.worktrees.get("/home/user/dev/myapp").unwrap();
         assert_eq!(worktree.block, (3000, 3004));
         assert_eq!(worktree.branch.as_deref(), Some("main"));
         assert_eq!(worktree.manifest_hash.as_deref(), Some("a1b2c3d4e5f6"));

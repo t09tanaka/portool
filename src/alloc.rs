@@ -204,9 +204,9 @@ mod tests {
     #[test]
     fn preferred_slot_detached_head_uses_worktree_path() {
         let slots = 8;
-        let expected = fnv1a_32(b"/home/takuto/dev/esimdb-wt/detached") % slots;
+        let expected = fnv1a_32(b"/home/user/dev/myapp-wt/detached") % slots;
         assert_eq!(
-            preferred_slot(None, "/home/takuto/dev/esimdb-wt/detached", slots),
+            preferred_slot(None, "/home/user/dev/myapp-wt/detached", slots),
             expected
         );
     }

@@ -157,18 +157,18 @@ mod tests {
     #[test]
     fn shorten_home_replaces_prefix() {
         assert_eq!(
-            shorten_home("/home/takuto/dev/esimdb", Some("/home/takuto")),
-            "~/dev/esimdb"
+            shorten_home("/home/user/dev/myapp", Some("/home/user")),
+            "~/dev/myapp"
         );
-        assert_eq!(shorten_home("/home/takuto", Some("/home/takuto")), "~");
+        assert_eq!(shorten_home("/home/user", Some("/home/user")), "~");
         assert_eq!(
-            shorten_home("/srv/repos/esimdb", Some("/home/takuto")),
-            "/srv/repos/esimdb"
+            shorten_home("/srv/repos/myapp", Some("/home/user")),
+            "/srv/repos/myapp"
         );
     }
 
     #[test]
     fn shorten_home_leaves_path_untouched_without_home() {
-        assert_eq!(shorten_home("/srv/repos/esimdb", None), "/srv/repos/esimdb");
+        assert_eq!(shorten_home("/srv/repos/myapp", None), "/srv/repos/myapp");
     }
 }

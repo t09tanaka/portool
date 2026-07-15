@@ -171,7 +171,7 @@ mod tests {
 
         let mut worktrees = BTreeMap::new();
         worktrees.insert(
-            "/home/takuto/dev/esimdb".to_string(),
+            "/home/user/dev/myapp".to_string(),
             WorktreeEntry {
                 block: (3000, 3004),
                 branch: Some("main".to_string()),
@@ -183,9 +183,9 @@ mod tests {
             },
         );
         registry.projects.insert(
-            "/home/takuto/dev/esimdb/.git".to_string(),
+            "/home/user/dev/myapp/.git".to_string(),
             ProjectEntry {
-                name: "esimdb".to_string(),
+                name: "myapp".to_string(),
                 subranges: vec![(3000, 3499)],
                 worktrees,
             },

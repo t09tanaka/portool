@@ -171,7 +171,7 @@ mod tests {
     #[test]
     fn discover_resolves_main_worktree() {
         let tmp = TempDir::new().unwrap();
-        let repo = tmp.path().join("esimdb");
+        let repo = tmp.path().join("myapp");
         std::fs::create_dir(&repo).unwrap();
         init_repo(&repo);
 
@@ -183,7 +183,7 @@ mod tests {
             std::fs::canonicalize(repo.join(".git")).unwrap()
         );
         assert_eq!(ctx.branch.as_deref(), Some("main"));
-        assert_eq!(ctx.project_name, "esimdb");
+        assert_eq!(ctx.project_name, "myapp");
     }
 
     #[test]
@@ -318,12 +318,12 @@ mod tests {
         // A bare-repo-style common dir whose final component isn't
         // `.git` should use that final component directly.
         assert_eq!(
-            infer_project_name(Path::new("/srv/repos/kiri.git")),
-            "kiri.git"
+            infer_project_name(Path::new("/srv/repos/blog.git")),
+            "blog.git"
         );
         assert_eq!(
-            infer_project_name(Path::new("/home/t/dev/esimdb/.git")),
-            "esimdb"
+            infer_project_name(Path::new("/home/t/dev/myapp/.git")),
+            "myapp"
         );
     }
 }
