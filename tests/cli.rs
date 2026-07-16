@@ -105,6 +105,32 @@ fn git(dir: &Path, args: &[&str]) -> Output {
         .expect("failed to run git")
 }
 
+/// Runs git with this test's fully isolated environment AND the portool
+/// binary prepended to `PATH`, so hooks spawned by git (post-checkout)
+/// can themselves run `portool sync` against the test's isolated state.
+fn git_with_portool(env: &TestEnv, dir: &Path, args: &[&str]) -> Output {
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_portool"));
+    let bin_dir = bin.parent().expect("binary has a parent dir");
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(dir)
+        .args(args)
+        .env_clear()
+        .env("PATH", path)
+        .env("HOME", &env.home)
+        .env("XDG_STATE_HOME", &env.state)
+        .env("XDG_CONFIG_HOME", &env.config)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+    cmd.output().expect("failed to run git")
+}
+
 fn init_repo(dir: &Path) {
     fs::create_dir_all(dir).unwrap();
     assert!(git(dir, &["init", "-q", "-b", "main"]).status.success());
@@ -444,7 +470,9 @@ fn init_installs_hook_and_gitignore_and_is_idempotent() {
     let hook_path = repo.join(".git/hooks/post-checkout");
     let expected_hook = "#!/bin/sh\n\
 # installed by portool\n\
-command -v portool >/dev/null 2>&1 && portool sync --quiet\n";
+if command -v portool >/dev/null 2>&1; then\n\
+\x20\x20portool sync --quiet\n\
+fi\n";
     let hook_content_1 = fs::read_to_string(&hook_path).unwrap();
     assert_eq!(hook_content_1, expected_hook);
     let mode = fs::metadata(&hook_path).unwrap().permissions().mode();
@@ -469,6 +497,237 @@ command -v portool >/dev/null 2>&1 && portool sync --quiet\n";
         1,
         "the .gitignore line must not be duplicated"
     );
+}
+
+// --- 8b. init: core.hooksPath / Husky support ------------------------------
+
+/// A plain repo (no core.hooksPath): `git worktree add` runs the installed
+/// post-checkout hook, so the brand-new worktree gets its `.env.portool`
+/// with no manual sync.
+#[test]
+fn worktree_add_first_checkout_generates_env_via_hook() {
+    let env = TestEnv::new();
+    let repo = env.path("repo");
+    init_repo(&repo);
+    assert!(env.run(&repo, &["init"]).status.success());
+
+    let wt = env.path("repo-wt");
+    let output = git_with_portool(
+        &env,
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature",
+            wt.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        wt.join(".env.portool").exists(),
+        "the post-checkout hook must have synced the new worktree"
+    );
+}
+
+#[test]
+fn init_with_custom_hookspath_installs_there_not_git_hooks() {
+    let env = TestEnv::new();
+    let repo = env.path("repo");
+    init_repo(&repo);
+    fs::create_dir_all(repo.join("ci-hooks")).unwrap();
+    assert!(git(&repo, &["config", "core.hooksPath", "ci-hooks"])
+        .status
+        .success());
+
+    let output = env.run(&repo, &["init"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let hook_path = repo.join("ci-hooks/post-checkout");
+    let content_1 = fs::read_to_string(&hook_path).unwrap();
+    assert!(content_1.contains("portool sync"));
+    let mode = fs::metadata(&hook_path).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o755, "hook must be executable");
+    assert!(
+        !repo.join(".git/hooks/post-checkout").exists(),
+        "the unused default location must be left alone"
+    );
+
+    // Idempotent across re-runs.
+    assert!(env.run(&repo, &["init"]).status.success());
+    assert_eq!(fs::read_to_string(&hook_path).unwrap(), content_1);
+
+    // The hook actually fires from the custom location.
+    fs::remove_file(repo.join(".env.portool")).unwrap();
+    let output = git_with_portool(&env, &repo, &["checkout", "-q", "-b", "feature"]);
+    assert!(output.status.success());
+    assert!(repo.join(".env.portool").exists());
+}
+
+#[test]
+fn init_with_custom_hookspath_appends_to_existing_hook() {
+    let env = TestEnv::new();
+    let repo = env.path("repo");
+    init_repo(&repo);
+    fs::create_dir_all(repo.join("ci-hooks")).unwrap();
+    fs::write(
+        repo.join("ci-hooks/post-checkout"),
+        "#!/bin/sh\necho existing\n",
+    )
+    .unwrap();
+    assert!(git(&repo, &["config", "core.hooksPath", "ci-hooks"])
+        .status
+        .success());
+
+    assert!(env.run(&repo, &["init"]).status.success());
+    assert!(env.run(&repo, &["init"]).status.success());
+
+    let content = fs::read_to_string(repo.join("ci-hooks/post-checkout")).unwrap();
+    assert!(
+        content.starts_with("#!/bin/sh\necho existing\n"),
+        "the pre-existing hook body must be preserved"
+    );
+    assert_eq!(
+        content.matches("portool sync").count(),
+        1,
+        "re-running init must not duplicate the line"
+    );
+}
+
+/// A Husky-style repo: `core.hooksPath=.husky/_`, with a minimal stand-in
+/// for Husky's generated bootstrap that delegates to the user-managed
+/// `.husky/<hook>` (as Husky's `_/h` does). `portool init` must install
+/// into `.husky/post-checkout` -- never into `.husky/_` or `.git/hooks`.
+#[test]
+fn init_with_husky_hookspath_installs_user_managed_hook_and_chains() {
+    let env = TestEnv::new();
+    let repo = env.path("repo");
+    init_repo(&repo);
+
+    let husky_shim = "#!/bin/sh\nh=\"$(dirname \"$0\")/../post-checkout\"\n[ -f \"$h\" ] && sh -e \"$h\" \"$@\"\n";
+    fs::create_dir_all(repo.join(".husky/_")).unwrap();
+    fs::write(repo.join(".husky/_/post-checkout"), husky_shim).unwrap();
+    let mut perms = fs::metadata(repo.join(".husky/_/post-checkout"))
+        .unwrap()
+        .permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(repo.join(".husky/_/post-checkout"), perms).unwrap();
+    assert!(git(&repo, &["config", "core.hooksPath", ".husky/_"])
+        .status
+        .success());
+
+    let output = env.run(&repo, &["init"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Husky detected"),
+        "init must explain the Husky integration, got: {stderr}"
+    );
+
+    let user_hook = fs::read_to_string(repo.join(".husky/post-checkout")).unwrap();
+    assert!(user_hook.contains("portool sync"));
+    assert_eq!(
+        fs::read_to_string(repo.join(".husky/_/post-checkout")).unwrap(),
+        husky_shim,
+        "Husky's generated runtime dir must be left untouched"
+    );
+    assert!(
+        !repo.join(".git/hooks/post-checkout").exists(),
+        "the unused default location must be left alone"
+    );
+
+    // Idempotent across re-runs.
+    assert!(env.run(&repo, &["init"]).status.success());
+    assert_eq!(
+        fs::read_to_string(repo.join(".husky/post-checkout")).unwrap(),
+        user_hook
+    );
+
+    // A checkout chains through the Husky-style bootstrap into portool.
+    fs::remove_file(repo.join(".env.portool")).unwrap();
+    let output = git_with_portool(&env, &repo, &["checkout", "-q", "-b", "feature"]);
+    assert!(output.status.success());
+    assert!(
+        repo.join(".env.portool").exists(),
+        "sync must run via .husky/_ -> .husky/post-checkout"
+    );
+
+    // And sync no longer nags about a missing hook.
+    let output = env.run(&repo, &["sync"]);
+    assert!(output.status.success());
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("hint: run 'portool init'"),
+        "the hook-missing hint must respect core.hooksPath"
+    );
+}
+
+/// The user-managed Husky hook exits 0 when portool isn't on PATH, even
+/// under Husky's `sh -e` + exit-code propagation.
+#[test]
+fn husky_hook_is_harmless_when_portool_is_not_installed() {
+    let env = TestEnv::new();
+    let repo = env.path("repo");
+    init_repo(&repo);
+    fs::create_dir_all(repo.join(".husky/_")).unwrap();
+    assert!(git(&repo, &["config", "core.hooksPath", ".husky/_"])
+        .status
+        .success());
+    assert!(env.run(&repo, &["init"]).status.success());
+
+    let output = Command::new("/bin/sh")
+        .arg("-e")
+        .arg(repo.join(".husky/post-checkout"))
+        .env_clear()
+        .env("PATH", "/nonexistent") // no portool (and no git) available
+        .output()
+        .expect("failed to run sh");
+    assert!(
+        output.status.success(),
+        "hook must exit 0 without portool, got {:?}: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `core.hooksPath` pointing at a directory that doesn't exist (and isn't
+/// Husky's): init must warn with instructions instead of silently
+/// installing somewhere git will never look.
+#[test]
+fn init_with_missing_hookspath_warns_and_installs_nothing() {
+    let env = TestEnv::new();
+    let repo = env.path("repo");
+    init_repo(&repo);
+    assert!(git(&repo, &["config", "core.hooksPath", "generated/hooks"])
+        .status
+        .success());
+
+    let output = env.run(&repo, &["init"]);
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("core.hooksPath") && stderr.contains("is not an existing directory"),
+        "expected a warning about the unusable hooksPath, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("portool init --hook-only"),
+        "the warning must include concrete recovery instructions, got: {stderr}"
+    );
+    assert!(!repo.join(".git/hooks/post-checkout").exists());
+    assert!(!repo.join("generated").exists());
 }
 
 // --- 9. ls / ls --json ------------------------------------------------------

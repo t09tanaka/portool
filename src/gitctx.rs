@@ -1,7 +1,8 @@
 //! Thin `git` command-line wrapper: project/worktree identity discovery
 //! and `git worktree list` parsing (spec §6.1). The only external
 //! processes this crate spawns are `git rev-parse`, `git symbolic-ref
-//! --short -q HEAD`, and `git worktree list --porcelain`.
+//! --short -q HEAD`, `git worktree list --porcelain`, and `git config
+//! --type=path --get`.
 
 use crate::error::{Error, Result};
 use std::path::{Path, PathBuf};
@@ -83,6 +84,16 @@ pub fn worktree_list_at(dir: &Path) -> Result<Vec<PathBuf>> {
         }
     }
     Ok(paths)
+}
+
+/// Reads a path-valued git config key via `git config --type=path --get`
+/// (so `~` is expanded by git itself), returning `None` when the key is
+/// unset or git fails. Relative values are returned as-is; resolving them
+/// against the right base is the caller's job.
+pub fn config_path_value(dir: &Path, key: &str) -> Option<String> {
+    run_git(dir, &["config", "--type=path", "--get", key])
+        .map(|s| s.trim_end().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Runs `git -C <cwd> <args>`, returning stdout as a `String` on success
