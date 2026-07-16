@@ -11,7 +11,7 @@ use crate::envread::{self, Entry, FileValue};
 use crate::error::{Error, Result};
 use crate::gitctx::GitCtx;
 use crate::identity;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::PathBuf;
 
@@ -47,15 +47,25 @@ pub fn run(env_files: &[PathBuf], command: &[OsString]) -> Result<()> {
         file_entries.push(envread::parse_env_file(path)?);
     }
 
-    // Only UTF-8 parent variables participate in expansion; non-UTF-8
-    // ones are left untouched in the process environment and are still
-    // inherited by the child (we never env_clear).
+    // Every parent variable with a UTF-8 name takes part in precedence, so
+    // an env-file entry can never shadow an inherited variable (§6). A
+    // non-UTF-8 *value* is lossily decoded for `${NAME}` expansion only —
+    // the child still inherits its exact bytes, because parent-sourced
+    // winners are never re-set on the child (see `compose`).
     let parent: Vec<(String, String)> = std::env::vars_os()
-        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+        .filter_map(|(name, value)| {
+            let name = name.into_string().ok()?;
+            let value = match value.into_string() {
+                Ok(value) => value,
+                Err(raw) => raw.to_string_lossy().into_owned(),
+            };
+            Some((name, value))
+        })
         .collect();
 
-    let map = compose(file_entries, parent, portool_vars);
-    let resolved = envread::resolve(&map)?;
+    let (map, to_set) = compose(file_entries, parent, portool_vars);
+    let mut resolved = envread::resolve(&map)?;
+    resolved.retain(|name, _| to_set.contains(name));
 
     exec_command(command, &resolved)
 }
@@ -63,24 +73,32 @@ pub fn run(env_files: &[PathBuf], command: &[OsString]) -> Result<()> {
 /// Merges the three variable sources into one map with the spec §6
 /// precedence: earlier env files < later env files (later lines win
 /// within a file too) < parent environment < portool-managed variables.
+///
+/// Also returns the set of names to actually set on the child: file and
+/// portool winners only. Parent-sourced winners are excluded — the child
+/// inherits them as-is, which keeps non-UTF-8 parent values byte-exact.
 fn compose(
     file_entries: Vec<Vec<(String, FileValue)>>,
     parent: Vec<(String, String)>,
     portool_vars: Vec<(String, String)>,
-) -> BTreeMap<String, Entry> {
+) -> (BTreeMap<String, Entry>, BTreeSet<String>) {
     let mut map = BTreeMap::new();
+    let mut to_set = BTreeSet::new();
     for entries in file_entries {
         for (name, value) in entries {
+            to_set.insert(name.clone());
             map.insert(name, Entry::File(value));
         }
     }
     for (name, value) in parent {
+        to_set.remove(&name);
         map.insert(name, Entry::Literal(value));
     }
     for (name, value) in portool_vars {
+        to_set.insert(name.clone());
         map.insert(name, Entry::Literal(value));
     }
-    map
+    (map, to_set)
 }
 
 /// Spec §9: no shell, cwd unchanged, stdio inherited. `exec` replaces the
@@ -91,8 +109,8 @@ fn exec_command(command: &[OsString], env: &BTreeMap<String, String>) -> Result<
     use std::os::unix::process::CommandExt;
 
     let mut cmd = std::process::Command::new(&command[0]);
-    // No env_clear(): non-UTF-8 parent variables survive into the child;
-    // .envs() only overlays the resolved UTF-8 set.
+    // No env_clear(): the parent environment is inherited wholesale;
+    // .envs() only overlays the file/portool winners.
     cmd.args(&command[1..]).envs(env);
 
     let err = cmd.exec();
@@ -128,7 +146,7 @@ mod tests {
     /// file) < parent < portool.
     #[test]
     fn compose_applies_precedence_order() {
-        let map = compose(
+        let (map, to_set) = compose(
             vec![
                 vec![
                     ("A".into(), file_value("file1-first")),
@@ -149,6 +167,11 @@ mod tests {
         assert_eq!(raw_of(&map["D"]), "portool");
         assert!(matches!(map["A"], Entry::File(_)));
         assert!(matches!(map["C"], Entry::Literal(_)));
+
+        // File and portool winners are set on the child; parent winners
+        // are inherited instead, never re-set.
+        let names: Vec<&str> = to_set.iter().map(String::as_str).collect();
+        assert_eq!(names, ["A", "B", "D"]);
     }
 
     /// Parent and portool values enter as literals, so file-side
@@ -156,7 +179,7 @@ mod tests {
     /// verbatim.
     #[test]
     fn compose_result_resolves_with_portool_value() {
-        let map = compose(
+        let (map, _) = compose(
             vec![vec![
                 ("TEST_DB_PORT".into(), file_value("1111")),
                 ("URL".into(), file_value("localhost:${TEST_DB_PORT}")),

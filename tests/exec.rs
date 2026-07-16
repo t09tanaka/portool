@@ -310,6 +310,38 @@ fn exec_parent_env_overrides_env_file() {
     assert_eq!(success_stdout(&output), "parent");
 }
 
+/// Spec §6: a parent variable whose value is not valid UTF-8 still beats
+/// the env file, and the child inherits its exact bytes (exec never
+/// re-sets parent-sourced winners).
+#[test]
+fn exec_non_utf8_parent_value_beats_env_file_and_survives_byte_exact() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let env = TestEnv::new();
+    let repo = env.path("repo");
+    init_repo(&repo);
+    fs::write(repo.join(".env.test"), "FOO=file\n").unwrap();
+
+    let raw: &[u8] = b"caf\xe9-raw"; // invalid UTF-8 (lone 0xE9)
+    let mut cmd = env.command();
+    cmd.current_dir(&repo)
+        .env(OsStr::from_bytes(b"FOO"), OsStr::from_bytes(raw))
+        .args([
+            "exec",
+            "--env-file",
+            ".env.test",
+            "--",
+            "sh",
+            "-c",
+            r#"printf "%s" "$FOO""#,
+        ]);
+    let output = cmd.output().expect("failed to spawn portool");
+
+    assert!(output.status.success(), "exec must succeed");
+    assert_eq!(output.stdout, raw, "child must inherit the exact bytes");
+}
+
 // --- 6. portool-managed variables beat everything ----------------------------
 
 /// Spec §6: portool-managed variables override both a stale parent value
