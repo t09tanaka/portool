@@ -22,10 +22,14 @@ breaks:
   `git checkout`, or an agent creating worktrees on your behalf all just
   work — the right ports show up on their own.
 
-`portool` does exactly one job. It does not manage processes, proxy
-requests, or template your `.env` files, and it doesn't provide `pin`/
-`unpin` commands yet even though the ledger schema already has room for
-pinned entries.
+The ledger itself stays passive: `portool` never daemonizes, proxies
+requests, or supervises processes. The one place it touches your command
+line is [`portool exec`](#portool-exec) — a thin execution boundary that
+composes the allocated ports into an environment and then replaces itself
+with your command via `exec(2)`. Even there it templates nothing on its
+own: the only env files it expands are the ones you explicitly pass. It
+doesn't provide `pin`/`unpin` commands yet even though the ledger schema
+already has room for pinned entries.
 
 ## Install
 
@@ -98,7 +102,8 @@ Consumers must ignore unknown `PORTOOL_*` metadata variables and must
 not assume every variable ends with `_PORT`.
 
 `portool` only ever writes this file — reading it into your process is your
-tool's job:
+tool's job (or [`portool exec`](#portool-exec)'s, if you'd rather not wire
+that up yourself):
 
 **direnv** — add to `.envrc`:
 
@@ -135,6 +140,70 @@ generated yet:**
 ```js
 const port = process.env.WEB_PORT || 3000;
 ```
+
+## `portool exec`
+
+Runs a command with the current worktree's assignments injected as
+environment variables — no `source`, no per-worktree launcher scripts:
+
+```sh
+portool exec [-e <PATH>]... -- <COMMAND> [ARGS...]
+```
+
+In order, `exec` locates the current worktree, runs the equivalent of
+`portool sync`, loads each env file passed with `-e`/`--env-file`,
+composes everything into one environment, expands `${NAME}` /
+`${NAME:-default}` references, and then replaces itself with `<COMMAND>`
+via `exec(2)` — no shell in between, so stdin/stdout/stderr, signals, and
+the exit code all pass through untouched. The `--` is required, and
+omitting the command is a usage error. If sync or environment
+construction fails, the command is never started.
+
+Precedence, lowest to highest:
+
+```
+earlier env files < later env files < parent environment < portool-managed variables
+```
+
+So a stale `TEST_DB_PORT` left in a file or in your shell can never shadow
+the current worktree's allocation, while variables `portool` doesn't
+manage (`DATABASE_URL`, `JWT_SECRET`, …) keep their parent-environment
+values.
+
+Expansion rules:
+
+- Only `${NAME}` and `${NAME:-default}` are recognized. `$NAME` is not,
+  and command substitution (`$()`, backticks) is never executed.
+- Unquoted and double-quoted values are expanded; single-quoted values
+  are left verbatim.
+- An undefined `${NAME}` is an error — use `${NAME:-default}` when a
+  fallback makes sense.
+
+`exec` must run inside a git worktree whose root has a `.portool.toml`.
+Env-file paths are resolved relative to the current working directory,
+and a missing file is an error — nothing (`.env`, `.env.test`, …) is ever
+read implicitly.
+
+The payoff of these rules is that one committed env file serves both
+worlds. Write a `.env.test` like:
+
+```dotenv
+DATABASE_URL=postgresql://postgres:password@localhost:${TEST_DB_PORT:-5432}/testdb
+```
+
+and run your integration tests through `portool`:
+
+```sh
+portool exec --env-file .env.test -- npm run test:int
+```
+
+Each worktree's tests hit that worktree's own database port. On CI, where
+`portool` isn't installed, the exact same file works as a plain dotenv
+with the `5432` default.
+
+`exec` returns the child command's exit code as-is; `127` if the command
+wasn't found, `126` if it isn't executable. If you need shell features,
+ask for them explicitly: `portool exec -- sh -c '...'`.
 
 ## Worktree identity
 
@@ -173,6 +242,7 @@ What the IDs survive:
 ```
 portool init  [--hook-only | --gitignore-only]
 portool sync  [--quiet]
+portool exec  [-e <PATH>]... -- <COMMAND> [ARGS...]
 portool ls    [--json] [--all]
 portool prune [--all] [--dry-run]
 ```
@@ -201,6 +271,15 @@ in well under a millisecond.
 | Flag | Effect |
 |---|---|
 | `--quiet` | Suppress the normal-case summary line on stdout (used by the hook). Warnings and errors always go to stderr regardless. |
+
+### `portool exec`
+
+Runs `<COMMAND>` with the composed environment — covered in detail in
+[`portool exec`](#portool-exec) above.
+
+| Flag | Effect |
+|---|---|
+| `-e, --env-file <PATH>` | An env file to load before composing. Repeatable; later files override earlier ones. |
 
 ### `portool ls`
 
@@ -243,6 +322,10 @@ entire project's `common_dir` — the whole repository clone — is gone.
 | 2 | No subrange, however many are acquired, could ever fit one block (the manifest's block size exceeds `subrange_size`). |
 | 3 | The pool has no room left for a new subrange. |
 | 4 | Timed out (10s) waiting for the registry lock. |
+
+`portool exec` is the exception: once the child command starts, its exit
+code is passed through unchanged (with `127` for command not found and
+`126` for not executable).
 
 ## Global config (`config.toml`)
 
