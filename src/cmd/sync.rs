@@ -31,7 +31,7 @@ pub fn run(quiet: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let ctx = GitCtx::discover(&cwd)?;
 
-    warn_if_hook_missing(&ctx.common_dir);
+    warn_if_hook_missing(&ctx);
 
     if try_fast_path(&ctx)? {
         return Ok(());
@@ -322,10 +322,14 @@ fn allocate_or_reuse_block(
 
 /// Frozen decision 10: warns on stderr if the post-checkout hook isn't
 /// installed for this project, regardless of which sync path is taken.
-fn warn_if_hook_missing(common_dir: &Path) {
-    let hook_path = common_dir.join("hooks").join("post-checkout");
-    let installed = std::fs::read_to_string(&hook_path)
-        .map(|content| content.contains("portool sync"))
+/// Checks the *effective* hook location (honoring `core.hooksPath` /
+/// Husky); an uninstallable location counts as missing -- `init` explains
+/// the details.
+fn warn_if_hook_missing(ctx: &GitCtx) {
+    let installed = crate::hooks::HooksLocation::resolve(ctx)
+        .post_checkout_file()
+        .and_then(|hook_path| std::fs::read_to_string(hook_path).ok())
+        .map(|content| content.contains(crate::hooks::HOOK_MARKER))
         .unwrap_or(false);
     if !installed {
         eprintln!("hint: run 'portool init' to install the post-checkout hook");
