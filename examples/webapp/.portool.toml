@@ -1,0 +1,4 @@
+[ports]
+web = 0      # server.js dev server
+db = 1       # compose `db` service
+test_db = 2  # compose `test-db` service + DATABASE_URL in .env.test

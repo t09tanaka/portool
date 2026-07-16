@@ -909,3 +909,54 @@ fn exec_without_command_is_a_usage_error() {
         assert!(stderr.contains("usage"), "stderr was: {stderr}");
     }
 }
+
+// --- 26. the committed examples/webapp fixture ---------------------------------
+
+/// README "Keep your repo portool-free": the committed example's manifest
+/// and `.env.test` really serve both worlds. Through `exec`, DATABASE_URL
+/// expands to this worktree's own `test_db` port; and the file keeps a
+/// `:-` default so a plain dotenv loader (CI, no portool) still resolves
+/// it. The example can't be exec'd in place -- it sits inside the portool
+/// repo, whose root has no manifest -- so its files are copied into a
+/// scratch repo.
+#[test]
+fn exec_examples_webapp_env_test_expands_to_allocated_port() {
+    let env = TestEnv::new();
+    let repo = env.path("repo");
+    init_bare_repo(&repo);
+
+    let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/webapp");
+    for file in [".portool.toml", ".env.test"] {
+        fs::copy(example.join(file), repo.join(file)).expect(file);
+    }
+
+    let output = env.run(
+        &repo,
+        &[
+            "exec",
+            "--env-file",
+            ".env.test",
+            "--",
+            "sh",
+            "-c",
+            r#"printf "%s" "$DATABASE_URL""#,
+        ],
+    );
+    let stdout = success_stdout(&output);
+
+    // `test_db` is declared at offset 2 in the example manifest.
+    let test_db = block_start(&env, &repo, &repo) + 2;
+    assert!(
+        stdout.contains(&format!(":{test_db}/")),
+        "DATABASE_URL must embed this worktree's test_db port, got: {stdout}"
+    );
+
+    // The other half of the contract: without portool the same committed
+    // file must keep working as plain dotenv, so the port reference has
+    // to carry a fallback default.
+    let env_test = fs::read_to_string(example.join(".env.test")).unwrap();
+    assert!(
+        env_test.contains("${TEST_DB_PORT:-"),
+        ".env.test must keep a fallback default for portool-free environments"
+    );
+}

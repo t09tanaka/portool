@@ -1,0 +1,11 @@
+{
+  "name": "example-webapp",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node server.js",
+    "db:up": "docker compose up -d",
+    "db:down": "docker compose down",
+    "test:int": "echo \"would run integration tests against ${DATABASE_URL:-postgresql://postgres:password@127.0.0.1:5433/app_test}\""
+  }
+}
