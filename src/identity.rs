@@ -34,17 +34,11 @@ pub fn worktree_id(common_dir: &Path, worktree_root: &Path) -> String {
     truncated_hex(&hasher.finalize())
 }
 
-/// The raw bytes of a path: on Unix the exact OS bytes (correct even for
-/// non-UTF-8 paths), elsewhere a lossy UTF-8 rendering.
-#[cfg(unix)]
-fn path_bytes(path: &Path) -> Vec<u8> {
+/// The raw bytes of a path: the exact OS bytes, correct even for
+/// non-UTF-8 paths (portool targets macOS and Linux only).
+fn path_bytes(path: &Path) -> &[u8] {
     use std::os::unix::ffi::OsStrExt;
-    path.as_os_str().as_bytes().to_vec()
-}
-
-#[cfg(not(unix))]
-fn path_bytes(path: &Path) -> Vec<u8> {
-    path.to_string_lossy().as_bytes().to_vec()
+    path.as_os_str().as_bytes()
 }
 
 fn truncated_hex(digest: &[u8]) -> String {
