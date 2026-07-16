@@ -293,12 +293,48 @@ including ones created later:
 ```sh
 #!/bin/sh
 # installed by portool
-command -v portool >/dev/null 2>&1 && portool sync --quiet
+if command -v portool >/dev/null 2>&1; then
+  portool sync --quiet
+fi
 ```
+
+The `command -v` guard means the hook is a harmless no-op (exit 0) on
+machines without portool installed — even under hook managers that run
+hooks with `sh -e` and propagate exit codes.
 
 Because `git worktree add` runs a checkout internally, this fires on
 worktree creation too — that's the whole mechanism behind "ports just
 appear."
+
+If a `post-checkout` hook already exists, `init` appends a single
+`portool sync` line to it instead of overwriting, and re-running `init`
+never duplicates it.
+
+### `core.hooksPath` and Husky
+
+When `core.hooksPath` is set, git ignores `<git-common-dir>/hooks`, so
+`portool init` installs into the *effective* location instead:
+
+- **Husky** (`core.hooksPath=.husky/_`): the hook goes into the
+  user-managed `.husky/post-checkout` — Husky's own way of adding hooks —
+  so Husky's bootstrap (`HUSKY=0`, `~/.config/husky/init.sh`, PATH setup,
+  `sh -e`, exit-code propagation) stays fully in charge. The file is
+  tracked; commit it to share the hook with your team.
+
+  One Husky-inherited caveat: in a **brand-new worktree**, `.husky/_`
+  doesn't exist until `npm install` (the `prepare` script) generates it,
+  so no hook — portool's included — can fire on that first checkout, just
+  like hooks don't run in a fresh clone before `npm install`. Run
+  `portool sync` once in new worktrees, or add `portool sync --quiet` to
+  your package.json `prepare` script.
+
+- **Any other `core.hooksPath`** whose directory exists: portool installs
+  or appends `<hooksPath>/post-checkout` there, idempotently.
+
+- **A `core.hooksPath` directory that doesn't exist** (likely generated
+  by a tool portool doesn't recognize): `init` refuses to install into a
+  location git would never read, and prints the exact line to add to your
+  hook manager's `post-checkout` instead.
 
 ## Claude Code integration
 
