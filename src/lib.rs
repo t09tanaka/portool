@@ -8,6 +8,7 @@ pub mod alloc;
 pub mod cmd;
 pub mod config;
 pub mod envfile;
+pub mod envread;
 pub mod error;
 pub mod gc;
 pub mod gitctx;
