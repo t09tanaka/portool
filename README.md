@@ -205,6 +205,33 @@ with the `5432` default.
 wasn't found, `126` if it isn't executable. If you need shell features,
 ask for them explicitly: `portool exec -- sh -c '...'`.
 
+## Keep your repo portool-free
+
+portool works best when the repositories that use it don't depend on it.
+Treat it as an overlay applied from the outside, not a dependency built
+in:
+
+- **Scripts never call or detect portool.** `package.json`, `Makefile`,
+  and compose files stay portool-free; the caller wraps a command once —
+  `portool exec -e .env.test -- npm test` — where portool is available,
+  and runs `npm test` directly where it isn't.
+- **Every port reference carries a fallback.** `${WEB_PORT:-3000}` in
+  compose and env files, `process.env.WEB_PORT || 3000` in code. Machines
+  without portool (CI, a teammate's fresh laptop) get the defaults;
+  worktrees with portool get their own block.
+- **The unwrapped commands are the contract.** If `npm test` stops
+  working without portool, the integration is wrong — fix the fallback
+  rather than adding a portool dependency.
+
+The rest is already handled for you: the `post-checkout` hook no-ops when
+portool isn't installed, and `.env.portool` is gitignored, so a clone
+without portool never sees a trace of it beyond the inert
+`.portool.toml`.
+
+See [`examples/webapp`](examples/webapp) for a complete project laid out
+this way — the same files and commands, runnable with and without
+portool.
+
 ## Worktree identity
 
 `PORTOOL_*` is `portool`'s reserved env-var prefix. Two identity

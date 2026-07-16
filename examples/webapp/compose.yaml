@@ -1,0 +1,21 @@
+# The project name is namespaced by worktree identity, so two worktrees'
+# containers, networks, and volumes never collide. Without portool the
+# `default` fallback keeps a single shared namespace.
+name: webapp-${PORTOOL_WORKTREE_ID:-default}
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: app
+    ports:
+      - "${DB_PORT:-5432}:5432"
+
+  test-db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: app_test
+    ports:
+      - "${TEST_DB_PORT:-5433}:5432"
