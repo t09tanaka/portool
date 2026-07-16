@@ -719,7 +719,7 @@ fn init_with_missing_hookspath_warns_and_installs_nothing() {
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("core.hooksPath") && stderr.contains("does not exist"),
+        stderr.contains("core.hooksPath") && stderr.contains("is not an existing directory"),
         "expected a warning about the unusable hooksPath, got: {stderr}"
     );
     assert!(

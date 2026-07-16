@@ -76,9 +76,9 @@ fn install_hook(ctx: &GitCtx) -> Result<()> {
             resolved,
         } => {
             eprintln!(
-                "warning: core.hooksPath is set to '{configured}' but {} does not exist; \
-                 git would ignore a hook installed at <git-common-dir>/hooks, so nothing \
-                 was installed",
+                "warning: core.hooksPath is set to '{configured}' but {} is not an existing \
+                 directory; git would ignore a hook installed at <git-common-dir>/hooks, so \
+                 nothing was installed",
                 resolved.display()
             );
             eprintln!(

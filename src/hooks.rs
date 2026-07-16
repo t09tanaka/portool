@@ -24,9 +24,10 @@ pub enum HooksLocation {
     Husky { hook_file: PathBuf },
     /// Some other `core.hooksPath` whose directory exists.
     Custom { hooks_dir: PathBuf },
-    /// `core.hooksPath` is set but the directory doesn't exist (likely a
-    /// generated dir portool doesn't recognize); installing anywhere would
-    /// either be discarded or never run, so nothing is safe to touch.
+    /// `core.hooksPath` is set but doesn't point at an existing directory
+    /// -- missing, or an existing non-directory (likely a generated dir
+    /// portool doesn't recognize); installing anywhere would either be
+    /// discarded or never run, so nothing is safe to touch.
     Missing {
         configured: String,
         resolved: PathBuf,
