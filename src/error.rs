@@ -17,6 +17,12 @@ pub enum Error {
     PoolExhausted,
     /// Acquiring the registry lock timed out (exit code 4).
     LockTimeout,
+    /// `portool exec` could not find the requested command (exit code
+    /// 127, spec v0.4 §9).
+    CommandNotFound(String),
+    /// `portool exec` found the requested command but could not execute
+    /// it, e.g. missing execute permission (exit code 126, spec v0.4 §9).
+    CommandNotExecutable(String),
 }
 
 impl Error {
@@ -27,6 +33,8 @@ impl Error {
             Error::SubrangeExhausted => 2,
             Error::PoolExhausted => 3,
             Error::LockTimeout => 4,
+            Error::CommandNotExecutable(_) => 126,
+            Error::CommandNotFound(_) => 127,
         }
     }
 }
@@ -38,6 +46,8 @@ impl fmt::Display for Error {
             Error::SubrangeExhausted => write!(f, "subrange exhausted"),
             Error::PoolExhausted => write!(f, "pool exhausted"),
             Error::LockTimeout => write!(f, "lock timeout"),
+            Error::CommandNotFound(cmd) => write!(f, "command not found: {cmd}"),
+            Error::CommandNotExecutable(cmd) => write!(f, "cannot execute: {cmd}"),
         }
     }
 }
@@ -75,6 +85,8 @@ mod tests {
         assert_eq!(Error::SubrangeExhausted.exit_code(), 2);
         assert_eq!(Error::PoolExhausted.exit_code(), 3);
         assert_eq!(Error::LockTimeout.exit_code(), 4);
+        assert_eq!(Error::CommandNotExecutable("x".into()).exit_code(), 126);
+        assert_eq!(Error::CommandNotFound("x".into()).exit_code(), 127);
     }
 
     #[test]
@@ -83,6 +95,14 @@ mod tests {
         assert_eq!(Error::SubrangeExhausted.to_string(), "subrange exhausted");
         assert_eq!(Error::PoolExhausted.to_string(), "pool exhausted");
         assert_eq!(Error::LockTimeout.to_string(), "lock timeout");
+        assert_eq!(
+            Error::CommandNotFound("nope".into()).to_string(),
+            "command not found: nope"
+        );
+        assert_eq!(
+            Error::CommandNotExecutable("nope".into()).to_string(),
+            "cannot execute: nope"
+        );
     }
 
     #[test]

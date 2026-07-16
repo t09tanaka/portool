@@ -42,6 +42,15 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
+    /// Run a command with the worktree's allocated ports in its environment.
+    Exec {
+        /// Env file(s) to load, in order; later files override earlier ones.
+        #[arg(short = 'e', long = "env-file", value_name = "PATH")]
+        env_file: Vec<std::path::PathBuf>,
+        /// The command to run (everything after `--`).
+        #[arg(last = true, required = true, value_name = "COMMAND")]
+        command: Vec<std::ffi::OsString>,
+    },
     /// Reclaim stale worktree entries.
     Prune {
         /// Operate across all projects instead of just the current one.
@@ -63,6 +72,7 @@ fn main() {
         } => cmd::init::run(hook_only, gitignore_only),
         Command::Sync { quiet } => cmd::sync::run(quiet),
         Command::Ls { json, all } => cmd::ls::run(json, all),
+        Command::Exec { env_file, command } => cmd::exec::run(&env_file, &command),
         Command::Prune { all, dry_run } => cmd::prune::run(all, dry_run),
     };
 
