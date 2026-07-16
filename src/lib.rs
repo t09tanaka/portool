@@ -11,6 +11,7 @@ pub mod envfile;
 pub mod error;
 pub mod gc;
 pub mod gitctx;
+pub mod identity;
 pub mod lock;
 pub mod manifest;
 pub mod paths;

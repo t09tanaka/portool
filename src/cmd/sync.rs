@@ -7,6 +7,7 @@ use crate::config::Config;
 use crate::envfile;
 use crate::error::{Error, Result};
 use crate::gitctx::GitCtx;
+use crate::identity;
 use crate::lock;
 use crate::manifest::{default_block_size, manifest_hash, Manifest};
 use crate::paths;
@@ -99,6 +100,8 @@ fn try_fast_path(ctx: &GitCtx) -> Result<bool> {
         &worktree_key,
         entry.block,
         manifest_state.manifest.as_ref(),
+        &identity::project_id(&ctx.common_dir),
+        &identity::worktree_id(&ctx.common_dir, &ctx.worktree_root),
     );
     let actual = std::fs::read(ctx.worktree_root.join(".env.portool"));
     Ok(matches!(actual, Ok(bytes) if bytes == expected.as_bytes()))
@@ -229,6 +232,8 @@ fn slow_path(ctx: &GitCtx, quiet: bool) -> Result<()> {
         &worktree_key,
         final_block,
         manifest_state.manifest.as_ref(),
+        &identity::project_id(&ctx.common_dir),
+        &identity::worktree_id(&ctx.common_dir, &ctx.worktree_root),
     );
     write_atomic(&ctx.worktree_root.join(".env.portool"), rendered.as_bytes())?;
 
