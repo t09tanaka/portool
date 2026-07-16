@@ -24,20 +24,32 @@ const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 /// subranges list.
 type BlockAllocation = ((u16, u16), Vec<(u16, u16)>);
 
+/// The result of a successful sync: the worktree's block and its parsed
+/// manifest (if any), for callers that need the allocated values.
+pub struct SyncOutcome {
+    pub block: (u16, u16),
+    pub manifest: Option<Manifest>,
+}
+
 /// Runs `portool sync`. `quiet` suppresses the normal-case stdout summary
 /// emitted by the slow path (spec §9.2); warnings and hints always go to
 /// stderr regardless.
 pub fn run(quiet: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let ctx = GitCtx::discover(&cwd)?;
+    ensure(&ctx, quiet).map(|_| ())
+}
 
-    warn_if_hook_missing(&ctx);
+/// Runs the sync algorithm for an already-discovered worktree and returns
+/// the resulting allocation.
+pub fn ensure(ctx: &GitCtx, quiet: bool) -> Result<SyncOutcome> {
+    warn_if_hook_missing(ctx);
 
-    if try_fast_path(&ctx)? {
-        return Ok(());
+    if let Some(outcome) = try_fast_path(ctx)? {
+        return Ok(outcome);
     }
 
-    slow_path(&ctx, quiet)
+    slow_path(ctx, quiet)
 }
 
 /// The manifest state for a worktree: the parsed manifest (if any) plus the
@@ -68,14 +80,14 @@ fn load_manifest_state(worktree_root: &Path) -> Result<ManifestState> {
     }
 }
 
-/// Spec §7 steps 1-3: read-only, no lock. Returns `true` if the current
-/// worktree's ledger entry, manifest hash, and `.env.portool` bytes all
-/// already match -- in which case sync is a complete no-op.
-fn try_fast_path(ctx: &GitCtx) -> Result<bool> {
+/// Spec §7 steps 1-3: read-only, no lock. Returns the current allocation
+/// if the worktree's ledger entry, manifest hash, and `.env.portool` bytes
+/// all already match -- in which case sync is a complete no-op.
+fn try_fast_path(ctx: &GitCtx) -> Result<Option<SyncOutcome>> {
     // Read-only, lock-free: never heal a corrupt ledger here (finding 3).
     let load_result = store::load(&paths::registry_path(), false);
     if load_result.corrupt || load_result.read_error {
-        return Ok(false);
+        return Ok(None);
     }
 
     let common_dir_key = key(&ctx.common_dir);
@@ -87,12 +99,12 @@ fn try_fast_path(ctx: &GitCtx) -> Result<bool> {
         .and_then(|p| p.worktrees.get(&worktree_key))
     {
         Some(entry) => entry,
-        None => return Ok(false),
+        None => return Ok(None),
     };
 
     let manifest_state = load_manifest_state(&ctx.worktree_root)?;
     if entry.manifest_hash != manifest_state.hash {
-        return Ok(false);
+        return Ok(None);
     }
 
     let expected = envfile::render(
@@ -104,11 +116,18 @@ fn try_fast_path(ctx: &GitCtx) -> Result<bool> {
         &identity::worktree_id(&ctx.common_dir, &ctx.worktree_root),
     );
     let actual = std::fs::read(ctx.worktree_root.join(".env.portool"));
-    Ok(matches!(actual, Ok(bytes) if bytes == expected.as_bytes()))
+    if matches!(actual, Ok(bytes) if bytes == expected.as_bytes()) {
+        Ok(Some(SyncOutcome {
+            block: entry.block,
+            manifest: manifest_state.manifest,
+        }))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Spec §7 steps 4-10: locked read-modify-write.
-fn slow_path(ctx: &GitCtx, quiet: bool) -> Result<()> {
+fn slow_path(ctx: &GitCtx, quiet: bool) -> Result<SyncOutcome> {
     let _lock = lock::acquire(&paths::lock_path(), LOCK_TIMEOUT)?;
 
     let registry_path = paths::registry_path();
@@ -251,7 +270,10 @@ fn slow_path(ctx: &GitCtx, quiet: bool) -> Result<()> {
         );
     }
 
-    Ok(())
+    Ok(SyncOutcome {
+        block: final_block,
+        manifest: manifest_state.manifest,
+    })
 }
 
 /// Finds a block for this worktree within `registry`'s current state

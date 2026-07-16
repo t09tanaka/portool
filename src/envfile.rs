@@ -27,22 +27,39 @@ pub fn render(
         "# block: {}-{}  project: {}  worktree: {}",
         block.0, block.1, project_name, worktree_path
     );
-    let _ = writeln!(out, "PORTOOL_PROJECT_ID={project_id}");
-    let _ = writeln!(out, "PORTOOL_WORKTREE_ID={worktree_id}");
+    for (name, value) in variables(block, manifest, project_id, worktree_id) {
+        let _ = writeln!(out, "{name}={value}");
+    }
+
+    out
+}
+
+/// The portool-managed variables for a worktree, in `.env.portool` order:
+/// the two identity lines, then one `<KEY>_PORT` per manifest port (or a
+/// single `PORT` when there is no manifest).
+pub fn variables(
+    block: (u16, u16),
+    manifest: Option<&Manifest>,
+    project_id: &str,
+    worktree_id: &str,
+) -> Vec<(String, String)> {
+    let mut vars = Vec::new();
+    vars.push(("PORTOOL_PROJECT_ID".to_string(), project_id.to_string()));
+    vars.push(("PORTOOL_WORKTREE_ID".to_string(), worktree_id.to_string()));
 
     match manifest {
         Some(m) => {
             for (key, offset) in &m.ports {
                 let port = block.0 + offset;
-                let _ = writeln!(out, "{}={}", env_var_name(key), port);
+                vars.push((env_var_name(key), port.to_string()));
             }
         }
         None => {
-            let _ = writeln!(out, "PORT={}", block.0);
+            vars.push(("PORT".to_string(), block.0.to_string()));
         }
     }
 
-    out
+    vars
 }
 
 #[cfg(test)]
@@ -114,6 +131,58 @@ PORT=3000\n";
         let port_pos = rendered.find("WEB_PORT=").unwrap();
         assert!(project_id_pos < worktree_id_pos);
         assert!(worktree_id_pos < port_pos);
+    }
+
+    #[test]
+    fn variables_match_render_body_with_manifest() {
+        let manifest = Manifest::parse("[ports]\nweb = 0\napi = 1\nhmr = 2\ndb = 3\n").unwrap();
+        let block = (3000, 3004);
+
+        let vars = variables(block, Some(&manifest), PROJECT_ID, WORKTREE_ID);
+        assert_eq!(
+            vars,
+            vec![
+                ("PORTOOL_PROJECT_ID".to_string(), PROJECT_ID.to_string()),
+                ("PORTOOL_WORKTREE_ID".to_string(), WORKTREE_ID.to_string()),
+                ("WEB_PORT".to_string(), "3000".to_string()),
+                ("API_PORT".to_string(), "3001".to_string()),
+                ("HMR_PORT".to_string(), "3002".to_string()),
+                ("DB_PORT".to_string(), "3003".to_string()),
+            ]
+        );
+
+        // render() must be exactly the two comment lines plus these
+        // variables, so the two can never drift apart.
+        let rendered = render(
+            "myapp",
+            "/home/user/dev/myapp",
+            block,
+            Some(&manifest),
+            PROJECT_ID,
+            WORKTREE_ID,
+        );
+        let body: Vec<(String, String)> = rendered
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .map(|line| {
+                let (name, value) = line.split_once('=').unwrap();
+                (name.to_string(), value.to_string())
+            })
+            .collect();
+        assert_eq!(body, vars);
+    }
+
+    #[test]
+    fn variables_use_single_port_line_when_no_manifest() {
+        let vars = variables((3000, 3004), None, PROJECT_ID, WORKTREE_ID);
+        assert_eq!(
+            vars,
+            vec![
+                ("PORTOOL_PROJECT_ID".to_string(), PROJECT_ID.to_string()),
+                ("PORTOOL_WORKTREE_ID".to_string(), WORKTREE_ID.to_string()),
+                ("PORT".to_string(), "3000".to_string()),
+            ]
+        );
     }
 
     #[test]
