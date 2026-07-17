@@ -216,6 +216,7 @@ pub fn run(repair: bool, abandon_other_projects: bool) -> Result<()> {
 /// only). All advisories -- doctor's exit code is unaffected -- but a
 /// nonzero return suppresses the "nothing to repair" summary line.
 fn report_hook_health(ctx: &GitCtx) -> usize {
+    use crate::cmd::init::{managed_block_state, ManagedBlockState};
     use crate::hooks::{self, HooksLocation};
     use std::os::unix::fs::PermissionsExt;
 
@@ -251,6 +252,22 @@ fn report_hook_health(ctx: &GitCtx) -> usize {
             findings += 1;
             continue;
         }
+        match managed_block_state(&content) {
+            ManagedBlockState::Valid { begin, .. } if top_level_exit_precedes(&content, begin) => {
+                println!(
+                    "portool: doctor: hook {name}: has a top-level exit/exec before portool's \
+                     block; the block may never run (re-run 'portool init' to move it)"
+                );
+                findings += 1;
+            }
+            ManagedBlockState::Malformed => {
+                println!(
+                    "portool: doctor: hook {name}: managed block is malformed; fix it by hand"
+                );
+                findings += 1;
+            }
+            _ => {}
+        }
         match embedded_bin_path(&content) {
             Some(bin) if !Path::new(&bin).exists() => {
                 println!(
@@ -271,6 +288,21 @@ fn report_hook_health(ctx: &GitCtx) -> usize {
         }
     }
     findings
+}
+
+/// True when a line starting at column 0 (i.e. not indented -- so not inside
+/// an `if`/`case`/function body) and consisting of `exit`, `exit N`, `exec`,
+/// or `exec ...` appears among `content`'s first `before_line` lines. Used to
+/// flag a managed block that portool <= 0.8 appended at EOF, after a
+/// top-level `exit 0` git will never reach past.
+fn top_level_exit_precedes(content: &str, before_line: usize) -> bool {
+    content.lines().take(before_line).any(|line| {
+        if line.starts_with(char::is_whitespace) {
+            return false;
+        }
+        let t = line.trim_end();
+        t == "exit" || t.starts_with("exit ") || t == "exec" || t.starts_with("exec ")
+    })
 }
 
 /// Extracts the absolute path embedded as `PORTOOL_BIN="<path>"` in a hook
@@ -359,5 +391,20 @@ mod tests {
         assert!(validate_block((4000, 3999)).is_err());
         assert!(validate_block((3000, 3004)).is_ok());
         assert!(validate_block((3000, 3000)).is_ok());
+    }
+
+    #[test]
+    fn detects_top_level_exit_before_block() {
+        let content = "#!/bin/sh\nexit 0\n# >>> portool >>>\nB\n# <<< portool <<<\n";
+        assert!(top_level_exit_precedes(content, 2));
+        let indented =
+            "#!/bin/sh\nif x; then\n  exit 1\nfi\n# >>> portool >>>\nB\n# <<< portool <<<\n";
+        assert!(
+            !top_level_exit_precedes(indented, 4),
+            "indented exit is not top-level"
+        );
+        let exec_line =
+            "#!/bin/sh\nexec other-hook \"$@\"\n# >>> portool >>>\nB\n# <<< portool <<<\n";
+        assert!(top_level_exit_precedes(exec_line, 2));
     }
 }

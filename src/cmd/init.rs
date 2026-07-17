@@ -87,7 +87,7 @@ pub(crate) enum HookOutcome {
 ///   extending to EOF and owned wholesale by `install_into`/`deinit_hook`,
 ///   which could delete a user's own code appended after a portool block
 ///   whose end marker was accidentally deleted.
-enum ManagedBlockState {
+pub(crate) enum ManagedBlockState {
     Absent,
     /// Line indices into `content.lines()`, inclusive.
     Valid {
@@ -100,7 +100,12 @@ enum ManagedBlockState {
 /// Scans `content` line-exactly (matching how [`replace_managed_block`]
 /// slices) for the begin/end markers and classifies the result. See
 /// [`ManagedBlockState`] for the exact rule.
-fn managed_block_state(content: &str) -> ManagedBlockState {
+///
+/// `pub(crate)`: reused by `doctor`'s hook-health report (Task 3) to detect
+/// both a malformed layout and an unreachable-but-valid block (one sitting
+/// after a top-level `exit`/`exec` left by portool <= 0.8's EOF-append
+/// insertion).
+pub(crate) fn managed_block_state(content: &str) -> ManagedBlockState {
     let mut begins = Vec::new();
     let mut ends = Vec::new();
     for (i, line) in content.lines().enumerate() {

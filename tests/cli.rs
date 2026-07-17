@@ -2384,6 +2384,79 @@ fn doctor_reports_hook_problems() {
     assert!(stdout.contains("/no/such/portool"), "got: {stdout}");
 }
 
+/// Task 3 (external review, doctor's unreachable-hook detection): a hook
+/// installed by portool <= 0.8 appended the managed block at EOF, after a
+/// top-level `exit 0` git never reaches past. Such a hook still "invokes
+/// portool" and is executable, so the pre-existing checks call it healthy;
+/// `doctor` must additionally flag it as unreachable. Built by hand (not via
+/// `init`, which now inserts after the shebang and would never reproduce
+/// this legacy layout).
+#[test]
+fn existing_hook_exit_before_managed_block_is_not_reported_healthy() {
+    let env = TestEnv::new();
+    let repo = env.path("app");
+    init_repo(&repo);
+    assert!(env.run(&repo, &["sync"]).status.success());
+
+    let hooks = repo.join(".git/hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    let legacy_layout = format!(
+        "#!/bin/sh\nexit 0\n{}\nPORTOOL_BIN=portool\nif command -v \"$PORTOOL_BIN\" >/dev/null 2>&1; then \"$PORTOOL_BIN\" sync --quiet || true; fi\n{}\n",
+        portool::hooks::HOOK_BLOCK_BEGIN,
+        portool::hooks::HOOK_BLOCK_END,
+    );
+    for name in ["post-checkout", "post-merge"] {
+        fs::write(hooks.join(name), &legacy_layout).unwrap();
+        fs::set_permissions(hooks.join(name), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let out = env.run(&repo, &["doctor"]);
+    assert!(
+        out.status.success(),
+        "doctor's hook-health report is advisory only; exit code must stay 0"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("top-level exit/exec before portool's block"),
+        "got: {stdout}"
+    );
+}
+
+/// Task 3: a hook with a malformed managed block (duplicate begin markers)
+/// still contains a portool invocation, so `doctor` must go on to flag the
+/// malformed layout specifically rather than calling the hook healthy.
+#[test]
+fn doctor_reports_a_malformed_managed_block() {
+    let env = TestEnv::new();
+    let repo = env.path("app");
+    init_repo(&repo);
+    assert!(env.run(&repo, &["sync"]).status.success());
+
+    let hooks = repo.join(".git/hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    let malformed = format!(
+        "#!/bin/sh\n{}\nportool sync --quiet || true\n{}\n{}\nother\n{}\n",
+        portool::hooks::HOOK_BLOCK_BEGIN,
+        portool::hooks::HOOK_BLOCK_END,
+        portool::hooks::HOOK_BLOCK_BEGIN,
+        portool::hooks::HOOK_BLOCK_END,
+    );
+    fs::write(hooks.join("post-checkout"), &malformed).unwrap();
+    fs::set_permissions(
+        hooks.join("post-checkout"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+
+    let out = env.run(&repo, &["doctor"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("managed block is malformed"),
+        "got: {stdout}"
+    );
+}
+
 /// The config is validated before the lock-free fast path: a config broken
 /// *after* a successful sync still fails the next sync, instead of being
 /// skipped on the fast path and only surfacing days later (external review
