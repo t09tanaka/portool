@@ -1092,3 +1092,61 @@ fn exec_reallocate_on_conflict_moves_and_warns_about_split() {
         "--reallocate-on-conflict must move off the occupied block"
     );
 }
+
+// --- 28. --env-file-overrides lets files beat the parent (v0.8.0) -----------
+
+/// External review: `portool exec -e .env.test -- npm test` was silently
+/// losing to a stale parent `DATABASE_URL`. `--env-file-overrides` flips the
+/// parent/file precedence (parent < files < portool) so an explicitly
+/// passed env file wins; without the flag, the parent still wins (spec §6
+/// regression check).
+#[test]
+fn exec_env_file_overrides_beats_the_parent_environment() {
+    let env = TestEnv::new();
+    env.write_config("range = [19200, 19299]\n");
+    let repo = env.path("repo");
+    init_repo(&repo);
+    fs::write(repo.join(".env.test"), "DATABASE_URL=file-value\n").unwrap();
+
+    let output = run_with_env(
+        &env,
+        &repo,
+        &[("DATABASE_URL", "parent-value")],
+        &[
+            "exec",
+            "--env-file-overrides",
+            "--env-file",
+            ".env.test",
+            "--",
+            "sh",
+            "-c",
+            r#"printf "%s" "$DATABASE_URL""#,
+        ],
+    );
+    assert_eq!(
+        success_stdout(&output),
+        "file-value",
+        "--env-file-overrides must let the env file beat the parent"
+    );
+
+    // Regression: without the flag, the parent still wins (current default).
+    let output = run_with_env(
+        &env,
+        &repo,
+        &[("DATABASE_URL", "parent-value")],
+        &[
+            "exec",
+            "--env-file",
+            ".env.test",
+            "--",
+            "sh",
+            "-c",
+            r#"printf "%s" "$DATABASE_URL""#,
+        ],
+    );
+    assert_eq!(
+        success_stdout(&output),
+        "parent-value",
+        "without the flag, the parent must still win"
+    );
+}

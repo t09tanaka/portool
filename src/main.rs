@@ -62,6 +62,10 @@ enum Command {
         /// the old ports, so the worktree can end up split across blocks.
         #[arg(long)]
         reallocate_on_conflict: bool,
+        /// Let the given env files override inherited environment variables
+        /// (default: the parent environment wins over env files).
+        #[arg(long)]
+        env_file_overrides: bool,
         /// The command to run (everything after `--`).
         #[arg(last = true, required = true, value_name = "COMMAND")]
         command: Vec<std::ffi::OsString>,
@@ -162,6 +166,7 @@ fn main() {
             check_ports,
             strict,
             reallocate_on_conflict,
+            env_file_overrides,
             command,
         } => cmd::exec::run(
             &env_file,
@@ -169,6 +174,7 @@ fn main() {
             check_ports,
             strict,
             reallocate_on_conflict,
+            env_file_overrides,
         ),
         Command::Reallocate { quiet } => cmd::sync::reallocate_cmd(quiet),
         Command::Prune { all, dry_run } => cmd::prune::run(all, dry_run),
