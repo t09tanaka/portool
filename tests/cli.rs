@@ -1604,7 +1604,7 @@ fn malformed_config_is_fatal() {
     );
 }
 
-// --- Batch C: allocation from the pool, reallocate, exec bind-recheck ------
+// --- Batch C: allocation from the pool, reallocate ------------------------
 
 /// The core fix for the 14-repository exhaustion: blocks come straight from
 /// the pool, so a tiny pool holds exactly as many blocks as it has slots --
@@ -1692,30 +1692,10 @@ fn reallocate_without_allocation_errors() {
     assert_eq!(output.status.code(), Some(1));
 }
 
-/// `portool exec --strict` fails when the allocated block's port is in use at
-/// the execution boundary.
-#[test]
-fn exec_strict_fails_when_block_port_in_use() {
-    let env = TestEnv::new();
-    let repo = env.path("repo");
-    init_repo(&repo);
-    fs::write(repo.join(".portool.toml"), "[ports]\nweb = 0\n").unwrap();
-    assert!(env.run(&repo, &["sync"]).status.success());
-
-    // Hold a guaranteed-free ephemeral port and pin the worktree onto it, so
-    // the execution-boundary bind-recheck sees a real, deterministic conflict.
-    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let port = listener.local_addr().unwrap().port();
-    pin_block_to_port(&env, &repo, port);
-
-    let output = env.run(&repo, &["exec", "--strict", "--", "true"]);
-    assert_eq!(
-        output.status.code(),
-        Some(1),
-        "exec --strict must fail on a port conflict; stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
+// v0.8.0 (external review 3rd round P1-2): exec's bind check moved from
+// default-on to opt-in via --check-ports/--strict/--reallocate-on-conflict.
+// The exec bind-recheck coverage now lives in tests/exec.rs, alongside the
+// rest of exec's behavior.
 
 // --- Batch D: check / release / deinit / doctor ---------------------------
 

@@ -20,12 +20,18 @@ use std::path::PathBuf;
 /// is replaced by `command`. Any failure — sync, env construction, or the
 /// exec itself — happens before the child runs (spec §5, §10).
 ///
-/// `strict` turns the execution-boundary bind conflict (batch C #1) into a
-/// hard failure; `reallocate_on_conflict` moves the worktree to a fresh
-/// block instead of warning. Both default off.
+/// The execution-boundary bind check (batch C #1) is opt-in as of v0.8.0
+/// (external review 3rd round P1-2): `check_ports` turns it on as an
+/// advisory warning; `strict` turns a detected conflict into a hard
+/// failure; `reallocate_on_conflict` moves the worktree to a fresh block
+/// instead of warning. `strict` and `reallocate_on_conflict` each imply the
+/// check even without `check_ports`. All three default off, since a
+/// worktree's own already-running dev servers legitimately occupy its
+/// block.
 pub fn run(
     env_files: &[PathBuf],
     command: &[OsString],
+    check_ports: bool,
     strict: bool,
     reallocate_on_conflict: bool,
 ) -> Result<()> {
@@ -44,18 +50,25 @@ pub fn run(
     // Spec §5 step 3: sync first; if it fails the child is never started.
     let outcome = sync::ensure(&ctx, true)?;
 
-    // Batch C #1: exec is the execution boundary -- the one place worth
-    // verifying the block's ports are actually free right now. A conflict
-    // here may just be this worktree's own already-running server, so the
-    // default is a neutral advisory, not a failure or a silent move.
-    let outcome = if ports::block_free(outcome.block) {
+    // v0.8.0 (external review 3rd round P1-2): the bind check is opt-in. A
+    // worktree's own dev servers legitimately occupy the block, so a
+    // default-on check made every second `portool exec` noisy. --strict
+    // and --reallocate-on-conflict imply the check.
+    let check = check_ports || strict || reallocate_on_conflict;
+    let outcome = if !check || ports::block_free(outcome.block) {
         outcome
     } else if reallocate_on_conflict {
+        eprintln!(
+            "portool: ports {}-{} are in use; moving to a fresh block -- processes \
+             already running keep the old ports, so this worktree may end up split \
+             across old and new blocks until they are restarted",
+            outcome.block.0, outcome.block.1
+        );
         sync::reallocate(&ctx, true)?
     } else {
         eprintln!(
-            "portool: ports {}-{} are in use -- this may be this worktree's own running \
-             processes (pass --reallocate-on-conflict to move, --strict to fail)",
+            "portool: ports {}-{} are in use -- this may be this worktree's own \
+             running processes (pass --strict to fail instead)",
             outcome.block.0, outcome.block.1
         );
         if strict {

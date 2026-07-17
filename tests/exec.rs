@@ -970,3 +970,125 @@ fn exec_examples_webapp_env_test_expands_to_allocated_port() {
         ".env.test must keep a fallback default for portool-free environments"
     );
 }
+
+// --- 27. bind check is opt-in (v0.8.0) --------------------------------------
+
+/// Rewrites the ledger so `repo`'s worktree block is the single-port block
+/// `(port, port)`. Combined with a held ephemeral port, this creates a
+/// deterministic bind conflict at the execution boundary -- avoiding the race
+/// of binding a *predicted* port that a parallel test might grab first.
+/// Duplicated from tests/cli.rs: integration tests are separate crates and
+/// cannot share code.
+fn pin_block_to_port(env: &TestEnv, repo: &Path, port: u16) {
+    let mut reg: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(env.registry_path()).unwrap()).unwrap();
+    reg["projects"][common_dir_key(repo)]["worktrees"][worktree_key(repo)]["block"] =
+        serde_json::json!([port, port]);
+    fs::write(env.registry_path(), serde_json::to_string(&reg).unwrap()).unwrap();
+}
+
+/// Sets up a repo with a single-port manifest, synced, then pinned onto a
+/// held ephemeral port so the block is guaranteed to conflict. Returns the
+/// held listener (keep it alive for the duration of the test) and the port.
+fn repo_with_pinned_conflict(env: &TestEnv) -> (PathBuf, std::net::TcpListener, u16) {
+    env.write_config("range = [19000, 19099]\n");
+    let repo = env.path("repo");
+    init_bare_repo(&repo);
+    fs::write(repo.join(".portool.toml"), "[ports]\nweb = 0\n").unwrap();
+    assert!(env.run(&repo, &["sync"]).status.success());
+
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    pin_block_to_port(env, &repo, port);
+
+    (repo, listener, port)
+}
+
+/// v0.8.0: exec no longer bind-checks by default -- running a second
+/// process of the same worktree must be silent (external review 3rd round
+/// P1-2).
+#[test]
+fn exec_is_silent_by_default_even_when_block_ports_are_bound() {
+    let env = TestEnv::new();
+    let (repo, _listener, _port) = repo_with_pinned_conflict(&env);
+
+    let output = env.run(&repo, &["exec", "--", "sh", "-c", "true"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("in use"),
+        "default exec must not bind-check, stderr was: {stderr}"
+    );
+}
+
+/// `--check-ports` opts back into the advisory bind check.
+#[test]
+fn exec_check_ports_warns_when_block_ports_are_bound() {
+    let env = TestEnv::new();
+    let (repo, _listener, _port) = repo_with_pinned_conflict(&env);
+
+    let output = env.run(&repo, &["exec", "--check-ports", "--", "sh", "-c", "true"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("in use"),
+        "--check-ports must warn on a conflict, stderr was: {stderr}"
+    );
+}
+
+/// `--strict` implies the bind check and fails hard on a conflict, without
+/// needing `--check-ports` alongside it.
+#[test]
+fn exec_strict_fails_on_conflict_without_needing_check_ports() {
+    let env = TestEnv::new();
+    let (repo, _listener, _port) = repo_with_pinned_conflict(&env);
+
+    let output = env.run(&repo, &["exec", "--strict", "--", "sh", "-c", "true"]);
+    assert!(
+        !output.status.success(),
+        "--strict must fail on a port conflict"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("in use"), "stderr was: {stderr}");
+}
+
+/// `--reallocate-on-conflict` implies the bind check, moves the worktree off
+/// the occupied block, and warns about the risk of ending up split across
+/// old and new blocks (processes already running keep the old ports).
+#[test]
+fn exec_reallocate_on_conflict_moves_and_warns_about_split() {
+    let env = TestEnv::new();
+    let (repo, _listener, port) = repo_with_pinned_conflict(&env);
+
+    let output = env.run(
+        &repo,
+        &["exec", "--reallocate-on-conflict", "--", "sh", "-c", "true"],
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("split"),
+        "--reallocate-on-conflict must warn about a possible split, stderr was: {stderr}"
+    );
+
+    let block = env.registry()["projects"][common_dir_key(&repo)]["worktrees"][worktree_key(&repo)]
+        ["block"]
+        .clone();
+    assert_ne!(
+        block,
+        serde_json::json!([port, port]),
+        "--reallocate-on-conflict must move off the occupied block"
+    );
+}
