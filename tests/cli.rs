@@ -831,6 +831,10 @@ fn init_with_missing_hookspath_warns_and_installs_nothing() {
 #[test]
 fn ls_table_and_json_shapes() {
     let env = TestEnv::new();
+    // An isolated range: this test asserts the exact block value, which
+    // parallel tests' transient bind checks on the default 3000+ pool can
+    // otherwise push off its expected slot.
+    env.write_config("range = [4300, 4319]\nblock_align = 5\n");
     let repo_a = env.path("repo-a");
     init_repo(&repo_a);
     assert!(env.run(&repo_a, &["sync"]).status.success());
@@ -853,7 +857,7 @@ fn ls_table_and_json_shapes() {
     assert_eq!(data_lines.len(), 1, "only repo-a's row should be shown");
     assert!(data_lines[0].contains("repo-a"));
     assert!(data_lines[0].contains("main"));
-    assert!(data_lines[0].contains("3000-3004"));
+    assert!(data_lines[0].contains("4300-4304"));
     assert!(data_lines[0].contains("active"));
     assert!(!data_lines[0].contains("repo-b"));
 
@@ -870,7 +874,7 @@ fn ls_table_and_json_shapes() {
     let json: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&output.stdout))
         .expect("ls --json must emit valid JSON");
     assert_eq!(json["version"], serde_json::json!(3));
-    assert_eq!(json["range"], serde_json::json!([3000, 9999]));
+    assert_eq!(json["range"], serde_json::json!([4300, 4319]));
     let projects = json["projects"].as_object().unwrap();
     assert_eq!(projects.len(), 1);
     assert!(projects.contains_key(&common_dir_key(&repo_a)));
@@ -1670,6 +1674,9 @@ fn future_schema_ledger_is_not_auto_reset() {
 #[test]
 fn doctor_repair_moves_corrupt_ledger_aside_and_rebuilds() {
     let env = TestEnv::new();
+    // An isolated range keeps this test's bind checks (and block values)
+    // clear of the parallel tests sharing the default 3000+ pool.
+    env.write_config("range = [4200, 4209]\nblock_align = 5\n");
     let repo = env.path("repo");
     init_repo(&repo);
     assert!(env.run(&repo, &["sync"]).status.success());
@@ -1750,6 +1757,7 @@ fn doctor_skips_invalid_block_headers() {
 #[test]
 fn fast_path_rejects_newly_malformed_config() {
     let env = TestEnv::new();
+    env.write_config("range = [4210, 4219]\nblock_align = 5\n");
     let repo = env.path("repo");
     init_repo(&repo);
     assert!(env.run(&repo, &["sync"]).status.success());
@@ -1771,6 +1779,7 @@ fn fast_path_rejects_newly_malformed_config() {
 #[test]
 fn reallocate_moves_even_when_current_block_is_free() {
     let env = TestEnv::new();
+    env.write_config("range = [4220, 4239]\nblock_align = 5\n");
     let repo = env.path("repo");
     init_repo(&repo);
     assert!(env.run(&repo, &["sync"]).status.success());
@@ -1853,6 +1862,7 @@ fn init_refuses_global_husky_shaped_hookspath() {
 #[test]
 fn release_env_delete_failure_keeps_the_ledger_entry() {
     let env = TestEnv::new();
+    env.write_config("range = [4240, 4249]\nblock_align = 5\n");
     let repo = env.path("repo");
     init_repo(&repo);
     assert!(env.run(&repo, &["sync"]).status.success());
@@ -1926,6 +1936,7 @@ fn edit_registry(env: &TestEnv, mutate: impl FnOnce(&mut serde_json::Value)) {
 #[test]
 fn v2_ledger_is_migrated_with_blocks_preserved() {
     let env = TestEnv::new();
+    env.write_config("range = [4250, 4259]\nblock_align = 5\n");
     let repo = env.path("repo");
     init_repo(&repo);
     assert!(env.run(&repo, &["sync"]).status.success());
@@ -1954,7 +1965,7 @@ fn v2_ledger_is_migrated_with_blocks_preserved() {
         serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
     assert_eq!(json["version"], serde_json::json!(3));
     let entry = &json["projects"][common_dir_key(&repo)]["worktrees"][worktree_key(&repo)];
-    assert_eq!(entry["block"], serde_json::json!([3000, 3004]));
+    assert_eq!(entry["block"], serde_json::json!([4250, 4254]));
     assert_eq!(entry["generation"], serde_json::json!(1));
     assert_eq!(entry["pending_block"], serde_json::Value::Null);
 }
@@ -1965,23 +1976,24 @@ fn v2_ledger_is_migrated_with_blocks_preserved() {
 #[test]
 fn interrupted_move_rolls_forward_when_env_carries_pending() {
     let env = TestEnv::new();
+    env.write_config("range = [4260, 4269]\nblock_align = 5\n");
     let repo = env.path("repo");
     init_repo(&repo);
     assert!(env.run(&repo, &["sync"]).status.success());
 
     edit_registry(&env, |reg| {
         reg["projects"][common_dir_key(&repo)]["worktrees"][worktree_key(&repo)]["pending_block"] =
-            serde_json::json!([3100, 3104]);
+            serde_json::json!([4265, 4269]);
     });
     // Simulate the phase-2 env write having completed: rewrite the header
     // to the pending block with the post-move generation.
     let env_file = fs::read_to_string(repo.join(".env.portool")).unwrap();
     let moved = env_file
         .replace(
-            "# block: 3000-3004  generation: 1",
-            "# block: 3100-3104  generation: 2",
+            "# block: 4260-4264  generation: 1",
+            "# block: 4265-4269  generation: 2",
         )
-        .replace("PORT=3000", "PORT=3100");
+        .replace("PORT=4260", "PORT=4265");
     fs::write(repo.join(".env.portool"), moved).unwrap();
 
     let output = env.run(&repo, &["sync"]);
@@ -1995,7 +2007,7 @@ fn interrupted_move_rolls_forward_when_env_carries_pending() {
         env.registry()["projects"][common_dir_key(&repo)]["worktrees"][worktree_key(&repo)].clone();
     assert_eq!(
         entry["block"],
-        serde_json::json!([3100, 3104]),
+        serde_json::json!([4265, 4269]),
         "the move must be rolled forward to the block the env already uses"
     );
     assert_eq!(entry["generation"], serde_json::json!(2));
@@ -2009,13 +2021,14 @@ fn interrupted_move_rolls_forward_when_env_carries_pending() {
 #[test]
 fn interrupted_move_rolls_back_when_env_still_has_old_block() {
     let env = TestEnv::new();
+    env.write_config("range = [4270, 4279]\nblock_align = 5\n");
     let repo = env.path("repo");
     init_repo(&repo);
     assert!(env.run(&repo, &["sync"]).status.success());
 
     edit_registry(&env, |reg| {
         reg["projects"][common_dir_key(&repo)]["worktrees"][worktree_key(&repo)]["pending_block"] =
-            serde_json::json!([3100, 3104]);
+            serde_json::json!([4275, 4279]);
     });
 
     let output = env.run(&repo, &["sync"]);
@@ -2029,7 +2042,7 @@ fn interrupted_move_rolls_back_when_env_still_has_old_block() {
         env.registry()["projects"][common_dir_key(&repo)]["worktrees"][worktree_key(&repo)].clone();
     assert_eq!(
         entry["block"],
-        serde_json::json!([3000, 3004]),
+        serde_json::json!([4270, 4274]),
         "the never-completed move must be rolled back"
     );
     assert_eq!(entry["generation"], serde_json::json!(1));
@@ -2090,6 +2103,7 @@ fn pending_block_is_excluded_from_allocation() {
 #[test]
 fn reallocate_bumps_the_generation() {
     let env = TestEnv::new();
+    env.write_config("range = [4280, 4299]\nblock_align = 5\n");
     let repo = env.path("repo");
     init_repo(&repo);
     assert!(env.run(&repo, &["sync"]).status.success());
