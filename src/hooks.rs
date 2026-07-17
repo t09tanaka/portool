@@ -6,9 +6,34 @@ use crate::gitctx::{self, GitCtx};
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
-/// The substring that marks a hook (or a line in one) as portool's own;
-/// both `init` (idempotency) and `sync` (missing-hook hint) key off it.
+/// The substring that marks a legacy appended portool line (the pre-managed-
+/// block forms `init` used to emit) as portool's own; only
+/// [`contains_portool_invocation`] still keys off it directly.
 pub const HOOK_MARKER: &str = "portool sync";
+
+/// The comment on the *second* line of portool's owned standalone hook
+/// script. Its presence there -- regardless of anything else in the file --
+/// identifies the file as portool's own, covering every shape portool has
+/// ever emitted (old and new); `init` rewrites such a file wholesale when
+/// its content goes stale (e.g. a moved binary path).
+pub const HOOK_OWNED_COMMENT: &str = "# installed by portool";
+
+/// Marks the start of the managed block `init` appends to a foreign hook.
+pub const HOOK_BLOCK_BEGIN: &str = "# >>> portool >>>";
+
+/// Marks the end of the managed block `init` appends to a foreign hook.
+pub const HOOK_BLOCK_END: &str = "# <<< portool <<<";
+
+/// True when `content` carries any portool hook form: an owned standalone
+/// script, a managed block, or a legacy appended line. Intentionally a
+/// loose substring heuristic -- used only for warnings/hints (e.g. `sync`'s
+/// missing-hook nag), never for install/deinit decisions, which use the
+/// line-exact checks in `crate::cmd::init`.
+pub fn contains_portool_invocation(content: &str) -> bool {
+    content.contains(HOOK_OWNED_COMMENT)
+        || content.contains(HOOK_BLOCK_BEGIN)
+        || content.contains(HOOK_MARKER)
+}
 
 /// Where portool's `post-checkout` invocation belongs for this repository.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -270,6 +295,20 @@ mod tests {
             loc.hook_file("post-merge"),
             Some(PathBuf::from("/work/repo/.husky/post-merge"))
         );
+    }
+
+    #[test]
+    fn contains_portool_invocation_recognizes_every_form() {
+        assert!(contains_portool_invocation(
+            "#!/bin/sh\n# installed by portool\nexit 0\n"
+        ));
+        assert!(contains_portool_invocation(
+            "#!/bin/sh\necho hi\n# >>> portool >>>\n...\n# <<< portool <<<\n"
+        ));
+        assert!(contains_portool_invocation(
+            "#!/bin/sh\nif command -v portool >/dev/null 2>&1; then portool sync --quiet || true; fi\n"
+        ));
+        assert!(!contains_portool_invocation("#!/bin/sh\necho hi\n"));
     }
 
     #[test]

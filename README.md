@@ -36,9 +36,7 @@ requests, or supervises processes. The one place it touches your command
 line is [`portool exec`](#portool-exec) — a thin execution boundary that
 composes the allocated ports into an environment and then replaces itself
 with your command via `exec(2)`. Even there it templates nothing on its
-own: the only env files it expands are the ones you explicitly pass. It
-doesn't provide `pin`/`unpin` commands yet even though the ledger schema
-already has room for pinned entries.
+own: the only env files it expands are the ones you explicitly pass.
 
 ## Install
 
@@ -52,9 +50,18 @@ Requires macOS or Linux (see [Platform support](#platform-support)).
 
 ```sh
 cd your-repo
-portool init      # installs the post-checkout hook, updates .gitignore, runs sync
+portool init      # installs the post-checkout hook, updates git's info/exclude, runs sync
 cat .env.portool   # your ports are already here
 ```
+
+No `.portool.toml` yet? `sync` and `exec` both still work — you get a
+single `PORT` variable pointing at a free block:
+
+```sh
+portool exec -- npm run dev   # PORT=<block start> injected, no manifest needed
+```
+
+See [`.portool.toml`](#portooltoml) to declare more than one port.
 
 From here on, every worktree gets its own block automatically:
 
@@ -63,9 +70,6 @@ git worktree add ../your-repo-feature-x -b feature-x
 cd ../your-repo-feature-x
 cat .env.portool   # a different block, allocated by the hook during checkout
 ```
-
-No `.portool.toml`? You still get a `PORT` variable pointing at a free
-block — see [`.portool.toml`](#portooltoml) to declare more than one port.
 
 ## `.portool.toml`
 
@@ -89,6 +93,10 @@ db  = 3
 - No manifest at all → a single `block_align`-wide block, exposed as
   `PORT=<block start>`. This lets you adopt `portool` before writing a
   manifest.
+- The manifest is fail-closed: an empty `[ports]` table, an unknown
+  top-level field, or a `portool`/`portool_*` key (reserved for portool's
+  own identity variables) is a hard `.portool.toml` error rather than a
+  silent single-block fallback or a colliding env var.
 
 ## `.env.portool`
 
@@ -188,10 +196,11 @@ Expansion rules:
 - An undefined `${NAME}` is an error — use `${NAME:-default}` when a
   fallback makes sense.
 
-`exec` must run inside a git worktree whose root has a `.portool.toml`.
-Env-file paths are resolved relative to the current working directory,
-and a missing file is an error — nothing (`.env`, `.env.test`, …) is ever
-read implicitly.
+`exec` must run inside a git worktree — no `.portool.toml` is required (see
+[Quick start](#quick-start)); without one you get a single `PORT`
+variable, same as `sync`. Env-file paths are resolved relative to the
+current working directory, and a missing file is an error — nothing
+(`.env`, `.env.test`, …) is ever read implicitly.
 
 **Execution-boundary check.** After syncing, `exec` bind-checks the
 allocated block on `127.0.0.1` — the one moment it's worth confirming the
@@ -291,42 +300,78 @@ portool reallocate [--quiet]
 portool ls         [--json] [--all]
 portool prune      [--all] [--dry-run]
 portool check
-portool doctor     [--repair]
+portool doctor     [--repair] [--abandon-other-projects]
 portool release
-portool deinit
+portool unhook
+portool deinit     [--keep-allocations]
+portool reserve    <PORT|START-END> [--label <LABEL>]
+portool unreserve  <PORT|START-END>
+portool pin        [--label <LABEL>]
+portool unpin
 ```
 
 - **`check`** — validate the config and ledger; exits non-zero on any
   problem (read-only, script-friendly).
 - **`doctor`** — diagnose and repair the current project: re-import ledger
-  entries from live worktrees' `.env.portool`, and report blocks whose ports
-  are currently in use. `--repair` is the **only** way portool ever moves a
-  corrupt ledger aside (to `registry.json.corrupt-<ts>`) before rebuilding —
-  every other command fails closed on a corrupt or unsupported-version
+  entries from live worktrees' `.env.portool`, report blocks whose ports are
+  currently in use, and check hook effectiveness. `--repair` is the **only**
+  way portool ever touches a corrupt ledger: it restores `registry.json`
+  from `registry.json.bak` (every project kept) and copies the corrupt file
+  aside to `registry.json.corrupt-<ts>`; without a usable backup it refuses
+  and points at `--repair --abandon-other-projects`, the one destructive
+  path, which discards the ledger and rebuilds only the current project.
+  Every other command fails closed on a corrupt or unsupported-version
   ledger and leaves the file untouched.
 - **`release`** — free the current worktree's block from the ledger and
   remove its `.env.portool`.
-- **`deinit`** — reverse `init`: remove portool's `post-checkout` /
-  `post-merge` hook lines and the `.gitignore` entry.
+- **`unhook`** — remove portool's `post-checkout` / `post-merge` hook
+  content and nothing else.
+- **`deinit`** — full reverse of `init`: releases this project's ledger
+  allocations, removes every worktree's `.env.portool`, removes the hooks,
+  and removes the `info/exclude` entry. Pass `--keep-allocations` to only
+  remove the hooks and the ignore rule (the pre-0.7 `deinit` behavior).
+- **`reserve`** / **`unreserve`** — permanently reserve (or release) a port
+  or port range so portool never allocates over it, even when nothing is
+  currently listening there.
+- **`pin`** / **`unpin`** — exempt (or stop exempting) the current
+  worktree's allocation from garbage collection.
 
 ### `portool init`
 
-Installs the `post-checkout` hook (§ below), appends `.env.portool` to
-`.gitignore`, then runs `sync` once. All three steps are idempotent — running
-`init` again never duplicates the hook line or the `.gitignore` entry.
+Installs the `post-checkout` / `post-merge` hooks (§ below), appends
+`.env.portool` to `$GIT_COMMON_DIR/info/exclude` (never the tracked
+`.gitignore` — see below), then runs `sync` once. All three steps are
+idempotent — running `init` again never duplicates the hook content or the
+`info/exclude` entry.
 
 | Flag | Effect |
 |---|---|
-| `--hook-only` | Only install the hook. |
-| `--gitignore-only` | Only append `.env.portool` to `.gitignore`. |
+| `--hook-only` | Only install the hooks. |
+| `--gitignore-only` | Only append `.env.portool` to `info/exclude`. |
 
-(`--hook-only` and `--gitignore-only` are mutually exclusive.)
+(`--hook-only` and `--gitignore-only` are mutually exclusive; `--gitignore-only`
+keeps its pre-1.0 name even though it now touches `info/exclude`.)
+
+`init` **exits non-zero** when it can't find anywhere safe to install a
+hook — a `core.hooksPath` pointing at a directory that doesn't exist, or an
+absolute `core.hooksPath` set in shared `global`/`system` git config scope
+(see [`core.hooksPath` and Husky](#corehookspath-and-husky) below) — and
+prints the exact line to add to your hook manager instead of silently
+succeeding with nothing installed.
+
+`init` writes the ignore rule to `$GIT_COMMON_DIR/info/exclude` — shared by
+every worktree of the repo, never committed, and independent of the tracked
+`.gitignore`. `init` never edits `.gitignore`; a `.env.portool` line left
+there by an older portool (or added by hand) is harmless but no longer
+necessary, and `deinit` only ever hints at removing it, never edits it.
 
 ### `portool sync`
 
 Allocates a block for the current worktree if it doesn't have one yet,
 refreshes `.env.portool` if the manifest changed, and reclaims this
-project's own stale worktree entries. This is what the git hook calls after
+project's own stale worktree entries *before* allocating — so a worktree
+re-created on the same branch can reclaim the block it just vacated instead
+of being pushed onto a different one. This is what the git hook calls after
 every checkout; when nothing has changed it's a lock-free read that writes
 nothing.
 
@@ -370,17 +415,70 @@ PROJECT  WORKTREE                          BRANCH        BLOCK      STATUS
 myapp    ~/dev/myapp                       main          3000-3004  active
 myapp    ~/dev/myapp-wt/feat-api           feat/api-v2   3005-3009  active
 blog     ~/dev/blog                        main          3500-3504  stale?
+
+reserved 5432-5432  postgres
 ```
 
 `STATUS` is `active` (worktree directory present), `stale?` (worktree gone —
-a `prune` candidate), or `pinned`.
+a `prune` candidate), or `pinned`. Any reservations print below the table
+(see [`portool reserve`](#portool-reserve--portool-unreserve)).
 
 | Flag | Effect |
 |---|---|
-| `--json` | Emit the ledger's own JSON shape instead of a table (for scripts and agents). |
+| `--json` | Emit a machine-readable envelope instead of a table (for scripts and agents) — see below. |
 | `--all` | Show every project instead of just the one for the current directory. |
 
 Outside a git repository, `--all` is required; plain `ls` exits 1.
+
+#### `ls --json` output
+
+A stable, versioned envelope, independent of the ledger's on-disk storage
+schema:
+
+```json
+{
+  "format_version": 1,
+  "ok": true,
+  "registry_schema_version": 3,
+  "effective_config": { "range": [3000, 9999], "block_align": 5 },
+  "allocations": [
+    {
+      "project": "myapp",
+      "project_key": "/home/user/dev/myapp/.git",
+      "project_id": "abe4c983b7295f37",
+      "worktree_id": "740da24128c5e2f7",
+      "path": "/home/user/dev/myapp",
+      "branch": "main",
+      "block": [3000, 3004],
+      "generation": 1,
+      "pinned": false,
+      "label": null,
+      "status": "active",
+      "ports": { "WEB_PORT": 3000, "API_PORT": 3001 },
+      "allocated_at": "2026-07-17T09:00:00+00:00",
+      "last_seen_at": "2026-07-17T09:00:00+00:00"
+    }
+  ],
+  "reservations": [
+    { "block": [5432, 5432], "label": "postgres", "pinned": true }
+  ]
+}
+```
+
+On failure (a corrupt or unreadable ledger, or an unsupported schema
+version) `ls --json` prints an error envelope and exits non-zero instead:
+
+```json
+{ "format_version": 1, "ok": false, "error": "registry is corrupt: ..." }
+```
+
+**Compatibility promise**: `format_version` changes only on a breaking
+shape change to this envelope (renamed/removed keys, changed types, a
+newly *required* field); adding an optional field doesn't bump it. A
+ledger storage-schema migration (`registry_schema_version`) never changes
+`format_version`. `ports` is `null` when it can't be derived (the worktree
+directory is gone, or its `.portool.toml` is unreadable or invalid);
+otherwise it's the same env-var-name → port map `portool exec` would set.
 
 ### `portool prune`
 
@@ -392,6 +490,48 @@ entire repository clone (`common_dir`) is gone.
 |---|---|
 | `--all` | Operate across every project instead of just the current one. |
 | `--dry-run` | Print what would be reclaimed without touching the ledger. |
+
+### `portool reserve` / `portool unreserve`
+
+Permanently reserves a port or port range so portool never hands it out —
+useful for a service (Postgres, Redis, …) that's sometimes stopped, when a
+plain bind check alone would read its port as "free":
+
+```sh
+portool reserve 5432 --label postgres
+portool ls --json | jq '.reservations'
+portool unreserve 5432
+```
+
+```
+portool reserve   <PORT|START-END> [--label <LABEL>]
+portool unreserve <PORT|START-END>
+```
+
+`reserve` takes a single port (`5432`) or an inclusive range
+(`6000-6009`); it errors if the reservation would overlap an existing
+allocation or reservation. `unreserve` matches a single port against
+whichever reservation currently contains it; a range must match an
+existing reservation exactly. Reservations are global, not per-project,
+and show up in `portool ls`'s table footer and `--json` output.
+
+### `portool pin` / `portool unpin`
+
+Exempts the current worktree's allocation from every GC path (implicit
+`sync` GC, `prune`) until unpinned:
+
+```sh
+portool pin --label "long-lived staging"
+portool unpin
+```
+
+| Flag | Effect |
+|---|---|
+| `--label <LABEL>` | Optional label shown in `ls`. |
+
+Requires the worktree to already have an allocation (run `sync` first). A
+pinned worktree shows `STATUS pinned` in `portool ls` regardless of
+whether its directory currently exists.
 
 ### Exit codes
 
@@ -417,12 +557,13 @@ field is optional and falls back to its default:
 ```toml
 range = [3000, 9999]      # the full port pool
 block_align = 5           # block-size rounding unit (and minimum block size)
-gc_days = 30              # reserved for future cross-project GC
 ```
 
-(`subrange_size` was removed in the hardening release — blocks are allocated
-directly from `range`. A config that still sets it is accepted with a
-deprecation warning and otherwise ignored.)
+(`subrange_size` — removed in 0.5.0 — and `gc_days` — removed in 0.7.0 —
+are no longer part of the effective config: blocks are allocated directly
+from `range`, and GC is condition-based (a worktree's directory is gone
+and its ports are free), not age-based. A config that still sets either is
+accepted with a deprecation warning and otherwise ignored.)
 
 Changing this file only affects *new* allocations — existing blocks are
 left in place.
@@ -445,15 +586,19 @@ Allocation is two levels:
    more projects than the old fixed-slice model — which capped the default
    pool at ~14 repositories regardless of how few ports each actually used.
 
-Block placement is deterministic: a worktree on `main`/`master` prefers the
-pool start, and every other branch prefers `FNV-1a-32(branch) % slots` (a
-detached worktree hashes its path instead) — a stable hash, so re-creating a
-worktree on the same branch tends to return to the same block. If the
-preferred slot is taken (or something outside the ledger is already listening
-on it), `portool` scans forward, wrapping, for the next free and bindable
-slot. The ports a block actually uses are verified at
-[`portool exec`](#portool-exec) time; run `portool reallocate` to move a
-worktree off a block whose ports something else now holds.
+Block placement is deterministic: every branch, including `main`/`master`,
+prefers slot `FNV-1a-32(project_key + "\n" + branch) % slots` (a detached
+worktree hashes its worktree path instead of a branch name) — a stable
+hash, so re-creating a worktree on the same branch tends to return to the
+same block, and different projects' identically named branches spread
+across the pool instead of piling onto one hotspot. If the preferred slot
+is taken (or reserved — see
+[`portool reserve`](#portool-reserve--portool-unreserve) — or something
+outside the ledger is already listening on it), `portool` scans forward,
+wrapping, for the next free and bindable slot. The ports a block actually
+uses are verified at [`portool exec`](#portool-exec) time; run
+`portool reallocate` to move a worktree off a block whose ports something
+else now holds.
 
 Ledger writes always go through an exclusive `flock` on
 `registry.json.lock`; reads for the common case (nothing changed) never
@@ -471,8 +616,15 @@ otherwise).
 
 The ledger is **fail-closed**, like the config: a corrupt, unreadable, or
 newer-schema `registry.json` makes every command error out (exit 1) without
-touching the file. The explicit recovery path is `portool doctor --repair`,
-which moves the bad file aside to `registry.json.corrupt-<ts>` and rebuilds
+touching the file. Every save also refreshes `registry.json.bak`, a
+byte-exact copy of the last successfully saved ledger. The explicit
+recovery path is `portool doctor --repair`: for a corrupt ledger it
+restores `registry.json` from that backup (every project's allocations
+survive) and copies the corrupt file aside to
+`registry.json.corrupt-<ts>`; without a usable backup it refuses rather
+than guess, and points at `--repair --abandon-other-projects` — the one
+destructive path, and the only way an unsupported-version ledger (written
+by a newer portool) is ever discarded. Either way, `doctor` then rebuilds
 the current project's entries from its worktrees' `.env.portool` files.
 
 ### `post-checkout` hook

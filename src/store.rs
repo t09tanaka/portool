@@ -79,7 +79,7 @@ pub fn load_strict(path: &Path) -> Result<Option<Registry>> {
         LedgerLoad::Loaded(registry) => Ok(Some(registry)),
         LedgerLoad::Corrupt { reason } => Err(Error::General(format!(
             "{} is corrupt ({reason}); refusing to touch it -- run 'portool doctor --repair' \
-             to move it aside and rebuild this project's entries",
+             to restore it from backup and rebuild this project's entries",
             path.display()
         ))),
         LedgerLoad::UnsupportedVersion { found, supported } => Err(Error::General(format!(
@@ -110,9 +110,29 @@ pub fn move_aside(path: &Path) -> Result<PathBuf> {
     Ok(corrupt_path)
 }
 
+/// Copies the (bad) ledger to a `.corrupt-<unix seconds>` sibling without
+/// removing the original, and returns the sibling's path. The restore path
+/// of `doctor --repair` uses this instead of [`move_aside`]: if the
+/// subsequent save of the restored backup fails, `registry.json` still
+/// holds the (corrupt) original -- it is never missing, so a later command
+/// can never mistake the state for a fresh install and clobber the backup.
+pub fn copy_aside(path: &Path) -> Result<PathBuf> {
+    let corrupt_path = corrupt_sibling_path(path);
+    fs::copy(path, &corrupt_path).map_err(|err| {
+        Error::General(format!(
+            "failed to copy {} aside to {}: {err}",
+            path.display(),
+            corrupt_path.display()
+        ))
+    })?;
+    Ok(corrupt_path)
+}
+
 /// Saves `registry` to `path` atomically: writes pretty-printed JSON to a
 /// temp file in the same directory, then renames it into place. The parent
-/// directory is created if necessary.
+/// directory is created if necessary. On success, also refreshes `<path>.bak`
+/// (see [`backup_path`]) as a best-effort copy: a backup failure is a
+/// warning on stderr, never a command failure.
 pub fn save(path: &Path, registry: &Registry) -> Result<()> {
     let dir = path.parent().ok_or_else(|| {
         Error::General(format!(
@@ -126,7 +146,29 @@ pub fn save(path: &Path, registry: &Registry) -> Result<()> {
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
     tmp.write_all(json.as_bytes())?;
     tmp.persist(path).map_err(|e| Error::from(e.error))?;
+
+    // Best-effort backup refresh: the primary save already succeeded, so a
+    // backup failure is a loud warning, not a command failure.
+    let bak = backup_path(path);
+    if let Err(err) = fs::copy(path, &bak) {
+        eprintln!(
+            "portool: warning: failed to update backup {}: {err}",
+            bak.display()
+        );
+    }
     Ok(())
+}
+
+/// `<path>.bak`: a byte-exact copy of the last successfully saved ledger,
+/// refreshed by every [`save`]. `doctor --repair` restores from it so that
+/// a corrupt ledger costs at most one save, not every other project's
+/// allocations (external review P0-1).
+pub fn backup_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "registry.json".to_string());
+    path.with_file_name(format!("{file_name}.bak"))
 }
 
 fn corrupt_sibling_path(path: &Path) -> PathBuf {
@@ -325,7 +367,12 @@ mod tests {
 
         save(&path, &Registry::empty((3000, 9999))).unwrap();
 
-        assert_eq!(dir_entries(tmp.path()), vec!["registry.json".to_string()]);
+        let mut entries = dir_entries(tmp.path());
+        entries.sort();
+        assert_eq!(
+            entries,
+            vec!["registry.json".to_string(), "registry.json.bak".to_string()]
+        );
     }
 
     #[test]
@@ -337,5 +384,65 @@ mod tests {
         save(&path, &sample_registry()).unwrap();
 
         assert_eq!(load_strict(&path).unwrap(), Some(sample_registry()));
+    }
+
+    #[test]
+    fn copy_aside_keeps_the_original_and_creates_a_corrupt_sibling() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("registry.json");
+        let contents = b"{ this is not valid json".to_vec();
+        fs::write(&path, &contents).unwrap();
+
+        let copied_to = copy_aside(&path).unwrap();
+
+        assert!(
+            path.exists(),
+            "the original must never go missing during a copy-aside"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            contents,
+            "the original must be byte-identical"
+        );
+        assert!(copied_to.exists());
+        assert_eq!(
+            fs::read(&copied_to).unwrap(),
+            contents,
+            "the sibling must be a byte-exact copy"
+        );
+        assert!(copied_to
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("registry.json.corrupt-"));
+    }
+
+    #[test]
+    fn save_writes_a_backup_sibling() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("registry.json");
+        save(&path, &sample_registry()).unwrap();
+
+        let bak = backup_path(&path);
+        assert!(bak.exists());
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            fs::read(&bak).unwrap(),
+            "backup must be a byte-exact copy of the last successful save"
+        );
+    }
+
+    #[test]
+    fn backup_lags_one_save_behind_on_the_next_write() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("registry.json");
+        save(&path, &Registry::empty((3000, 9999))).unwrap();
+        save(&path, &sample_registry()).unwrap();
+        // After the second save the backup equals the *second* saved state
+        // (copy happens after persist), and load_strict on it succeeds.
+        assert_eq!(
+            load_strict(&backup_path(&path)).unwrap(),
+            Some(sample_registry())
+        );
     }
 }

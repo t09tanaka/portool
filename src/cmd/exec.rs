@@ -41,15 +41,6 @@ pub fn run(
     let cwd = std::env::current_dir()?;
     let ctx = GitCtx::discover(&cwd)?;
 
-    // Spec §10: sync alone tolerates a missing manifest, but exec exists
-    // to inject allocated ports, so it requires one.
-    if !ctx.worktree_root.join(".portool.toml").exists() {
-        return Err(Error::General(format!(
-            ".portool.toml not found in {}: portool exec requires a port manifest",
-            ctx.worktree_root.display()
-        )));
-    }
-
     // Spec §5 step 3: sync first; if it fails the child is never started.
     let outcome = sync::ensure(&ctx, true)?;
 
@@ -81,7 +72,7 @@ pub fn run(
         outcome.manifest.as_ref(),
         &identity::project_id(&ctx.common_dir),
         &identity::worktree_id(&ctx.common_dir, &ctx.worktree_root),
-    );
+    )?;
 
     // Spec §8: files load in the order given; relative paths stay
     // relative to the cwd exec was invoked from.

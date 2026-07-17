@@ -95,7 +95,20 @@ fn prune_all(registry: &mut Registry, dry_run: bool) -> bool {
             continue;
         }
 
-        let live = gitctx::worktree_list_at(Path::new(key)).unwrap_or_default();
+        let live = match gitctx::worktree_list_at(Path::new(key)) {
+            Ok(live) => live,
+            Err(err) => {
+                // Fail-closed (external review P0-2): a Git failure is not
+                // "this project has zero worktrees". Reclaiming on that
+                // misreading could free blocks that live worktrees' env
+                // files still hand out. Keep every entry and move on.
+                eprintln!(
+                    "portool: prune: skipping project {key}: listing worktrees failed \
+                     ({err}); its entries were kept"
+                );
+                continue;
+            }
+        };
         let project = registry
             .projects
             .get_mut(key)

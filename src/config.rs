@@ -15,8 +15,6 @@ pub struct Config {
     pub range: (u16, u16),
     /// Block size rounding unit (and minimum block size).
     pub block_align: u16,
-    /// Age threshold (in days) used by cross-project GC (v0.2+).
-    pub gc_days: u32,
 }
 
 impl Default for Config {
@@ -24,7 +22,6 @@ impl Default for Config {
         Config {
             range: (3000, 9999),
             block_align: 5,
-            gc_days: 30,
         }
     }
 }
@@ -32,9 +29,11 @@ impl Default for Config {
 /// Mirrors the TOML schema of `config.toml`; every field is optional so
 /// that partial configuration files are accepted. `deny_unknown_fields`
 /// makes a typo (`ragne = …`) a hard error rather than a silently-ignored
-/// field. `subrange_size` is retained here only as a **deprecated, ignored**
-/// field so that a legacy config that still sets it keeps working (rather
-/// than tripping `deny_unknown_fields`); it no longer affects allocation.
+/// field. `subrange_size` and `gc_days` are retained here only as
+/// **deprecated, ignored** fields so that a legacy config that still sets
+/// them keeps working (rather than tripping `deny_unknown_fields`); neither
+/// affects allocation any more (GC is condition-based: gone directory + free
+/// ports).
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
@@ -62,10 +61,15 @@ impl Config {
                  (blocks are now allocated directly from `range`)"
             );
         }
+        if raw.gc_days.is_some() {
+            eprintln!(
+                "portool: warning: config `gc_days` is deprecated and ignored \
+                 (GC is condition-based: gone directory + free ports)"
+            );
+        }
 
         let range = raw.range.unwrap_or(default.range);
         let block_align = raw.block_align.unwrap_or(default.block_align);
-        let gc_days = raw.gc_days.unwrap_or(default.gc_days);
 
         if range.0 > range.1 {
             return Err(Error::General(format!(
@@ -87,11 +91,7 @@ impl Config {
             ));
         }
 
-        Ok(Config {
-            range,
-            block_align,
-            gc_days,
-        })
+        Ok(Config { range, block_align })
     }
 
     /// Loads the global config from [`crate::paths::config_path`].
@@ -131,7 +131,6 @@ mod tests {
         let cfg = Config::default();
         assert_eq!(cfg.range, (3000, 9999));
         assert_eq!(cfg.block_align, 5);
-        assert_eq!(cfg.gc_days, 30);
     }
 
     #[test]
@@ -145,21 +144,27 @@ mod tests {
         let cfg = Config::from_toml_str("block_align = 10\n").unwrap();
         assert_eq!(cfg.block_align, 10);
         assert_eq!(cfg.range, Config::default().range);
-        assert_eq!(cfg.gc_days, Config::default().gc_days);
     }
 
     #[test]
     fn full_source_is_honored() {
-        let cfg =
-            Config::from_toml_str("range = [4000, 5000]\nblock_align = 4\ngc_days = 7\n").unwrap();
+        let cfg = Config::from_toml_str("range = [4000, 5000]\nblock_align = 4\n").unwrap();
         assert_eq!(
             cfg,
             Config {
                 range: (4000, 5000),
                 block_align: 4,
-                gc_days: 7,
             }
         );
+    }
+
+    #[test]
+    fn deprecated_gc_days_is_accepted_and_ignored() {
+        // A legacy config that still sets gc_days must keep working
+        // (accepted + ignored), not trip deny_unknown_fields.
+        let cfg = Config::from_toml_str("gc_days = 7\nblock_align = 4\n").unwrap();
+        assert_eq!(cfg.block_align, 4);
+        assert_eq!(cfg.range, Config::default().range);
     }
 
     #[test]

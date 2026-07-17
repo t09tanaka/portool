@@ -18,12 +18,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Install the post-checkout hook, update .gitignore, and run sync.
+    /// Install the post-checkout hook, update git's info/exclude, and run
+    /// sync.
     Init {
         /// Only install the post-checkout hook.
         #[arg(long, conflicts_with = "gitignore_only")]
         hook_only: bool,
-        /// Only append `.env.portool` to .gitignore.
+        /// Only add `.env.portool` to $GIT_COMMON_DIR/info/exclude.
         #[arg(long)]
         gitignore_only: bool,
     },
@@ -77,15 +78,49 @@ enum Command {
     /// Diagnose and repair the current project (rebuild lost entries, report
     /// blocks whose ports are in use).
     Doctor {
-        /// Move a corrupt (or unsupported-version) ledger aside and rebuild
-        /// this project's entries from live worktrees' `.env.portool`.
+        /// Repair a corrupt ledger: restore the whole ledger from its
+        /// backup, then rebuild this project's missing entries.
         #[arg(long)]
         repair: bool,
+        /// With --repair and no usable backup: discard the bad ledger and
+        /// rebuild only this project. Every other project's allocations are
+        /// dropped until doctor runs there. DESTRUCTIVE.
+        #[arg(long, requires = "repair")]
+        abandon_other_projects: bool,
     },
     /// Free the current worktree's block and remove its `.env.portool`.
     Release,
-    /// Remove portool's hooks and `.gitignore` entry (reverses `init`).
-    Deinit,
+    /// Remove portool's lines from this repo's git hooks (and nothing else).
+    Unhook,
+    /// Release this project's allocations and remove portool's env files,
+    /// hooks, and ignore rule (full reverse of init).
+    Deinit {
+        /// Keep the ledger allocations and .env.portool files; only remove
+        /// hooks and the ignore rule.
+        #[arg(long)]
+        keep_allocations: bool,
+    },
+    /// Reserve a port or port range so portool never allocates over it.
+    Reserve {
+        /// PORT or START-END (inclusive), e.g. 5432 or 6000-6009.
+        ports: String,
+        /// Optional label shown in ls (e.g. "postgres").
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Remove a reservation (single port matches its containing block).
+    Unreserve {
+        /// PORT or START-END (inclusive).
+        ports: String,
+    },
+    /// Protect the current worktree's allocation from GC.
+    Pin {
+        /// Optional label shown in ls.
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Remove the current worktree's GC protection.
+    Unpin,
 }
 
 fn main() {
@@ -123,9 +158,17 @@ fn main() {
         Command::Reallocate { quiet } => cmd::sync::reallocate_cmd(quiet),
         Command::Prune { all, dry_run } => cmd::prune::run(all, dry_run),
         Command::Check => cmd::check::run(),
-        Command::Doctor { repair } => cmd::doctor::run(repair),
+        Command::Doctor {
+            repair,
+            abandon_other_projects,
+        } => cmd::doctor::run(repair, abandon_other_projects),
         Command::Release => cmd::release::run(),
-        Command::Deinit => cmd::init::deinit(),
+        Command::Unhook => cmd::init::unhook(),
+        Command::Deinit { keep_allocations } => cmd::init::deinit(keep_allocations),
+        Command::Reserve { ports, label } => cmd::reserve::reserve(&ports, label),
+        Command::Unreserve { ports } => cmd::reserve::unreserve(&ports),
+        Command::Pin { label } => cmd::pin::pin(label),
+        Command::Unpin => cmd::pin::unpin(),
     };
 
     if let Err(err) = result {
