@@ -275,7 +275,7 @@ fn slow_path(ctx: &GitCtx, config: &Config, quiet: bool) -> Result<SyncOutcome> 
         entry.pending_block = Some(final_block);
         store::save(&registry_path, &registry)?;
 
-        write_atomic(&ctx.worktree_root.join(".env.portool"), rendered.as_bytes())?;
+        store::write_atomic(&ctx.worktree_root.join(".env.portool"), rendered.as_bytes())?;
     }
 
     {
@@ -316,7 +316,7 @@ fn slow_path(ctx: &GitCtx, config: &Config, quiet: bool) -> Result<SyncOutcome> 
     // write comes first: a crash here leaves the block reserved with a
     // stale/missing env, which the next sync simply rewrites.
     if !moving {
-        write_atomic(&ctx.worktree_root.join(".env.portool"), rendered.as_bytes())?;
+        store::write_atomic(&ctx.worktree_root.join(".env.portool"), rendered.as_bytes())?;
     }
 
     if !quiet {
@@ -458,7 +458,7 @@ pub fn reallocate(ctx: &GitCtx, quiet: bool) -> Result<SyncOutcome> {
     }
     store::save(&registry_path, &registry)?;
 
-    write_atomic(&ctx.worktree_root.join(".env.portool"), rendered.as_bytes())?;
+    store::write_atomic(&ctx.worktree_root.join(".env.portool"), rendered.as_bytes())?;
 
     let now = now_local();
     {
@@ -554,18 +554,6 @@ fn now_local() -> DateTime<FixedOffset> {
 
 fn key(path: &Path) -> String {
     path.to_string_lossy().into_owned()
-}
-
-fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
-    use std::io::Write;
-    let dir = path
-        .parent()
-        .ok_or_else(|| Error::General(format!("{} has no parent directory", path.display())))?;
-    std::fs::create_dir_all(dir)?;
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
-    tmp.write_all(contents)?;
-    tmp.persist(path).map_err(|e| Error::from(e.error))?;
-    Ok(())
 }
 
 #[cfg(test)]
