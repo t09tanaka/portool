@@ -127,8 +127,8 @@ fn install_hook(ctx: &GitCtx) -> Result<()> {
             scope,
         } => {
             eprintln!(
-                "warning: core.hooksPath '{configured}' is a {scope}-scope shared hooks dir \
-                 ({}); refusing to auto-install portool's hook there -- it would run on every \
+                "warning: core.hooksPath '{configured}' is a shared hooks dir in {scope} scope \
+                 ({}); refusing to auto-install portool's hook there -- it could run on every \
                  repository's checkout",
                 resolved.display()
             );

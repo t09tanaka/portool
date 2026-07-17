@@ -50,31 +50,34 @@ impl HooksLocation {
     /// An absolute `core.hooksPath` set in `global`/`system` scope is a
     /// hooks dir shared across unrelated repos; it is reported as
     /// [`HooksLocation::SharedScope`] so `init` refuses to auto-install
-    /// there. A repo-relative value is inherently per-repo and is never
-    /// refused, whatever scope it came from.
+    /// there. This check runs *before* any other classification, so a
+    /// shared dir cannot slip through by looking like Husky's `.husky/_`
+    /// (external review P1 #3). It is also fail-closed: an absolute path
+    /// whose scope cannot be determined (git < 2.26, or a git failure) is
+    /// treated as shared. A repo-relative value is inherently per-repo and
+    /// is never refused, whatever scope it came from.
     pub fn resolve(ctx: &GitCtx) -> HooksLocation {
         let configured = gitctx::config_path_value(&ctx.worktree_root, "core.hooksPath");
-        let loc = classify(configured.clone(), &ctx.worktree_root, &ctx.common_dir);
 
-        if let HooksLocation::Custom { hooks_dir } = &loc {
-            let is_absolute = configured
-                .as_deref()
-                .map(|c| Path::new(c).is_absolute())
-                .unwrap_or(false);
-            if is_absolute {
-                if let Some(scope) = gitctx::config_scope(&ctx.worktree_root, "core.hooksPath") {
-                    if scope == "global" || scope == "system" {
-                        return HooksLocation::SharedScope {
-                            configured: configured.unwrap_or_default(),
-                            resolved: hooks_dir.clone(),
-                            scope,
-                        };
-                    }
+        if let Some(value) = configured.as_deref().filter(|v| !v.trim().is_empty()) {
+            if Path::new(value).is_absolute() {
+                let scope = gitctx::config_scope(&ctx.worktree_root, "core.hooksPath");
+                let shared = match scope.as_deref() {
+                    Some("global") | Some("system") => true,
+                    Some(_) => false, // local / worktree: per-repo
+                    None => true,     // undeterminable: fail closed
+                };
+                if shared {
+                    return HooksLocation::SharedScope {
+                        configured: value.to_string(),
+                        resolved: PathBuf::from(value),
+                        scope: scope.unwrap_or_else(|| "unknown".to_string()),
+                    };
                 }
             }
         }
 
-        loc
+        classify(configured, &ctx.worktree_root, &ctx.common_dir)
     }
 
     /// The file portool installs the named hook into (and `sync` checks),
