@@ -358,7 +358,7 @@ fn slow_path(ctx: &GitCtx, config: &Config, quiet: bool) -> Result<SyncOutcome> 
             "portool: {verb} {}-{} for {}",
             final_block.0,
             final_block.1,
-            ctx.worktree_root.display()
+            crate::display::sanitize(&ctx.worktree_root.to_string_lossy())
         );
     }
 
@@ -553,7 +553,7 @@ pub fn reallocate(ctx: &GitCtx, quiet: bool) -> Result<SyncOutcome> {
             "portool: reallocated {}-{} for {}",
             new_block.0,
             new_block.1,
-            ctx.worktree_root.display()
+            crate::display::sanitize(&ctx.worktree_root.to_string_lossy())
         );
     }
 

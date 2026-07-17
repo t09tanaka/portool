@@ -3043,3 +3043,34 @@ fn sync_refuses_to_move_while_the_current_block_is_in_use() {
         "the ledger must be unchanged after a refusal"
     );
 }
+
+/// External review 3rd round P1-4: a hostile label must not smuggle ANSI
+/// escapes or extra lines into `ls` output.
+#[test]
+fn ls_sanitizes_control_characters_in_labels() {
+    let env = TestEnv::new();
+    env.write_config("range = [19300, 19399]\n");
+    let repo = env.path("app");
+    init_repo(&repo);
+
+    let out = env.run(
+        &repo,
+        &["reserve", "19390", "--label", "evil\u{1b}[31m\nINJECTED"],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = env.run(&repo, &["ls"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "no raw ESC may survive: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("evil\u{FFFD}[31m\\nINJECTED"),
+        "controls must be visibly escaped: {stdout:?}"
+    );
+}

@@ -247,9 +247,9 @@ fn print_table(projects: &BTreeMap<String, ProjectEntry>, reservations: &[Reserv
                 "stale?"
             };
             rows.push(Row {
-                project: project.name.clone(),
-                worktree: shorten_home(path, home.as_deref()),
-                branch: worktree.branch.clone().unwrap_or_else(|| "-".to_string()),
+                project: crate::display::sanitize(&project.name),
+                worktree: crate::display::sanitize(&shorten_home(path, home.as_deref())),
+                branch: crate::display::sanitize(worktree.branch.as_deref().unwrap_or("-")),
                 block: format!("{}-{}", worktree.block.0, worktree.block.1),
                 status: status.to_string(),
             });
@@ -282,7 +282,7 @@ fn print_table(projects: &BTreeMap<String, ProjectEntry>, reservations: &[Reserv
                 "reserved {}-{}  {}",
                 r.block.0,
                 r.block.1,
-                r.label.as_deref().unwrap_or("-")
+                crate::display::sanitize(r.label.as_deref().unwrap_or("-"))
             );
         }
     }
@@ -290,24 +290,21 @@ fn print_table(projects: &BTreeMap<String, ProjectEntry>, reservations: &[Reserv
 
 fn column_width(rows: &[Row], header: &Row, get: impl Fn(&Row) -> &String) -> usize {
     rows.iter()
-        .map(|r| get(r).len())
-        .chain(std::iter::once(get(header).len()))
+        .map(|r| crate::display::width(get(r)))
+        .chain(std::iter::once(crate::display::width(get(header))))
         .max()
         .unwrap_or(0)
 }
 
 fn print_row(row: &Row, w_project: usize, w_worktree: usize, w_branch: usize, w_block: usize) {
+    use crate::display::pad;
     println!(
-        "{:<w_project$}  {:<w_worktree$}  {:<w_branch$}  {:<w_block$}  {}",
-        row.project,
-        row.worktree,
-        row.branch,
-        row.block,
+        "{}  {}  {}  {}  {}",
+        pad(&row.project, w_project),
+        pad(&row.worktree, w_worktree),
+        pad(&row.branch, w_branch),
+        pad(&row.block, w_block),
         row.status,
-        w_project = w_project,
-        w_worktree = w_worktree,
-        w_branch = w_branch,
-        w_block = w_block,
     );
 }
 

@@ -13,6 +13,8 @@ pub mod cmd;
 #[doc(hidden)]
 pub mod config;
 #[doc(hidden)]
+pub mod display;
+#[doc(hidden)]
 pub mod envfile;
 #[doc(hidden)]
 pub mod envread;
