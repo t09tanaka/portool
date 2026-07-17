@@ -84,3 +84,11 @@ No install step, no stub, no `if command -v portool` anywhere.
 - If your test runner loads `.env.test` through dotenv-expand (Next.js,
   dotenv-cli, …), the `${TEST_DB_PORT:-5433}` default resolves there too —
   the same committed file keeps serving CI.
+- Say so in your README, so teammates who have never heard of portool
+  know it's safe to ignore. Something like:
+
+  > Portool is optional. Existing test commands and CI do not require it.
+  > The checkout hook skips synchronization when `portool` is unavailable.
+  > `.env.portool` is generated automatically and must not be edited or
+  > committed. Run `portool --version` to confirm that portool 0.4.0 is
+  > available on `PATH`.
