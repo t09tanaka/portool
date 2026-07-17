@@ -442,7 +442,7 @@ common no-op fast when branch *and* timestamp are already current.
 
 | Command | Purpose |
 |---|---|
-| `portool doctor` | Diagnose & repair: report blocks whose ports are occupied, schema-invariant issues, stale entries; rebuild ledger entries from live worktrees' `.env.portool` (C4). |
+| `portool doctor` | Diagnose & repair: report blocks whose ports are occupied, schema-invariant issues, stale entries; rebuild ledger entries from live worktrees' `.env.portool` (C4). **Before re-importing a block it must verify the block does not overlap an already-imported one; on overlap, report and skip rather than re-import** — otherwise a corruption caused by a real bug that baked an overlap into `.env.portool` would be re-produced by a blind rebuild (Fable final note). |
 | `portool check` | Validate the ledger and config; exit non-zero on any problem. Read-only, script-friendly. |
 | `portool release` | Free the current worktree's block from the ledger (and remove its `.env.portool`). |
 | `portool deinit` | Reverse `init`: remove portool's hook lines (idempotent, interpreter-aware) and the `.gitignore` entry. |
@@ -457,6 +457,9 @@ Add coverage for the failure modes the current suite omits:
 - Hook exits 0 even when `sync` fails; legacy-hook migration; append onto
   Python/Node hooks (skipped) and sh hooks (appended); symlinked hook;
   preserved perms.
+- `post-merge` install is idempotent and symmetric with `post-checkout`;
+  `deinit` removes portool's lines from **both** hooks (Fable final note —
+  the current D6 draft is post-checkout-centric).
 - Shared-scope `hooksPath` refusal.
 - Config typo rejected; config parse error is fatal.
 - Semantically-broken ledger (overlaps, bad version, port 0) treated as
