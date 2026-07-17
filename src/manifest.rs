@@ -16,6 +16,7 @@ pub struct Manifest {
 /// raw TOML values so that non-integer / negative values can be rejected
 /// with a clear error rather than a generic deserialization failure.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawManifest {
     ports: BTreeMap<String, toml::Value>,
 }
@@ -30,6 +31,14 @@ impl Manifest {
         let raw: RawManifest =
             toml::from_str(s).map_err(|e| Error::General(format!("invalid manifest: {e}")))?;
 
+        if raw.ports.is_empty() {
+            return Err(Error::General(
+                "invalid manifest: [ports] declares no ports; declare at least one \
+                 port or remove .portool.toml"
+                    .to_string(),
+            ));
+        }
+
         let mut ports = Vec::with_capacity(raw.ports.len());
         let mut seen_offsets = HashSet::with_capacity(raw.ports.len());
 
@@ -37,6 +46,13 @@ impl Manifest {
             if !is_valid_key(&key) {
                 return Err(Error::General(format!(
                     "invalid manifest: port key '{key}' must match ^[a-z][a-z0-9_]*$"
+                )));
+            }
+
+            if key == "portool" || key.starts_with("portool_") {
+                return Err(Error::General(format!(
+                    "invalid manifest: port key '{key}' is reserved \
+                     (it would generate a variable in portool's PORTOOL_* namespace)"
                 )));
             }
 
@@ -163,10 +179,27 @@ mod tests {
     }
 
     #[test]
-    fn empty_ports_table_sizes_to_the_alignment_minimum() {
-        let m = Manifest::parse("[ports]\n").unwrap();
-        assert!(m.ports.is_empty());
-        assert_eq!(m.block_size(5).unwrap(), 5);
+    fn empty_ports_table_is_rejected() {
+        // P1-6: an empty [ports] used to silently reserve a full block while
+        // emitting no port variables at all.
+        let err = Manifest::parse("[ports]\n").unwrap_err();
+        assert!(err.to_string().contains("declares no ports"));
+    }
+
+    #[test]
+    fn unknown_top_level_field_is_rejected() {
+        let err = Manifest::parse("[ports]\nweb = 0\n\n[prots]\napi = 1\n").unwrap_err();
+        assert_eq!(err.exit_code(), 1);
+    }
+
+    #[test]
+    fn portool_prefixed_keys_are_rejected() {
+        // `portool_x` would generate PORTOOL_X_PORT, inside portool's own
+        // reserved env namespace.
+        assert!(Manifest::parse("[ports]\nportool_x = 0\n").is_err());
+        assert!(Manifest::parse("[ports]\nportool = 0\n").is_err());
+        // ...but a key merely *containing* portool is fine.
+        assert!(Manifest::parse("[ports]\nmy_portool = 0\n").is_ok());
     }
 
     #[test]

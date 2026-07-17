@@ -72,7 +72,7 @@ pub fn run(
         outcome.manifest.as_ref(),
         &identity::project_id(&ctx.common_dir),
         &identity::worktree_id(&ctx.common_dir, &ctx.worktree_root),
-    );
+    )?;
 
     // Spec §8: files load in the order given; relative paths stay
     // relative to the cwd exec was invoked from.

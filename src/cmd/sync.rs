@@ -115,7 +115,7 @@ fn try_fast_path(ctx: &GitCtx) -> Result<Option<SyncOutcome>> {
         return Ok(None);
     }
 
-    let expected = envfile::render(
+    let expected = match envfile::render(
         &ctx.project_name,
         &worktree_key,
         entry.block,
@@ -123,7 +123,10 @@ fn try_fast_path(ctx: &GitCtx) -> Result<Option<SyncOutcome>> {
         manifest_state.manifest.as_ref(),
         &identity::project_id(&ctx.common_dir),
         &identity::worktree_id(&ctx.common_dir, &ctx.worktree_root),
-    );
+    ) {
+        Ok(expected) => expected,
+        Err(_) => return Ok(None), // slow path re-derives and fixes
+    };
     // Batch D #14: even when block/manifest/env all match, fall through to
     // the (locked) slow path to refresh metadata when the branch changed or
     // `last_seen_at` is on an earlier calendar day -- so `branch` reflects
@@ -243,7 +246,7 @@ fn slow_path(ctx: &GitCtx, config: &Config, quiet: bool) -> Result<SyncOutcome> 
         manifest_state.manifest.as_ref(),
         &identity::project_id(&ctx.common_dir),
         &identity::worktree_id(&ctx.common_dir, &ctx.worktree_root),
-    );
+    )?;
 
     // Two-phase update for a block move (external review v0.6): reserve the
     // target alongside the old block, write the env, then finalize. A crash
@@ -436,7 +439,7 @@ pub fn reallocate(ctx: &GitCtx, quiet: bool) -> Result<SyncOutcome> {
         manifest_state.manifest.as_ref(),
         &identity::project_id(&ctx.common_dir),
         &identity::worktree_id(&ctx.common_dir, &ctx.worktree_root),
-    );
+    )?;
 
     // Two-phase move, same protocol as the sync slow path: reserve, write
     // the env, finalize.

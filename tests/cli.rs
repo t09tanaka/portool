@@ -1985,6 +1985,22 @@ fn sync_rejects_manifest_wider_than_u16() {
     );
 }
 
+/// A manifest with an unrecognized top-level table (e.g. a typo'd `[ports]`)
+/// is rejected fail-closed rather than silently ignored (P1-6).
+#[test]
+fn sync_rejects_manifest_with_unknown_table() {
+    let env = TestEnv::new();
+    let repo = env.path("app");
+    init_repo(&repo);
+    fs::write(
+        repo.join(".portool.toml"),
+        "[ports]\nweb = 0\n[bogus]\nx = 1\n",
+    )
+    .unwrap();
+    let out = env.run(&repo, &["sync"]);
+    assert!(!out.status.success());
+}
+
 // --- v0.6: schema v3, two-phase moves, generation --------------------------
 
 /// Rewrites the on-disk ledger with a mutation applied to its JSON value.
