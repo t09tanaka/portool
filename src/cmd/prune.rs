@@ -81,10 +81,11 @@ fn prune_all(registry: &mut Registry, dry_run: bool) -> bool {
                 .projects
                 .get(key)
                 .expect("key came from registry.projects.keys()");
-            let all_ports_free = project
-                .worktrees
-                .values()
-                .all(|w| ports::block_free(w.block));
+            // A pending block (interrupted two-phase move) is part of an
+            // entry's footprint, same as in gc::collect.
+            let all_ports_free = project.worktrees.values().all(|w| {
+                ports::block_free(w.block) && w.pending_block.map(ports::block_free).unwrap_or(true)
+            });
             if all_ports_free {
                 let verb = if dry_run { "would prune" } else { "pruned" };
                 println!("{verb} project {} ({key})", project.name);

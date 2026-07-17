@@ -37,7 +37,9 @@ pub fn collect(
             if is_live || dir_exists(Path::new(path.as_str())) {
                 return false;
             }
-            block_unused(entry.block)
+            // A pending block (interrupted two-phase move) is part of the
+            // entry's footprint: reclaim only when it, too, is unused.
+            block_unused(entry.block) && entry.pending_block.map(block_unused).unwrap_or(true)
         })
         .map(|(path, _)| path.clone())
         .collect();
@@ -63,6 +65,8 @@ mod tests {
         let now = tz.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
         WorktreeEntry {
             block,
+            generation: 1,
+            pending_block: None,
             branch: None,
             manifest_hash: None,
             pinned,

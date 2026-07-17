@@ -5,6 +5,46 @@ All notable changes to portool are documented here. The format is based on
 [Semantic Versioning](https://semver.org/) (pre-1.0: a breaking change bumps
 the minor version).
 
+## [Unreleased]
+
+The design-change items from the post-0.5.0 external review: transactional
+ledger/env state transitions. **Contains a breaking ledger schema change.**
+
+### Breaking
+
+- **Ledger schema v2 → v3.** Each worktree entry gains a `generation`
+  counter (bumped on every block change, mirrored into the `.env.portool`
+  header) and a `pending_block` slot. v1/v2 ledgers are migrated
+  automatically on the next locked write; every block is preserved
+  verbatim, so no ports move on upgrade. Older portool binaries refuse a
+  v3 ledger fail-closed ("unsupported version").
+- **`.env.portool` header format.** The `# block:` line now carries
+  `generation: N`. Files written by 0.5.x are upgraded on the next sync.
+
+### Changed / Fixed
+
+- **Block moves are a two-phase update.** Moving a worktree to a different
+  block (manifest growth, `reallocate`) now reserves the target block
+  alongside the old one, writes `.env.portool`, then finalizes. A crash at
+  any point leaves the env's block reserved — the ledger and the env file
+  can no longer disagree in a way that hands one worktree's ports to
+  another. The next `sync` resolves an interrupted move automatically
+  (forward if the env was already rewritten, backward otherwise), and a
+  pending target counts as occupied for allocation and GC.
+- **The lock-free sync fast path revalidates its snapshot.** After the env
+  comparison it re-reads the ledger and requires the same block and
+  generation, so a concurrent `reallocate`/`release` between the two reads
+  can no longer produce a stale success (the generation counter makes even
+  an A→B→A move visible).
+- **The Rust API is now explicitly internal.** All library modules are
+  `#[doc(hidden)]`; the stable interface is the CLI (commands, exit codes,
+  file formats). `cmd::exec::run` no longer panics on an empty command.
+- **Non-UTF-8 repository/worktree paths are rejected** (fail-closed)
+  instead of being lossily converted into ledger keys that could collide.
+- An absolute `core.hooksPath` whose git scope cannot be determined
+  (git < 2.26) is refused conservatively (documented; behavior since
+  0.5.1).
+
 ## [0.5.1] - 2026-07-17
 
 Fixes from the post-0.5.0 external review: the state-transition gaps between

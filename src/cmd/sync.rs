@@ -104,6 +104,12 @@ fn try_fast_path(ctx: &GitCtx) -> Result<Option<SyncOutcome>> {
         None => return Ok(None),
     };
 
+    // A worktree mid-move (interrupted two-phase update) always takes the
+    // slow path, which resolves the pending block under the lock.
+    if entry.pending_block.is_some() {
+        return Ok(None);
+    }
+
     let manifest_state = load_manifest_state(&ctx.worktree_root)?;
     if entry.manifest_hash != manifest_state.hash {
         return Ok(None);
@@ -113,6 +119,7 @@ fn try_fast_path(ctx: &GitCtx) -> Result<Option<SyncOutcome>> {
         &ctx.project_name,
         &worktree_key,
         entry.block,
+        entry.generation,
         manifest_state.manifest.as_ref(),
         &identity::project_id(&ctx.common_dir),
         &identity::worktree_id(&ctx.common_dir, &ctx.worktree_root),
@@ -126,14 +133,34 @@ fn try_fast_path(ctx: &GitCtx) -> Result<Option<SyncOutcome>> {
         && entry.last_seen_at.date_naive() == Local::now().date_naive();
 
     let actual = std::fs::read(ctx.worktree_root.join(".env.portool"));
-    if metadata_current && matches!(actual, Ok(bytes) if bytes == expected.as_bytes()) {
-        Ok(Some(SyncOutcome {
-            block: entry.block,
-            manifest: manifest_state.manifest,
-        }))
-    } else {
-        Ok(None)
+    if !(metadata_current && matches!(actual, Ok(bytes) if bytes == expected.as_bytes())) {
+        return Ok(None);
     }
+
+    // Snapshot revalidation (v0.6): the ledger and env were read at
+    // different instants without the lock, so a concurrent locked writer
+    // (reallocate, release) may have moved this worktree in between.
+    // Re-read the ledger and require the exact same (block, generation,
+    // no-pending) state; the generation counter makes even an A->B->A
+    // move visible. Any difference falls through to the locked slow path.
+    let entry_snapshot = (entry.block, entry.generation);
+    let still_current = match store::load(&paths::registry_path()?) {
+        store::LedgerLoad::Loaded(registry) => registry
+            .find_project(&common_dir_key)
+            .and_then(|p| p.worktrees.get(&worktree_key))
+            .is_some_and(|e| {
+                (e.block, e.generation) == entry_snapshot && e.pending_block.is_none()
+            }),
+        _ => false,
+    };
+    if !still_current {
+        return Ok(None);
+    }
+
+    Ok(Some(SyncOutcome {
+        block: entry_snapshot.0,
+        manifest: manifest_state.manifest,
+    }))
 }
 
 /// Spec §7 steps 4-10: locked read-modify-write. Fail-closed: a corrupt,
@@ -151,6 +178,13 @@ fn slow_path(ctx: &GitCtx, config: &Config, quiet: bool) -> Result<SyncOutcome> 
 
     let common_dir_key = key(&ctx.common_dir);
     let worktree_key = key(&ctx.worktree_root);
+
+    // Resolve an interrupted two-phase move for this worktree before
+    // anything else looks at its blocks: if the crash happened after the
+    // env write, the env already carries the pending block -- roll the
+    // ledger forward to match it; otherwise roll back (the pending target
+    // was reserved but never handed out).
+    resolve_pending_move(&mut registry, &common_dir_key, &worktree_key, ctx);
 
     let manifest_state = load_manifest_state(&ctx.worktree_root)?;
     let block_size = manifest_state
@@ -195,6 +229,39 @@ fn slow_path(ctx: &GitCtx, config: &Config, quiet: bool) -> Result<SyncOutcome> 
     };
 
     let now = now_local();
+    let moving = matches!(&existing_entry, Some(e) if e.block != final_block);
+    let new_generation = match &existing_entry {
+        Some(entry) if entry.block != final_block => entry.generation + 1,
+        Some(entry) => entry.generation,
+        None => 1,
+    };
+    let rendered = envfile::render(
+        &ctx.project_name,
+        &worktree_key,
+        final_block,
+        new_generation,
+        manifest_state.manifest.as_ref(),
+        &identity::project_id(&ctx.common_dir),
+        &identity::worktree_id(&ctx.common_dir, &ctx.worktree_root),
+    );
+
+    // Two-phase update for a block move (external review v0.6): reserve the
+    // target alongside the old block, write the env, then finalize. A crash
+    // at any point leaves the env's block reserved in the ledger, so no
+    // other worktree can be handed a block this one's env still points at.
+    if moving {
+        let entry = registry
+            .find_project_mut(&common_dir_key)
+            .expect("existing_entry implies the project exists")
+            .worktrees
+            .get_mut(&worktree_key)
+            .expect("existing_entry implies the entry exists");
+        entry.pending_block = Some(final_block);
+        store::save(&registry_path, &registry)?;
+
+        write_atomic(&ctx.worktree_root.join(".env.portool"), rendered.as_bytes())?;
+    }
+
     {
         let project_name = ctx.project_name.clone();
         let project = registry
@@ -210,6 +277,8 @@ fn slow_path(ctx: &GitCtx, config: &Config, quiet: bool) -> Result<SyncOutcome> 
             .entry(worktree_key.clone())
             .or_insert_with(|| WorktreeEntry {
                 block: final_block,
+                generation: new_generation,
+                pending_block: None,
                 branch: ctx.branch.clone(),
                 manifest_hash: manifest_state.hash.clone(),
                 pinned: false,
@@ -218,6 +287,8 @@ fn slow_path(ctx: &GitCtx, config: &Config, quiet: bool) -> Result<SyncOutcome> 
                 last_seen_at: now,
             });
         entry.block = final_block;
+        entry.generation = new_generation;
+        entry.pending_block = None;
         entry.branch = ctx.branch.clone();
         entry.manifest_hash = manifest_state.hash.clone();
         entry.last_seen_at = now;
@@ -237,15 +308,12 @@ fn slow_path(ctx: &GitCtx, config: &Config, quiet: bool) -> Result<SyncOutcome> 
 
     store::save(&registry_path, &registry)?;
 
-    let rendered = envfile::render(
-        &ctx.project_name,
-        &worktree_key,
-        final_block,
-        manifest_state.manifest.as_ref(),
-        &identity::project_id(&ctx.common_dir),
-        &identity::worktree_id(&ctx.common_dir, &ctx.worktree_root),
-    );
-    write_atomic(&ctx.worktree_root.join(".env.portool"), rendered.as_bytes())?;
+    // For a non-move (fresh allocation or in-place refresh), the ledger
+    // write comes first: a crash here leaves the block reserved with a
+    // stale/missing env, which the next sync simply rewrites.
+    if !moving {
+        write_atomic(&ctx.worktree_root.join(".env.portool"), rendered.as_bytes())?;
+    }
 
     if !quiet {
         let verb = match &existing_entry {
@@ -325,16 +393,20 @@ pub fn reallocate(ctx: &GitCtx, quiet: bool) -> Result<SyncOutcome> {
     let common_dir_key = key(&ctx.common_dir);
     let worktree_key = key(&ctx.worktree_root);
 
-    if registry
+    // Same recovery as the sync slow path: never allocate on top of an
+    // unresolved pending move.
+    resolve_pending_move(&mut registry, &common_dir_key, &worktree_key, ctx);
+
+    let existing = registry
         .find_project(&common_dir_key)
         .and_then(|p| p.worktrees.get(&worktree_key))
-        .is_none()
-    {
-        return Err(Error::General(format!(
-            "{} has no allocated block yet; run 'portool sync' first",
-            ctx.worktree_root.display()
-        )));
-    }
+        .cloned()
+        .ok_or_else(|| {
+            Error::General(format!(
+                "{} has no allocated block yet; run 'portool sync' first",
+                ctx.worktree_root.display()
+            ))
+        })?;
 
     let manifest_state = load_manifest_state(&ctx.worktree_root)?;
     let block_size = manifest_state
@@ -355,33 +427,48 @@ pub fn reallocate(ctx: &GitCtx, quiet: bool) -> Result<SyncOutcome> {
         None,
     )?;
 
-    let now = now_local();
-    {
-        let project = registry
-            .projects
-            .get_mut(&common_dir_key)
-            .expect("entry existed above");
-        let entry = project
-            .worktrees
-            .get_mut(&worktree_key)
-            .expect("entry existed above");
-        entry.block = new_block;
-        entry.branch = ctx.branch.clone();
-        entry.manifest_hash = manifest_state.hash.clone();
-        entry.last_seen_at = now;
-    }
-
-    store::save(&registry_path, &registry)?;
-
+    let new_generation = existing.generation + 1;
     let rendered = envfile::render(
         &ctx.project_name,
         &worktree_key,
         new_block,
+        new_generation,
         manifest_state.manifest.as_ref(),
         &identity::project_id(&ctx.common_dir),
         &identity::worktree_id(&ctx.common_dir, &ctx.worktree_root),
     );
+
+    // Two-phase move, same protocol as the sync slow path: reserve, write
+    // the env, finalize.
+    {
+        let entry = registry
+            .find_project_mut(&common_dir_key)
+            .expect("entry existed above")
+            .worktrees
+            .get_mut(&worktree_key)
+            .expect("entry existed above");
+        entry.pending_block = Some(new_block);
+    }
+    store::save(&registry_path, &registry)?;
+
     write_atomic(&ctx.worktree_root.join(".env.portool"), rendered.as_bytes())?;
+
+    let now = now_local();
+    {
+        let entry = registry
+            .find_project_mut(&common_dir_key)
+            .expect("entry existed above")
+            .worktrees
+            .get_mut(&worktree_key)
+            .expect("entry existed above");
+        entry.block = new_block;
+        entry.generation = new_generation;
+        entry.pending_block = None;
+        entry.branch = ctx.branch.clone();
+        entry.manifest_hash = manifest_state.hash.clone();
+        entry.last_seen_at = now;
+    }
+    store::save(&registry_path, &registry)?;
 
     if !quiet {
         println!(
@@ -419,6 +506,37 @@ fn warn_if_hook_missing(ctx: &GitCtx) {
         }
         _ => eprintln!("hint: run 'portool init' to install the post-checkout hook"),
     }
+}
+
+/// Resolves an interrupted two-phase move (a `pending_block` left behind by
+/// a crash) for one worktree. Must be called under the registry lock. If
+/// the worktree's env file already carries the pending block, the move
+/// completed on disk and the ledger is rolled forward (the env was written
+/// with `generation + 1`, so the counter follows); otherwise the target was
+/// reserved but never handed out, and the reservation is rolled back. The
+/// caller persists the result with its next save.
+fn resolve_pending_move(
+    registry: &mut Registry,
+    common_dir_key: &str,
+    worktree_key: &str,
+    ctx: &GitCtx,
+) {
+    let entry = match registry
+        .find_project_mut(common_dir_key)
+        .and_then(|p| p.worktrees.get_mut(worktree_key))
+    {
+        Some(entry) => entry,
+        None => return,
+    };
+    let pending = match entry.pending_block {
+        Some(pending) => pending,
+        None => return,
+    };
+    if envfile::read_block_from_env(&ctx.worktree_root) == Some(pending) {
+        entry.block = pending;
+        entry.generation += 1;
+    }
+    entry.pending_block = None;
 }
 
 /// Local-timezone RFC 3339 timestamp, truncated to whole seconds (cross-task

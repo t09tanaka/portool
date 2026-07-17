@@ -42,6 +42,13 @@ impl GitCtx {
             })?;
         let worktree_root = canonicalize(&cwd.join(worktree_root_raw.trim()))?;
 
+        // Ledger keys are JSON strings; a non-UTF-8 path would be keyed by
+        // its lossy conversion, under which two distinct paths can collide
+        // and silently share a block. Fail closed instead (external review
+        // v0.6 #5) -- possible on Linux only; APFS/HFS+ enforce UTF-8.
+        require_utf8(&common_dir)?;
+        require_utf8(&worktree_root)?;
+
         let branch = run_git(cwd, &["symbolic-ref", "--short", "-q", "HEAD"])
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
@@ -168,6 +175,18 @@ fn run_git_bytes(cwd: &Path, args: &[&str]) -> Option<Vec<u8>> {
 fn canonicalize(path: &Path) -> Result<PathBuf> {
     std::fs::canonicalize(path)
         .map_err(|e| Error::General(format!("failed to resolve {}: {e}", path.display())))
+}
+
+/// Rejects a path whose bytes are not valid UTF-8: it could not be keyed in
+/// the ledger without a lossy conversion under which distinct paths collide.
+fn require_utf8(path: &Path) -> Result<()> {
+    if path.to_str().is_none() {
+        return Err(Error::General(format!(
+            "{} is not valid UTF-8; portool requires UTF-8 repository and worktree paths",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Infers a project's display name from its common dir (frozen decision
@@ -389,6 +408,14 @@ mod tests {
             paths.iter().any(|p| p == Path::new("/b/new\nline")),
             "a newline-bearing path must be preserved, got: {paths:?}"
         );
+    }
+
+    #[test]
+    fn require_utf8_rejects_non_utf8_bytes_only() {
+        use std::os::unix::ffi::OsStrExt;
+        let bad = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/\xff\xfe"));
+        assert!(require_utf8(bad).is_err());
+        assert!(require_utf8(Path::new("/tmp/ok")).is_ok());
     }
 
     #[test]
