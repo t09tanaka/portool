@@ -84,6 +84,13 @@ impl TestEnv {
         self.state.join("portool").join("registry.json")
     }
 
+    /// Writes `config.toml` into this test's isolated `XDG_CONFIG_HOME`.
+    fn write_config(&self, contents: &str) {
+        let dir = self.config.join("portool");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("config.toml"), contents).unwrap();
+    }
+
     fn registry(&self) -> serde_json::Value {
         let contents = fs::read_to_string(self.registry_path()).expect("registry.json missing");
         serde_json::from_str(&contents).expect("registry.json is not valid JSON")
@@ -803,26 +810,28 @@ fn exec_outside_git_repo_exits_1() {
     );
 }
 
-// --- 22. missing .portool.toml ----------------------------------------------------------------------------
+// --- 22. no .portool.toml is not an error ----------------------------------------------------------------------------
 
-/// Spec §5/§10: unlike `sync`, exec requires the port manifest.
+/// P1-5 (external review): exec must work with no .portool.toml, injecting
+/// the fallback PORT variable -- the README's no-manifest promise applies
+/// to exec too.
 #[test]
-fn exec_without_manifest_exits_1() {
+fn exec_without_manifest_injects_port() {
     let env = TestEnv::new();
-    let repo = env.path("repo");
-    init_bare_repo(&repo); // no .portool.toml
+    env.write_config("range = [17400, 17499]\n");
+    let repo = env.path("app");
+    init_bare_repo(&repo); // no .portool.toml written
 
-    let output = env.run(&repo, &["exec", "--", "true"]);
-
-    assert_eq!(output.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let out = env.run(&repo, &["exec", "--", "sh", "-c", "echo PORT=$PORT"]);
     assert!(
-        stderr.contains(".portool.toml not found"),
-        "stderr was: {stderr}"
+        out.status.success(),
+        "exec must not require a manifest, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
+    let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stderr.contains("requires a port manifest"),
-        "stderr was: {stderr}"
+        stdout.contains("PORT=174"),
+        "PORT must be injected from the allocated block, got: {stdout}"
     );
 }
 
