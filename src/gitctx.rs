@@ -31,15 +31,12 @@ impl GitCtx {
     ///
     /// Returns [`Error::General`] if `cwd` is not inside a git repository.
     pub fn discover(cwd: &Path) -> Result<GitCtx> {
-        let common_dir_raw = run_git(cwd, &["rev-parse", "--git-common-dir"]).ok_or_else(|| {
-            Error::General(format!("{} is not inside a git repository", cwd.display()))
-        })?;
+        let common_dir_raw = run_git_checked(cwd, &["rev-parse", "--git-common-dir"])
+            .map_err(|e| not_inside_a_git_repository(cwd, &e))?;
         let common_dir = canonicalize(&cwd.join(common_dir_raw.trim()))?;
 
-        let worktree_root_raw =
-            run_git(cwd, &["rev-parse", "--show-toplevel"]).ok_or_else(|| {
-                Error::General(format!("{} is not inside a git repository", cwd.display()))
-            })?;
+        let worktree_root_raw = run_git_checked(cwd, &["rev-parse", "--show-toplevel"])
+            .map_err(|e| not_inside_a_git_repository(cwd, &e))?;
         let worktree_root = canonicalize(&cwd.join(worktree_root_raw.trim()))?;
 
         // Ledger keys are JSON strings; a non-UTF-8 path would be keyed by
@@ -87,8 +84,7 @@ pub fn worktree_list_at(dir: &Path) -> Result<Vec<PathBuf>> {
     if let Some(bytes) = run_git_bytes(dir, &["worktree", "list", "--porcelain", "-z"]) {
         return Ok(parse_worktree_list_z(&bytes));
     }
-    let output = run_git(dir, &["worktree", "list", "--porcelain"])
-        .ok_or_else(|| Error::General("failed to run 'git worktree list'".to_string()))?;
+    let output = run_git_checked(dir, &["worktree", "list", "--porcelain"])?;
     Ok(parse_worktree_list_lines(&output))
 }
 
@@ -140,16 +136,46 @@ pub fn config_scope(dir: &Path, key: &str) -> Option<String> {
         .and_then(|s| s.split_whitespace().next().map(str::to_string))
 }
 
+/// Environment variables through which a *parent* git process (most
+/// notably a git hook, per githooks(5)) pins its child processes to its own
+/// repository. If inherited, they override `git -C <cwd>`'s target -- a
+/// `portool` invoked from inside a hook would then operate on the parent
+/// repo instead of the one at `cwd`, which is silently wrong at best and,
+/// for something like `prune --all` iterating many repos, actively
+/// destructive at worst. Cleared on every git spawn via [`git_command`].
+const GIT_REPO_ENV_VARS: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_PREFIX",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_SHALLOW_FILE",
+    "GIT_GRAFT_FILE",
+];
+
+/// Builds a `git -C <cwd> <args>` command with every repo-pinning
+/// environment variable in [`GIT_REPO_ENV_VARS`] removed, so `-C` is always
+/// the sole source of truth for which repository it operates on. Every git
+/// spawn in this module goes through this constructor.
+fn git_command(cwd: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(cwd).args(args);
+    for var in GIT_REPO_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
 /// Runs `git -C <cwd> <args>`, returning stdout as a `String` on success
 /// (exit code 0), or `None` if the process could not be spawned, exited
-/// non-zero, or produced non-UTF-8 output.
+/// non-zero, or produced non-UTF-8 output. For callers where absence is a
+/// normal outcome (config lookups, `symbolic-ref`); callers that need to
+/// distinguish *why* it failed should use [`run_git_checked`] instead.
 fn run_git(cwd: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .output()
-        .ok()?;
+    let output = git_command(cwd, args).output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -160,16 +186,46 @@ fn run_git(cwd: &Path, args: &[&str]) -> Option<String> {
 /// contain non-UTF-8 paths), or `None` if the process failed to spawn or
 /// exited non-zero.
 fn run_git_bytes(cwd: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .output()
-        .ok()?;
+    let output = git_command(cwd, args).output().ok()?;
     if !output.status.success() {
         return None;
     }
     Some(output.stdout)
+}
+
+/// Like [`run_git`], but returns a [`Result`] that distinguishes *why* it
+/// failed instead of collapsing spawn failures, a non-zero exit, and
+/// non-UTF-8 output into a single `None` -- so callers for whom failure is
+/// unexpected can report git's own stderr instead of a misleading generic
+/// message.
+fn run_git_checked(cwd: &Path, args: &[&str]) -> Result<String> {
+    let output = git_command(cwd, args)
+        .output()
+        .map_err(|e| Error::General(format!("failed to run git {}: {e}", args.join(" "))))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::General(format!(
+            "git {} failed ({}): {}",
+            args.join(" "),
+            output.status,
+            stderr.trim()
+        )));
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|_| Error::General(format!("git {} produced non-UTF-8 output", args.join(" "))))
+}
+
+/// Wraps a [`run_git_checked`] failure from `discover`'s rev-parse calls
+/// with the legacy "not inside a git repository" wording that tests and
+/// users depend on, while still surfacing git's own error text (e.g. "not a
+/// git repository (or any of the parent directories)") instead of swallowing
+/// it -- distinguishing a genuine "no repo here" from an unrelated spawn
+/// failure or a git bug.
+fn not_inside_a_git_repository(cwd: &Path, cause: &Error) -> Error {
+    Error::General(format!(
+        "{} is not inside a git repository ({cause})",
+        cwd.display()
+    ))
 }
 
 fn canonicalize(path: &Path) -> Result<PathBuf> {
@@ -276,6 +332,29 @@ mod tests {
         let err = GitCtx::discover(tmp.path()).unwrap_err();
 
         assert_eq!(err.exit_code(), 1);
+    }
+
+    /// P1 (external review v0.9): the old `run_git` collapsed every failure
+    /// mode (spawn failure, non-zero exit, non-UTF-8 output) into a bare
+    /// `None`, so `discover` could only ever report the generic "not inside
+    /// a git repository" -- even if the real cause was something else
+    /// entirely. It must now keep that wording (existing tests and users
+    /// depend on it) while also surfacing git's own stderr.
+    #[test]
+    fn discover_error_message_includes_git_stderr() {
+        let tmp = TempDir::new().unwrap();
+
+        let err = GitCtx::discover(tmp.path()).unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("is not inside a git repository"),
+            "must keep the legacy wording, got: {msg}"
+        );
+        assert!(
+            msg.contains("not a git repository"),
+            "must surface git's own stderr, got: {msg}"
+        );
     }
 
     #[test]

@@ -69,6 +69,19 @@ impl TestEnv {
             .expect("failed to spawn portool")
     }
 
+    /// Like [`Self::run`], but with additional environment variables set on
+    /// top of the isolated base environment -- for simulating a parent
+    /// process (e.g. a git hook) that exports repo-pinning `GIT_*`
+    /// variables into `portool`'s environment.
+    fn run_with_env(&self, dir: &Path, args: &[&str], extra_env: &[(&str, &Path)]) -> Output {
+        let mut cmd = self.command();
+        cmd.current_dir(dir).args(args);
+        for (key, value) in extra_env {
+            cmd.env(key, value);
+        }
+        cmd.output().expect("failed to spawn portool")
+    }
+
     /// A not-yet-created path under this test's scratch root.
     fn path(&self, name: &str) -> PathBuf {
         self.root.join(name)
@@ -208,6 +221,85 @@ fn sync_outside_git_repo_exits_1() {
     assert!(
         stderr.starts_with("portool: error: "),
         "stderr was: {stderr}"
+    );
+}
+
+/// P1 (external review v0.9): `discover`'s rev-parse failure must keep the
+/// legacy "not inside a git repository" wording (existing behavior other
+/// tests/users depend on) while also surfacing git's own stderr, instead of
+/// collapsing every possible failure into that one generic sentence.
+#[test]
+fn discover_error_reports_git_stderr() {
+    let env = TestEnv::new();
+    let dir = env.path("not-a-repo");
+    fs::create_dir_all(&dir).unwrap();
+
+    let output = env.run(&dir, &["sync"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("is not inside a git repository"),
+        "must keep the legacy wording, stderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("not a git repository"),
+        "must surface git's real stderr, not just the generic sentence, stderr was: {stderr}"
+    );
+}
+
+/// P1 (external review v0.9): a parent git process (most notably a git
+/// hook, per githooks(5)) exports repo-pinning `GIT_DIR`/`GIT_WORK_TREE` in
+/// its own environment. If `portool` (spawned from inside that hook)
+/// inherits them, `git -C <repo-a>` would silently operate on repo B
+/// instead -- every git spawn must scrub those variables so `-C` is the
+/// sole source of truth.
+#[test]
+fn git_dir_environment_does_not_override_dash_c_target() {
+    let env = TestEnv::new();
+    let repo_a = env.path("repo-a");
+    init_repo(&repo_a);
+    let repo_b = env.path("repo-b");
+    init_repo(&repo_b);
+
+    let output = env.run_with_env(
+        &repo_a,
+        &["sync"],
+        &[
+            ("GIT_DIR", &repo_b.join(".git")),
+            ("GIT_WORK_TREE", &repo_b),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // A clean run (no inherited GIT_* vars) must see repo A's allocation --
+    // if the bug were present, `sync` would have written repo B's identity
+    // into the registry instead.
+    let ls = env.run(&repo_a, &["ls", "--json"]);
+    assert!(ls.status.success());
+    let json: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&ls.stdout))
+        .expect("ls --json must emit valid JSON");
+    let allocations = json["allocations"].as_array().unwrap();
+    assert_eq!(allocations.len(), 1, "allocations: {allocations:?}");
+    assert_eq!(
+        allocations[0]["project_key"],
+        serde_json::json!(common_dir_key(&repo_a))
+    );
+    assert_eq!(
+        allocations[0]["path"],
+        serde_json::json!(worktree_key(&repo_a))
+    );
+
+    // And repo B, which was never actually touched by the sync above, must
+    // have no allocation of its own.
+    let registry = env.registry();
+    assert!(
+        registry["projects"].get(common_dir_key(&repo_b)).is_none(),
+        "repo B must not have been allocated a block: {registry:?}"
     );
 }
 
