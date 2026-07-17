@@ -29,6 +29,15 @@ pub fn run(
     strict: bool,
     reallocate_on_conflict: bool,
 ) -> Result<()> {
+    // clap marks the trailing command as required, but this function is
+    // also reachable programmatically -- an empty command must be a clean
+    // error, not an index panic below.
+    if command.is_empty() {
+        return Err(Error::General(
+            "portool exec: no command given (expected 'portool exec -- <COMMAND>')".to_string(),
+        ));
+    }
+
     let cwd = std::env::current_dir()?;
     let ctx = GitCtx::discover(&cwd)?;
 
