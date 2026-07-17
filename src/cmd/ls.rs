@@ -24,27 +24,38 @@ pub fn run(json: bool, all: bool) -> Result<()> {
         ctx_result?;
     }
 
-    // Read-only command: never heal (rename aside) a corrupt ledger here.
-    // But do not lie about it either (batch B #10): a corrupt/unreadable
-    // ledger must exit non-zero and, in JSON mode, emit an explicit error
-    // object -- never an empty-but-valid-looking ledger that a machine
-    // consumer would read as "no allocations".
-    let load = store::load(&paths::registry_path()?, false);
-    if load.corrupt || load.read_error {
-        if json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "error": "registry is unreadable or corrupt"
-                }))
-                .expect("error object always serializes")
-            );
+    // Read-only command: `load` never mutates the ledger. But do not lie
+    // about a bad one either (batch B #10): a corrupt/unreadable ledger
+    // must exit non-zero and, in JSON mode, emit an explicit error object
+    // -- never an empty-but-valid-looking ledger that a machine consumer
+    // would read as "no allocations".
+    let registry = match store::load(&paths::registry_path()?) {
+        store::LedgerLoad::Loaded(registry) => registry,
+        store::LedgerLoad::Missing => Registry::empty(crate::config::Config::default().range),
+        bad => {
+            let message = match bad {
+                store::LedgerLoad::Corrupt { reason } => {
+                    format!("registry is corrupt: {reason}")
+                }
+                store::LedgerLoad::UnsupportedVersion { found, supported } => format!(
+                    "registry uses unsupported schema version {found} \
+                     (this build understands version {supported})"
+                ),
+                store::LedgerLoad::ReadError { reason } => {
+                    format!("registry is unreadable: {reason}")
+                }
+                store::LedgerLoad::Missing | store::LedgerLoad::Loaded(_) => unreachable!(),
+            };
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({ "error": message }))
+                        .expect("error object always serializes")
+                );
+            }
+            return Err(Error::General(message));
         }
-        return Err(Error::General(
-            "registry is unreadable or corrupt".to_string(),
-        ));
-    }
-    let registry = load.registry;
+    };
 
     let filtered: BTreeMap<String, ProjectEntry> = if all {
         registry.projects.clone()

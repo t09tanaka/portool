@@ -9,6 +9,11 @@ use std::fmt;
 pub enum Error {
     /// A general, unstructured error (exit code 1).
     General(String),
+    /// The on-disk ledger uses a schema version this build does not
+    /// understand (exit code 1). Kept distinct from generic corruption so
+    /// callers never treat a ledger written by a *newer* portool as
+    /// something to repair or reset.
+    UnsupportedRegistryVersion { found: u32, supported: u32 },
     /// The configured pool has no room left for a block anywhere in the
     /// range (exit code 3). Exit code 2 is retired along with the old
     /// per-project subrange model (hardening batch C).
@@ -28,6 +33,7 @@ impl Error {
     pub fn exit_code(&self) -> i32 {
         match self {
             Error::General(_) => 1,
+            Error::UnsupportedRegistryVersion { .. } => 1,
             Error::PoolExhausted => 3,
             Error::LockTimeout => 4,
             Error::CommandNotExecutable(_) => 126,
@@ -40,6 +46,10 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::General(msg) => write!(f, "{msg}"),
+            Error::UnsupportedRegistryVersion { found, supported } => write!(
+                f,
+                "unsupported registry version {found} (this build understands version {supported})"
+            ),
             Error::PoolExhausted => write!(f, "pool exhausted"),
             Error::LockTimeout => write!(f, "lock timeout"),
             Error::CommandNotFound(cmd) => write!(f, "command not found: {cmd}"),

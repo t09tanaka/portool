@@ -15,14 +15,18 @@ pub fn run() -> Result<()> {
     // error, a missing one means defaults.
     Config::load()?;
 
-    // Read-only: never heal (rename aside) here. `load` reports corruption
-    // and read errors via flags rather than mutating anything.
-    let load = store::load(&paths::registry_path()?, false);
-    if load.read_error {
-        return Err(Error::General("registry is unreadable".to_string()));
-    }
-    if load.corrupt {
-        return Err(Error::General("registry is corrupt".to_string()));
+    // Read-only: `load` never mutates anything.
+    match store::load(&paths::registry_path()?) {
+        store::LedgerLoad::Missing | store::LedgerLoad::Loaded(_) => {}
+        store::LedgerLoad::Corrupt { reason } => {
+            return Err(Error::General(format!("registry is corrupt: {reason}")));
+        }
+        store::LedgerLoad::UnsupportedVersion { found, supported } => {
+            return Err(Error::UnsupportedRegistryVersion { found, supported });
+        }
+        store::LedgerLoad::ReadError { reason } => {
+            return Err(Error::General(format!("registry is unreadable: {reason}")));
+        }
     }
 
     println!("portool: config and ledger are OK");

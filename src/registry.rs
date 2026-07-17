@@ -77,8 +77,10 @@ impl Registry {
     /// locked write; a read-only caller sees v2 in memory and leaves the v1
     /// file on disk.
     ///
-    /// An unparseable body or an unrecognized version is an error, which
-    /// callers treat as corruption.
+    /// An unparseable body is a general error, which callers treat as
+    /// corruption; an unrecognized version is the distinct
+    /// [`Error::UnsupportedRegistryVersion`], so a ledger written by a
+    /// newer portool is never mistaken for a corrupt one.
     pub fn from_json(s: &str) -> Result<Registry> {
         #[derive(Deserialize)]
         struct VersionPeek {
@@ -88,18 +90,18 @@ impl Registry {
         match peek.version {
             2 => Ok(serde_json::from_str::<Registry>(s)?),
             1 => Ok(serde_json::from_str::<v1::Registry>(s)?.into_current()),
-            other => Err(Error::General(format!(
-                "unsupported registry version {other} (this build understands version {})",
-                Self::CURRENT_VERSION
-            ))),
+            other => Err(Error::UnsupportedRegistryVersion {
+                found: other,
+                supported: Self::CURRENT_VERSION,
+            }),
         }
     }
 
     /// Semantic validation applied after a successful JSON parse (spec §5,
     /// hardening batch B #9). A violation means the ledger is *corrupt* and
-    /// callers handle it as such (move aside under lock; non-zero for
-    /// read-only callers) -- being parseable JSON is necessary but not
-    /// sufficient to trust the ledger.
+    /// every caller fails closed on it (only `doctor --repair` may move it
+    /// aside) -- being parseable JSON is necessary but not sufficient to
+    /// trust the ledger.
     ///
     /// Checks: the schema `version` is recognized; `range` is ordered; every
     /// block is ordered, carries no port 0, and does not overlap any other
@@ -109,11 +111,10 @@ impl Registry {
     /// pool legitimately produces such blocks (a `doctor` advisory).
     pub fn validate(&self) -> Result<()> {
         if self.version != Self::CURRENT_VERSION {
-            return Err(Error::General(format!(
-                "unsupported registry version {} (this build understands version {})",
-                self.version,
-                Self::CURRENT_VERSION
-            )));
+            return Err(Error::UnsupportedRegistryVersion {
+                found: self.version,
+                supported: Self::CURRENT_VERSION,
+            });
         }
         if self.range.0 > self.range.1 {
             return Err(Error::General(format!(

@@ -76,7 +76,12 @@ enum Command {
     Check,
     /// Diagnose and repair the current project (rebuild lost entries, report
     /// blocks whose ports are in use).
-    Doctor,
+    Doctor {
+        /// Move a corrupt (or unsupported-version) ledger aside and rebuild
+        /// this project's entries from live worktrees' `.env.portool`.
+        #[arg(long)]
+        repair: bool,
+    },
     /// Free the current worktree's block and remove its `.env.portool`.
     Release,
     /// Remove portool's hooks and `.gitignore` entry (reverses `init`).
@@ -118,7 +123,7 @@ fn main() {
         Command::Reallocate { quiet } => cmd::sync::reallocate_cmd(quiet),
         Command::Prune { all, dry_run } => cmd::prune::run(all, dry_run),
         Command::Check => cmd::check::run(),
-        Command::Doctor => cmd::doctor::run(),
+        Command::Doctor { repair } => cmd::doctor::run(repair),
         Command::Release => cmd::release::run(),
         Command::Deinit => cmd::init::deinit(),
     };

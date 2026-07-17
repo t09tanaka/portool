@@ -71,7 +71,11 @@ impl Manifest {
 
     /// The block size implied by this manifest: `max(max offset + 1,
     /// declared count)`, rounded up to a multiple of `block_align`.
-    pub fn block_size(&self, block_align: u16) -> u16 {
+    ///
+    /// A manifest whose (aligned) size exceeds `u16::MAX` is rejected
+    /// rather than clamped (external review P2 #6): clamping would silently
+    /// hand two declared offsets the same port.
+    pub fn block_size(&self, block_align: u16) -> Result<u16> {
         let max_offset_plus_one = self
             .ports
             .iter()
@@ -83,7 +87,12 @@ impl Manifest {
 
         let align = u32::from(block_align.max(1));
         let aligned = raw.div_ceil(align) * align;
-        u16::try_from(aligned).unwrap_or(u16::MAX)
+        u16::try_from(aligned).map_err(|_| {
+            Error::General(format!(
+                "invalid manifest: the declared ports need a {aligned}-port block, \
+                 which cannot fit below port 65535"
+            ))
+        })
     }
 }
 
@@ -157,7 +166,7 @@ mod tests {
     fn empty_ports_table_sizes_to_the_alignment_minimum() {
         let m = Manifest::parse("[ports]\n").unwrap();
         assert!(m.ports.is_empty());
-        assert_eq!(m.block_size(5), 5);
+        assert_eq!(m.block_size(5).unwrap(), 5);
     }
 
     #[test]
@@ -194,21 +203,42 @@ mod tests {
     fn block_size_rounds_4_to_5() {
         // 4 declared ports, max offset 3 -> raw 4, rounds up to align 5.
         let m = Manifest::parse("[ports]\na = 0\nb = 1\nc = 2\nd = 3\n").unwrap();
-        assert_eq!(m.block_size(5), 5);
+        assert_eq!(m.block_size(5).unwrap(), 5);
     }
 
     #[test]
     fn block_size_rounds_5_to_5() {
         // 5 declared ports, max offset 4 -> raw 5, already a multiple of 5.
         let m = Manifest::parse("[ports]\na = 0\nb = 1\nc = 2\nd = 3\ne = 4\n").unwrap();
-        assert_eq!(m.block_size(5), 5);
+        assert_eq!(m.block_size(5).unwrap(), 5);
     }
 
     #[test]
     fn block_size_rounds_6_to_10() {
         // 6 declared ports, max offset 5 -> raw 6, rounds up to 10.
         let m = Manifest::parse("[ports]\na = 0\nb = 1\nc = 2\nd = 3\ne = 4\nf = 5\n").unwrap();
-        assert_eq!(m.block_size(5), 10);
+        assert_eq!(m.block_size(5).unwrap(), 10);
+    }
+
+    #[test]
+    fn block_size_at_the_u16_ceiling_is_accepted() {
+        // Max offset 65534 -> raw 65535, exactly representable with align 1.
+        let m = Manifest::parse("[ports]\na = 65534\n").unwrap();
+        assert_eq!(m.block_size(1).unwrap(), u16::MAX);
+    }
+
+    #[test]
+    fn block_size_rejects_an_unrepresentable_manifest() {
+        // Max offset 65535 -> raw 65536 > u16::MAX: rejecting beats the old
+        // clamp, under which two offsets would saturate to the same port.
+        let m = Manifest::parse("[ports]\na = 65534\nb = 65535\n").unwrap();
+        let err = m.block_size(1).unwrap_err();
+        assert_eq!(err.exit_code(), 1);
+        assert!(err.to_string().contains("invalid manifest"));
+
+        // Alignment overflow is rejected too: raw 65534 aligns up to 65540.
+        let m = Manifest::parse("[ports]\na = 65533\n").unwrap();
+        assert!(m.block_size(10).is_err());
     }
 
     #[test]
