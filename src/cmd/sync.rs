@@ -499,7 +499,7 @@ fn warn_if_hook_missing(ctx: &GitCtx) {
         .hook_file("post-checkout")
         .and_then(|hook_path| std::fs::read_to_string(hook_path).ok());
     match content {
-        Some(c) if c.contains(crate::hooks::HOOK_MARKER) => {
+        Some(c) if crate::hooks::contains_portool_invocation(&c) => {
             if crate::cmd::init::contains_unsafe_portool_form(&c) {
                 eprintln!(
                     "portool: your post-checkout hook uses an old form that can fail \

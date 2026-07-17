@@ -468,20 +468,27 @@ fn init_installs_hook_and_gitignore_and_is_idempotent() {
     );
 
     let hook_path = repo.join(".git/hooks/post-checkout");
-    let expected_hook = "#!/bin/sh\n\
-# installed by portool\n\
-if command -v portool >/dev/null 2>&1; then\n\
-\x20\x20portool sync --quiet || echo 'portool: sync failed; Git was not blocked' >&2\n\
-fi\n\
-exit 0\n";
     let hook_content_1 = fs::read_to_string(&hook_path).unwrap();
-    assert_eq!(hook_content_1, expected_hook);
+    assert!(hook_content_1.starts_with("#!/bin/sh\n# installed by portool\n"));
+    assert!(portool::hooks::contains_portool_invocation(&hook_content_1));
+    assert!(
+        hook_content_1.contains("|| echo 'portool: sync failed; Git was not blocked' >&2"),
+        "must report sync failure without propagating it"
+    );
+    assert!(hook_content_1.trim_end().ends_with("exit 0"));
+    // Task 5: the hook embeds the running binary's absolute, canonicalized
+    // path -- so it still works from a GUI client whose PATH lacks it.
+    let expected_bin = fs::canonicalize(env!("CARGO_BIN_EXE_portool")).unwrap();
+    assert!(
+        hook_content_1.contains(&format!("PORTOOL_BIN=\"{}\"", expected_bin.display())),
+        "hook must embed the absolute portool binary path, got: {hook_content_1}"
+    );
     let mode = fs::metadata(&hook_path).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o755, "hook must be executable");
 
     // Batch A #5: post-merge is installed alongside post-checkout.
     let post_merge = repo.join(".git/hooks/post-merge");
-    assert_eq!(fs::read_to_string(&post_merge).unwrap(), expected_hook);
+    assert_eq!(fs::read_to_string(&post_merge).unwrap(), hook_content_1);
     assert_eq!(
         fs::metadata(&post_merge).unwrap().permissions().mode() & 0o777,
         0o755,
@@ -565,7 +572,7 @@ fn init_with_custom_hookspath_installs_there_not_git_hooks() {
 
     let hook_path = repo.join("ci-hooks/post-checkout");
     let content_1 = fs::read_to_string(&hook_path).unwrap();
-    assert!(content_1.contains("portool sync"));
+    assert!(portool::hooks::contains_portool_invocation(&content_1));
     let mode = fs::metadata(&hook_path).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o755, "hook must be executable");
     assert!(
@@ -607,10 +614,11 @@ fn init_with_custom_hookspath_appends_to_existing_hook() {
         content.starts_with("#!/bin/sh\necho existing\n"),
         "the pre-existing hook body must be preserved"
     );
+    assert!(portool::hooks::contains_portool_invocation(&content));
     assert_eq!(
-        content.matches("portool sync").count(),
+        content.matches(portool::hooks::HOOK_BLOCK_BEGIN).count(),
         1,
-        "re-running init must not duplicate the line"
+        "re-running init must not duplicate the managed block"
     );
 }
 
@@ -648,13 +656,13 @@ fn init_refuses_global_scope_shared_hookspath() {
         .current_dir(&repo)
         .args(["init", "--hook-only"]);
     let output = cmd.output().expect("failed to spawn portool");
-
-    assert!(
-        output.status.success(),
-        "init must not fail: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
     let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // External review P1-4: "installed nothing" must not look like success.
+    assert!(
+        !output.status.success(),
+        "init must fail when no hook location is installable, stderr: {stderr}"
+    );
     assert!(
         stderr.contains("shared hooks dir") && stderr.contains("global"),
         "must warn about the global-scope shared hooksPath, got: {stderr}"
@@ -735,7 +743,7 @@ fn init_with_husky_hookspath_installs_user_managed_hook_and_chains() {
     );
 
     let user_hook = fs::read_to_string(repo.join(".husky/post-checkout")).unwrap();
-    assert!(user_hook.contains("portool sync"));
+    assert!(portool::hooks::contains_portool_invocation(&user_hook));
     assert_eq!(
         fs::read_to_string(repo.join(".husky/_/post-checkout")).unwrap(),
         husky_shim,
@@ -812,8 +820,12 @@ fn init_with_missing_hookspath_warns_and_installs_nothing() {
         .success());
 
     let output = env.run(&repo, &["init"]);
-    assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
+    // External review P1-4: "installed nothing" must not look like success.
+    assert!(
+        !output.status.success(),
+        "init must fail when no hook location is installable, stderr: {stderr}"
+    );
     assert!(
         stderr.contains("core.hooksPath") && stderr.contains("is not an existing directory"),
         "expected a warning about the unusable hooksPath, got: {stderr}"
@@ -2040,13 +2052,13 @@ fn init_refuses_global_husky_shaped_hookspath() {
         .current_dir(&repo)
         .args(["init", "--hook-only"]);
     let output = cmd.output().expect("failed to spawn portool");
-
-    assert!(
-        output.status.success(),
-        "init must not fail: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
     let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // External review P1-4: "installed nothing" must not look like success.
+    assert!(
+        !output.status.success(),
+        "init must fail when no hook location is installable, stderr: {stderr}"
+    );
     assert!(
         stderr.contains("shared hooks dir") && stderr.contains("global"),
         "must warn about the global-scope shared hooksPath, got: {stderr}"
