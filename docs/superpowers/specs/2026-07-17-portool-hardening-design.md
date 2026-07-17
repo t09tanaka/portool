@@ -537,6 +537,30 @@ these on Ubuntu + macOS).
 4. **D — Robustness & tooling.** Small independent fixes + new commands +
    P2 tests; can be split further if a single PR grows too large.
 
+## Implementation deviations (reconciled post-merge)
+
+The shipped implementation departs from this spec's letter in three
+correctness-neutral ways, confirmed by the post-merge implementation review:
+
+- **C1 preferred position drops `project_id` from the hash.** `preferred_slot`
+  (`src/alloc.rs`) uses `main`/`master` → pool start (slot 0), other branches
+  → `FNV1a(branch) % slots` (detached → path), rather than the spec's
+  `FNV1a(project_id ++ key)` base. This keeps the first project's `main` at
+  the pool start (predictable, matching the test suite) and is simpler;
+  allocation correctness, non-overlap, and pool-exhaustion behavior are
+  unaffected (forward scan + overlap check resolve all collisions). The
+  trade-off is weaker per-project clustering (all `main` worktrees prefer the
+  low end). **The README's "How it works" describes the shipped behavior**;
+  this spec section is the record of the divergence.
+- **D4 env-var port math saturates instead of erroring.**
+  `block.0.saturating_add(offset)` (`src/envfile.rs`) prevents a release-build
+  wraparound; the "manifest error" path the spec described is unreachable in
+  practice (a block is always sized to fit its manifest and validated to fit
+  the pool), so saturation is defense-in-depth rather than a user-facing
+  error.
+- **D6 concurrency test lands at 16 processes** (raised from 8 in a follow-up)
+  — satisfying the "15+" target.
+
 ## Out of scope (this engagement)
 
 - Cross-user / system-wide (multi-`$HOME`) coordination — portool remains
