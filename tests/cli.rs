@@ -945,23 +945,32 @@ fn ls_table_and_json_shapes() {
     assert!(stdout.contains("repo-a"));
     assert!(stdout.contains("repo-b"));
 
-    // --json, current project only.
+    // --json, current project only. Task 10: a versioned envelope, not the
+    // raw ledger shape.
     let output = env.run(&repo_a, &["ls", "--json"]);
     assert!(output.status.success());
     let json: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&output.stdout))
         .expect("ls --json must emit valid JSON");
-    assert_eq!(json["version"], serde_json::json!(3));
-    assert_eq!(json["range"], serde_json::json!([4300, 4319]));
-    let projects = json["projects"].as_object().unwrap();
-    assert_eq!(projects.len(), 1);
-    assert!(projects.contains_key(&common_dir_key(&repo_a)));
+    assert_eq!(json["format_version"], serde_json::json!(1));
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["registry_schema_version"], serde_json::json!(3));
+    assert_eq!(
+        json["effective_config"]["range"],
+        serde_json::json!([4300, 4319])
+    );
+    let allocations = json["allocations"].as_array().unwrap();
+    assert_eq!(allocations.len(), 1);
+    assert_eq!(
+        allocations[0]["project_key"],
+        serde_json::json!(common_dir_key(&repo_a))
+    );
 
     // --json --all: both projects.
     let output = env.run(&repo_a, &["ls", "--json", "--all"]);
     let json: serde_json::Value =
         serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
-    let projects = json["projects"].as_object().unwrap();
-    assert_eq!(projects.len(), 2);
+    let allocations = json["allocations"].as_array().unwrap();
+    assert_eq!(allocations.len(), 2);
 
     // Outside a repo: `--all` is fine, plain `ls` is exit 1.
     let outside = env.path("outside");
@@ -970,6 +979,76 @@ fn ls_table_and_json_shapes() {
     assert_eq!(output.status.code(), Some(1));
     let output = env.run(&outside, &["ls", "--all", "--json"]);
     assert!(output.status.success());
+}
+
+/// Task 10 (external review P1-7): `ls --json` emits a versioned envelope
+/// decoupled from the ledger's storage schema, with derived `ports`.
+#[test]
+fn ls_json_emits_format_v1_envelope() {
+    let env = TestEnv::new();
+    env.write_config("range = [18300, 18399]\n");
+    let repo = env.path("app");
+    init_repo(&repo);
+    fs::write(repo.join(".portool.toml"), "[ports]\nweb = 0\napi = 1\n").unwrap();
+    assert!(env.run(&repo, &["sync"]).status.success());
+
+    let out = env.run(&repo, &["ls", "--json"]);
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["format_version"], 1);
+    assert_eq!(v["ok"], true);
+    assert_eq!(
+        v["effective_config"]["range"],
+        serde_json::json!([18300, 18399])
+    );
+    let alloc = &v["allocations"][0];
+    assert_eq!(alloc["branch"], "main");
+    assert_eq!(alloc["status"], "active");
+    assert_eq!(alloc["ports"]["WEB_PORT"], alloc["block"][0]);
+    assert!(alloc["project_id"].is_string());
+    // Storage-schema internals must NOT leak.
+    assert!(v.get("projects").is_none());
+    assert!(alloc.get("pending_block").is_none());
+}
+
+/// Missing ledger -> `ok: true`, empty allocations, and the *real* config
+/// (fixing the fabricated-default-range bug: it must not report
+/// `Config::default()` when the caller configured a different pool).
+#[test]
+fn ls_json_missing_ledger_reports_real_config() {
+    let env = TestEnv::new();
+    env.write_config("range = [18400, 18499]\n");
+    let repo = env.path("app");
+    init_repo(&repo);
+
+    let out = env.run(&repo, &["ls", "--json"]);
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], true);
+    assert_eq!(
+        v["effective_config"]["range"],
+        serde_json::json!([18400, 18499]),
+        "must reflect the real config, not Config::default()"
+    );
+    assert_eq!(v["allocations"].as_array().unwrap().len(), 0);
+}
+
+/// A corrupt ledger is the versioned error envelope, not the old bare
+/// `{"error": ...}` shape.
+#[test]
+fn ls_json_corrupt_ledger_is_an_error_envelope() {
+    let env = TestEnv::new();
+    let repo = env.path("app");
+    init_repo(&repo);
+    fs::create_dir_all(env.registry_path().parent().unwrap()).unwrap();
+    fs::write(env.registry_path(), "{ nope").unwrap();
+
+    let out = env.run(&repo, &["ls", "--json"]);
+    assert!(!out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["format_version"], 1);
+    assert_eq!(v["ok"], false);
+    assert!(v["error"].as_str().unwrap().contains("corrupt"));
 }
 
 // --- 10. deleted worktree is reclaimed by prune; --dry-run doesn't touch it -
@@ -2385,15 +2464,24 @@ fn v2_ledger_is_migrated_with_blocks_preserved() {
     );
     let json: serde_json::Value =
         serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
-    assert_eq!(json["version"], serde_json::json!(3));
-    let entry = &json["projects"][common_dir_key(&repo)]["worktrees"][worktree_key(&repo)];
+    assert_eq!(json["registry_schema_version"], serde_json::json!(3));
+    let allocations = json["allocations"].as_array().unwrap();
+    assert_eq!(allocations.len(), 1);
+    let entry = &allocations[0];
+    assert_eq!(
+        entry["project_key"],
+        serde_json::json!(common_dir_key(&repo))
+    );
+    assert_eq!(entry["path"], serde_json::json!(worktree_key(&repo)));
     assert_eq!(
         block_tuple(&entry["block"]),
         block_before,
         "the block must be preserved verbatim across the migration"
     );
     assert_eq!(entry["generation"], serde_json::json!(1));
-    assert_eq!(entry["pending_block"], serde_json::Value::Null);
+    // Storage-schema internals (the v2->v3 migration's `pending_block`) must
+    // not leak into the stable envelope.
+    assert!(entry.get("pending_block").is_none());
 }
 
 /// Crash recovery, forward direction: the ledger carries a pending move
