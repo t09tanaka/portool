@@ -19,6 +19,8 @@ pub mod envread;
 #[doc(hidden)]
 pub mod error;
 #[doc(hidden)]
+pub mod fault;
+#[doc(hidden)]
 pub mod gc;
 #[doc(hidden)]
 pub mod gitctx;
