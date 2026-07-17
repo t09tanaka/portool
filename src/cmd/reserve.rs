@@ -20,8 +20,18 @@ pub fn reserve(spec: &str, label: Option<String>) -> Result<()> {
     let mut registry =
         store::load_strict(&registry_path)?.unwrap_or_else(|| Registry::empty(config.range));
 
-    if registry.reservations.iter().any(|r| r.block == block) {
-        println!("portool: {}-{} is already reserved", block.0, block.1);
+    if let Some(existing) = registry.reservations.iter_mut().find(|r| r.block == block) {
+        if label.is_some() && label != existing.label {
+            existing.label = label;
+            registry.validate()?;
+            store::save(&registry_path, &registry)?;
+            println!(
+                "portool: {}-{} was already reserved; label updated",
+                block.0, block.1
+            );
+        } else {
+            println!("portool: {}-{} is already reserved", block.0, block.1);
+        }
         return Ok(());
     }
     if let Some(other) = registry.all_blocks().iter().find(|&&b| overlaps(b, block)) {
@@ -44,7 +54,11 @@ pub fn reserve(spec: &str, label: Option<String>) -> Result<()> {
 
 pub fn unreserve(spec: &str) -> Result<()> {
     let block = parse_block(spec)?;
-    let single_port = block.0 == block.1;
+    // Derived from the spec's syntax, not the parsed values: a degenerate
+    // RANGE spec like "19003-19003" must still require an exact match, so it
+    // can never containment-match and remove a wider reservation (e.g.
+    // "19000-19009"). Only a bare PORT spec (no '-') containment-matches.
+    let single_port = !spec.contains('-');
     let _lock = lock::acquire(&paths::lock_path()?, LOCK_TIMEOUT)?;
     let registry_path = paths::registry_path()?;
     let mut registry = store::load_strict(&registry_path)?

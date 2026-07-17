@@ -2773,6 +2773,20 @@ fn reserve_blocks_allocation_and_unreserve_frees_it() {
     assert!(env.run(&repo, &["reserve", "18600-18604"]).status.success());
     assert!(!env.run(&repo, &["reserve", "18604-18606"]).status.success());
 
+    // Idempotent re-reserve with a new --label updates the stored label
+    // instead of silently discarding it.
+    let out = env.run(&repo, &["reserve", "18600-18604", "--label", "pg"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        env.registry()["reservations"][0]["label"].as_str(),
+        Some("pg"),
+        "idempotent re-reserve with --label must update the stored label"
+    );
+
     // Single-port unreserve removes the containing reservation.
     assert!(env.run(&repo, &["unreserve", "18602"]).status.success());
     assert!(env.registry()["reservations"]
@@ -2799,6 +2813,24 @@ fn reserve_blocks_allocation_and_unreserve_frees_it() {
         1,
         "the failed unreserve must leave the reservation in place"
     );
+
+    // A degenerate range spec (START == END) must NOT containment-match: it
+    // has the same syntax shape as a range, so it requires an exact block
+    // match just like any other range, even though its parsed value equals
+    // a single port inside the wider reservation.
+    let out = env.run(&repo, &["unreserve", "18602-18602"]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a degenerate range spec must not containment-match; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        env.registry()["reservations"].as_array().unwrap().len(),
+        1,
+        "the failed degenerate-range unreserve must leave the reservation in place"
+    );
+
     assert!(env
         .run(&repo, &["unreserve", "18600-18604"])
         .status

@@ -487,8 +487,15 @@ fn install_into(hook_path: &Path, script: &str, block: &str) -> Result<()> {
         }
         // Exists but not readable as UTF-8: leave it entirely untouched --
         // we can't reason about its content, and must not risk clobbering it
-        // or changing its permissions.
-        Err(_) => {}
+        // or changing its permissions. Still warn, so this doesn't look like
+        // a silent success (doctor flags it later too).
+        Err(_) => {
+            eprintln!(
+                "warning: {} exists but is not readable as UTF-8; leaving it untouched \
+                 (portool's hook was NOT installed)",
+                hook_path.display()
+            );
+        }
     }
 
     Ok(())
@@ -958,6 +965,24 @@ mod tests {
 
         // Left byte-identical: portool never injects sh into a python hook.
         assert_eq!(fs::read_to_string(&hook_path).unwrap(), original);
+    }
+
+    #[test]
+    fn install_into_leaves_a_non_utf8_hook_untouched() {
+        let tmp = TempDir::new().unwrap();
+        let hooks_dir = tmp.path().join("repo/.git/hooks");
+        fs::create_dir_all(&hooks_dir).unwrap();
+        let hook_path = hooks_dir.join("post-checkout");
+        // Invalid UTF-8 byte sequence: not readable as a string.
+        let original: &[u8] = b"#!/bin/sh\n\xff\xfe not valid utf-8\n";
+        fs::write(&hook_path, original).unwrap();
+        let script = hook_script(Some("/p"));
+        let block = hook_append_block(Some("/p"));
+
+        install_into(&hook_path, &script, &block).unwrap();
+
+        // Left byte-identical: portool can't reason about non-UTF-8 content.
+        assert_eq!(fs::read(&hook_path).unwrap(), original);
     }
 
     #[test]
