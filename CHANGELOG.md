@@ -5,7 +5,7 @@ All notable changes to portool are documented here. The format is based on
 [Semantic Versioning](https://semver.org/) (pre-1.0: a breaking change bumps
 the minor version).
 
-## [Unreleased]
+## [0.6.0] - 2026-07-17
 
 The design-change items from the post-0.5.0 external review: transactional
 ledger/env state transitions. **Contains a breaking ledger schema change.**
