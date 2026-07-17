@@ -46,6 +46,8 @@ guarantees.
 | A | Hook safety | `cmd/init.rs`, `hooks.rs` | none | P0 |
 | B | Fail-closed & honesty | `config.rs`, `registry.rs`, `store.rs`, `cmd/ls.rs`, `main.rs`, `paths.rs`, `README.md` | validation only | P0/P1 |
 | C | Allocation model overhaul | `alloc.rs`, `registry.rs`, `cmd/sync.rs`, `cmd/exec.rs`, `store.rs` | **v2 (breaking)** | P0 |
+<!-- Batch C addresses findings #3, #1 (bind-recheck/reallocate), #11. -->
+
 | D | Robustness & tooling | `gitctx.rs`, `envfile.rs`, `ports.rs`, `cmd/*` (new commands), tests | none | P1/P2 |
 
 Each batch is one design record here; each becomes its own implementation
@@ -90,11 +92,25 @@ appended last. Acceptable — never blocking Git wins, and it is documented.)
 
 portool ≤0.2 wrote `command -v portool … && portool sync --quiet`, which can
 propagate failure. Today `install_into` *preserves* such lines verbatim
-(there is a test asserting this — it gets inverted). New behavior: when a
-portool-managed hook contains an unsafe form, **rewrite the portool lines**
-to the safe A1 form, in place, atomically. portool's own lines are
-identified precisely via the `portool sync` marker; foreign lines are never
-touched.
+(there is a test asserting this — `init.rs:201-215` gets inverted). New
+behavior: when a portool-managed hook contains an unsafe form, **rewrite the
+portool lines** to the safe A1 form, in place, atomically.
+
+- **Marker is a substring match, not precise ownership (Fable review #6).**
+  The `portool sync` marker (`hooks.rs:11`, matched at `init.rs:106`) is a
+  plain `contains` check, so a line the *user* hand-wrote that mentions
+  `portool sync` would also be a rewrite candidate. Constrain the rewrite:
+  only rewrite a line that matches the exact shape portool itself emits (the
+  `command -v portool … portool sync --quiet` guard forms this and prior
+  versions wrote); leave anything else untouched, and never rewrite lines
+  under a foreign hook's non-portool logic.
+- **`init` re-run is not the only trigger (Fable review #6).** Migration
+  only fires when `init` runs. `warn_if_hook_missing` (`sync.rs:350-359`)
+  keys off marker presence only, so a user who never re-runs `init` keeps
+  the unsafe hook silently. Extend the sync-time hook check to detect the
+  *unsafe legacy shape* and print a one-line hint: `portool: your
+  post-checkout hook uses an old form that can fail 'git checkout'; run
+  'portool init' to update it`.
 
 ### A3 — Interpreter-aware, non-destructive append (#5)
 
@@ -123,6 +139,17 @@ shared hooks dir), **refuse to auto-write** — warn and print the manual
 one-liner. Auto-install proceeds only for `local` / `worktree` scope and for
 repo-relative paths (which are inherently per-repo).
 
+### A5 — Also install `post-merge` (enhancement, Fable review item 7)
+
+`post-checkout` misses `.portool.toml` changes arriving via `git pull` /
+`git merge`. Since the safe A1 script is trivial, install the same guarded
+`portool sync --quiet` into `post-merge` alongside `post-checkout`, through
+the identical interpreter-aware/scope-aware install path (A3/A4). This
+widens passive freshness to the common pull-based workflow at near-zero
+cost. `deinit` (D5) removes both. Purely additive; does not change the
+finding-#7 contract (explicit `sync`/`doctor` remains the guarantee for
+edits Git hooks can't observe at all, e.g. a manual editor save).
+
 ---
 
 ## Batch B — Fail-closed & honesty
@@ -140,6 +167,16 @@ failure). Add `#[serde(deny_unknown_fields)]` to `RawConfig` so a typo like
 `ragne = …` is a hard error, not a silently-ignored field. `port 0` is
 rejected in range validation (see D4).
 
+**Deprecated-field interaction with C1 (Fable review, blocker #2).** C1
+removes `subrange_size`. With `deny_unknown_fields`, an existing
+`config.toml` still carrying `subrange_size = 500` would become a fatal
+error the moment C lands — silently breaking every user who ever tuned it.
+Resolution: keep a `subrange_size: Option<toml::Value>` (or `#[serde(rename
+= "subrange_size")]` sink) field on `RawConfig` that is **accepted and
+ignored with a one-line deprecation warning to stderr**, so `deny_unknown_fields`
+still rejects true typos but a legacy config keeps working. Everything else
+unknown is rejected. Document the deprecation in the README config section.
+
 ### B2 — Ledger schema validation & versioning (#9)
 
 Add a validation pass in `store::load` after successful JSON parse:
@@ -147,12 +184,26 @@ Add a validation pass in `store::load` after successful JSON parse:
 - **Version.** `version` must equal the current schema version (**2** after
   batch C). An unknown/newer version is treated as an incompatible ledger:
   refuse to write, surface loudly. A recognized older version (`1`) is run
-  through migration (batch C).
+  through migration (batch C). A **read-only** caller (`ls`, `sync` fast
+  path, `prune --dry-run`) that encounters a v1 ledger migrates it **in
+  memory only** for display/comparison and never persists (Fable review
+  #5) — persistence happens solely on the locked slow path.
 - **Invariants.** `range.0 ≤ range.1`; every block `start ≤ end`; no port is
-  `0`; every worktree/reservation block lies within `range`; **no two blocks
-  overlap** across the whole ledger. A violation makes the ledger *corrupt*
-  (same handling as unparseable: move-aside under lock, non-zero for
-  read-only callers).
+  `0` and every port fits `[1, 65535]`; **no two blocks overlap** across the
+  whole ledger. A violation makes the ledger *corrupt* (same handling as
+  unparseable: move-aside under lock, non-zero for read-only callers).
+  - **NOT a hard invariant: block ⊆ `ledger.range` (Fable review, blocker
+    #1).** `ledger.range` is frozen at ledger-creation time (frozen decision
+    14, `sync.rs:146-150`) while allocation always uses the *current*
+    `config.range`. So simply widening `config.range` after creation
+    produces legitimate blocks outside `ledger.range`; treating that as
+    corrupt would move the ledger aside and forget live allocations — a new
+    instance of finding #11. Therefore `ledger.range` is **informational
+    only** (as `registry.rs:12-13` already states) and is NOT a validation
+    bound. Blocks are validated against the absolute `[1, 65535]` bound and
+    against each other, never against the stored `range`. A block outside
+    the *current* `config.range` is surfaced by `doctor` as an advisory, not
+    treated as corruption.
 - `#[serde(deny_unknown_fields)]` on the ledger structs so a downgrade can't
   silently drop fields it doesn't understand.
 
@@ -197,9 +248,12 @@ print clap's message and exit with a dedicated usage code **`64`**
 
 ## Batch C — Allocation model overhaul (schema v2, breaking)
 
-**Findings:** #3 (500-port exclusive subranges → 14-repo exhaustion), #5
-(existing blocks never bind-rechecked; no `reallocate`), #11 (corruption
-recovery forgets allocations).
+**Findings:** #3 (500-port exclusive subranges → 14-repo exhaustion), #1
+(the "non-conflicting" guarantee — existing blocks are never bind-rechecked
+and there is no `reallocate`), #11 (corruption recovery forgets
+allocations). (Finding #5 is *foreign-hook mangling*, handled in Batch A;
+the earlier spec draft mislabeled the bind-recheck work as #5 — Fable review
+completeness note.)
 
 ### C1 — Abolish per-project subranges (#3)
 
@@ -219,6 +273,10 @@ regardless of actual usage. New model:
   position so a project's worktrees still cluster, without any exclusive
   hold. This preserves the "main lives at the start, features nearby"
   ergonomics while letting far more than 14 projects coexist.
+  - **Clamp to `range.0` (Fable review, minor).** When `range.0` is not a
+    multiple of `block_align`, `align_down(...)` can land below `range.0`;
+    the candidate start must be clamped up to `range.0` (the forward scan
+    then proceeds from a valid in-pool position).
 - `Config.subrange_size` is **removed** (breaking config change; documented).
   `find_free_subrange` / the subrange scan in `sync.rs` are deleted;
   `allocate_block` is simplified to operate on the single pool interval.
@@ -262,22 +320,36 @@ New shape (v2):
   prevent will pass, but a genuinely corrupt v1 is caught. Migration runs
   under the write lock (slow path / `doctor`), never from a read-only path.
 
-### C3 — Bind-recheck at the execution boundary (#5)
+### C3 — Bind-recheck at the execution boundary (#1)
 
 The everyday `sync` fast path stays bind-check-free (speed / passivity). The
 real check moves to where ports are actually used:
 
 - **`portool exec`** already runs `sync` before launching. After sync,
-  **bind-recheck the allocated block**. On conflict (a foreign process holds
-  a port in the block): print a clear stderr warning naming the block and
-  offending port(s), then proceed (the user's other config may already
-  reference these numbers — silently changing them at exec time is worse).
-  A new `--strict` flag turns the warning into a failure (exit 1, command
-  not started). A new `--reallocate-on-conflict` flag performs a C4
-  reallocation before launching.
+  **bind-recheck the allocated block**. On any port in the block being
+  in use: print a stderr advisory naming the block and the port(s), then
+  proceed (the user's other config may already reference these numbers —
+  silently changing them at exec time is worse).
+- **Own-process false positives are expected (Fable review, blocker #3).**
+  The bind check (`ports.rs:10-17`) cannot tell a *foreign* process from
+  *this worktree's own* running server. The everyday pattern — terminal 1
+  runs `portool exec -- npm run dev` (binding `WEB_PORT`), terminal 2 runs
+  `portool exec -- npm test` in the same worktree — will re-flag the block
+  every time. So the advisory wording must be **neutral**, e.g. `portool:
+  ports 3000-3004 are in use — this may be this worktree's own running
+  processes`, and must NOT imply a misallocation. `--reallocate-on-conflict`
+  is therefore **off by default and documented as a footgun**: reallocating
+  away from a port your own live server still holds leaves that server on
+  the old block while new processes get the new one. `--strict` (exit 1,
+  command not started) is likewise opt-in for callers that genuinely want a
+  hard gate.
+- **Bind check is IPv4/`127.0.0.1`-only** (`ports.rs:11`): a server bound
+  only to `::1` is not detected. This is a pre-existing limitation; note it
+  in the `doctor`/README wording rather than expanding scope here.
 - **`portool reallocate`** (new): force the current worktree onto a fresh
   free+bindable block, excluding its current block, and rewrite
-  `.env.portool`. This is the explicit escape hatch the review asked for.
+  `.env.portool`. This is the explicit escape hatch the review asked for
+  (subject to the same own-process caveat above).
 
 ### C4 — Corruption recovery that can rebuild (#11)
 
@@ -292,6 +364,12 @@ forgets live allocations:
   the ledger under the lock — reconstructing state a blind empty-restart
   would have dropped. `doctor` also reports blocks whose ports are currently
   occupied and any schema-invariant issues.
+- **Rebuild is per-project (Fable review item 8).** The move-aside is global
+  (one `registry.json`), but `doctor` reconstructs only the project it runs
+  in — other projects' entries stay dropped until `doctor` is run in each.
+  The moved-aside `registry.json.corrupt-<ts>` file is therefore the
+  authoritative manual-recovery artifact; `doctor` must print its path and
+  never delete it, so a user can reconcile projects it didn't rebuild.
 
 ---
 
@@ -309,6 +387,17 @@ path is legitimately non-UTF-8, preserve it via `OsString`/bytes rather than
 lossily forcing `String`. `run_git` failures should carry git's stderr into
 the error message instead of collapsing everything to `None`, at least on
 the paths where a diagnostic matters (discovery, worktree list).
+
+- **`-z` requires git ≥ 2.36 (Fable review item 4).** `git worktree list
+  --porcelain -z` landed in Git 2.36. Declare the minimum git version in the
+  README (alongside the A4 `--show-scope` ≥ 2.26 requirement — effective
+  floor becomes 2.36), and on `-z` failure fall back to the newline-split
+  parse rather than erroring the whole slow path.
+- **Non-UTF-8 support is partial (Fable review, minor).** Ledger keys are
+  `String` (`sync.rs:367-369` canonicalizes via `to_string_lossy`), so full
+  non-UTF-8 fidelity ends at the parsing layer. Scope this in the spec: D1
+  fixes *parsing/enumeration* robustness; end-to-end non-UTF-8 keying is out
+  of scope and noted as a known limitation.
 
 ### D2 — Escape variable paths in `.env.portool` (#13)
 
@@ -330,6 +419,13 @@ fields are renamed/redocumented to their true meaning. Preference: **(a)** —
 make `branch` reflect the current branch and `last_seen_at` a real
 last-touched timestamp, since `doctor`/future GC will rely on them. Keep the
 common no-op fast when branch *and* timestamp are already current.
+
+- **Refresh granularity is one day (Fable review item 7).** Treating
+  `last_seen_at` with second precision would make every checkout take the
+  lock and destroy the fast path. The fast path falls through only when the
+  branch differs OR `last_seen_at` is on an earlier calendar day than today
+  (local tz). Day granularity is ample against `gc_days = 30`, and keeps the
+  same-day common case lock-free.
 
 ### D4 — Boundary correctness (#16)
 
