@@ -48,12 +48,24 @@ enum Command {
         /// Env file(s) to load, in order; later files override earlier ones.
         #[arg(short = 'e', long = "env-file", value_name = "PATH")]
         env_file: Vec<std::path::PathBuf>,
-        /// Fail (exit 1) if the allocated block's ports are already in use.
+        /// Warn if the allocated block's ports are already in use (advisory
+        /// bind check; off by default -- your own dev servers legitimately
+        /// occupy the block).
+        #[arg(long)]
+        check_ports: bool,
+        /// Fail (exit 1) if the allocated block's ports are already in use
+        /// (implies --check-ports).
         #[arg(long)]
         strict: bool,
-        /// Move to a fresh block if the allocated block's ports are in use.
+        /// Move to a fresh block if the allocated block's ports are in use
+        /// (implies --check-ports). DANGER: processes already running keep
+        /// the old ports, so the worktree can end up split across blocks.
         #[arg(long)]
         reallocate_on_conflict: bool,
+        /// Let the given env files override inherited environment variables
+        /// (default: the parent environment wins over env files).
+        #[arg(long)]
+        env_file_overrides: bool,
         /// The command to run (everything after `--`).
         #[arg(last = true, required = true, value_name = "COMMAND")]
         command: Vec<std::ffi::OsString>,
@@ -151,10 +163,19 @@ fn main() {
         Command::Ls { json, all } => cmd::ls::run(json, all),
         Command::Exec {
             env_file,
+            check_ports,
             strict,
             reallocate_on_conflict,
+            env_file_overrides,
             command,
-        } => cmd::exec::run(&env_file, &command, strict, reallocate_on_conflict),
+        } => cmd::exec::run(
+            &env_file,
+            &command,
+            check_ports,
+            strict,
+            reallocate_on_conflict,
+            env_file_overrides,
+        ),
         Command::Reallocate { quiet } => cmd::sync::reallocate_cmd(quiet),
         Command::Prune { all, dry_run } => cmd::prune::run(all, dry_run),
         Command::Check => cmd::check::run(),

@@ -20,14 +20,26 @@ use std::path::PathBuf;
 /// is replaced by `command`. Any failure — sync, env construction, or the
 /// exec itself — happens before the child runs (spec §5, §10).
 ///
-/// `strict` turns the execution-boundary bind conflict (batch C #1) into a
-/// hard failure; `reallocate_on_conflict` moves the worktree to a fresh
-/// block instead of warning. Both default off.
+/// The execution-boundary bind check (batch C #1) is opt-in as of v0.8.0
+/// (external review 3rd round P1-2): `check_ports` turns it on as an
+/// advisory warning; `strict` turns a detected conflict into a hard
+/// failure; `reallocate_on_conflict` moves the worktree to a fresh block
+/// instead of warning. `strict` and `reallocate_on_conflict` each imply the
+/// check even without `check_ports`. All three default off, since a
+/// worktree's own already-running dev servers legitimately occupy its
+/// block.
+///
+/// `env_file_overrides` (v0.8.0, external review): by default the parent
+/// environment beats env files (spec §6); this flag lets explicitly passed
+/// env files win over inherited shell state instead, since a stale parent
+/// variable can otherwise silently shadow a value the caller just set.
 pub fn run(
     env_files: &[PathBuf],
     command: &[OsString],
+    check_ports: bool,
     strict: bool,
     reallocate_on_conflict: bool,
+    env_file_overrides: bool,
 ) -> Result<()> {
     // clap marks the trailing command as required, but this function is
     // also reachable programmatically -- an empty command must be a clean
@@ -44,18 +56,25 @@ pub fn run(
     // Spec §5 step 3: sync first; if it fails the child is never started.
     let outcome = sync::ensure(&ctx, true)?;
 
-    // Batch C #1: exec is the execution boundary -- the one place worth
-    // verifying the block's ports are actually free right now. A conflict
-    // here may just be this worktree's own already-running server, so the
-    // default is a neutral advisory, not a failure or a silent move.
-    let outcome = if ports::block_free(outcome.block) {
+    // v0.8.0 (external review 3rd round P1-2): the bind check is opt-in. A
+    // worktree's own dev servers legitimately occupy the block, so a
+    // default-on check made every second `portool exec` noisy. --strict
+    // and --reallocate-on-conflict imply the check.
+    let check = check_ports || strict || reallocate_on_conflict;
+    let outcome = if !check || ports::block_free(outcome.block) {
         outcome
     } else if reallocate_on_conflict {
+        eprintln!(
+            "portool: ports {}-{} are in use; moving to a fresh block -- processes \
+             already running keep the old ports, so this worktree may end up split \
+             across old and new blocks until they are restarted",
+            outcome.block.0, outcome.block.1
+        );
         sync::reallocate(&ctx, true)?
     } else {
         eprintln!(
-            "portool: ports {}-{} are in use -- this may be this worktree's own running \
-             processes (pass --reallocate-on-conflict to move, --strict to fail)",
+            "portool: ports {}-{} are in use -- this may be this worktree's own \
+             running processes (pass --reallocate-on-conflict to move, --strict to fail)",
             outcome.block.0, outcome.block.1
         );
         if strict {
@@ -97,16 +116,18 @@ pub fn run(
         })
         .collect();
 
-    let (map, to_set) = compose(file_entries, parent, portool_vars);
+    let (map, to_set) = compose(file_entries, parent, portool_vars, env_file_overrides);
     let mut resolved = envread::resolve(&map)?;
     resolved.retain(|name, _| to_set.contains(name));
 
     exec_command(command, &resolved)
 }
 
-/// Merges the three variable sources into one map with the spec §6
-/// precedence: earlier env files < later env files (later lines win
-/// within a file too) < parent environment < portool-managed variables.
+/// Merges the three variable sources into one map. Default precedence
+/// (spec §6): earlier env files < later env files < parent environment <
+/// portool-managed variables. With `env_file_overrides` (v0.8.0), the
+/// parent drops below the files: parent < files < portool, so an
+/// explicitly passed env file wins over inherited shell state.
 ///
 /// Also returns the set of names to actually set on the child: file and
 /// portool winners only. Parent-sourced winners are excluded — the child
@@ -115,18 +136,31 @@ fn compose(
     file_entries: Vec<Vec<(String, FileValue)>>,
     parent: Vec<(String, String)>,
     portool_vars: Vec<(String, String)>,
+    env_file_overrides: bool,
 ) -> (BTreeMap<String, Entry>, BTreeSet<String>) {
     let mut map = BTreeMap::new();
     let mut to_set = BTreeSet::new();
-    for entries in file_entries {
-        for (name, value) in entries {
-            to_set.insert(name.clone());
-            map.insert(name, Entry::File(value));
+    if env_file_overrides {
+        for (name, value) in parent {
+            map.insert(name, Entry::Literal(value));
         }
-    }
-    for (name, value) in parent {
-        to_set.remove(&name);
-        map.insert(name, Entry::Literal(value));
+        for entries in file_entries {
+            for (name, value) in entries {
+                to_set.insert(name.clone());
+                map.insert(name, Entry::File(value));
+            }
+        }
+    } else {
+        for entries in file_entries {
+            for (name, value) in entries {
+                to_set.insert(name.clone());
+                map.insert(name, Entry::File(value));
+            }
+        }
+        for (name, value) in parent {
+            to_set.remove(&name);
+            map.insert(name, Entry::Literal(value));
+        }
     }
     for (name, value) in portool_vars {
         to_set.insert(name.clone());
@@ -193,6 +227,7 @@ mod tests {
             ],
             vec![("C".into(), "parent".into()), ("D".into(), "parent".into())],
             vec![("D".into(), "portool".into())],
+            false,
         );
 
         assert_eq!(raw_of(&map["A"]), "file1-second");
@@ -220,9 +255,47 @@ mod tests {
             ]],
             vec![],
             vec![("TEST_DB_PORT".into(), "3005".into())],
+            false,
         );
         let resolved = envread::resolve(&map).unwrap();
         assert_eq!(resolved["URL"], "localhost:3005");
         assert_eq!(resolved["TEST_DB_PORT"], "3005");
+    }
+
+    /// --env-file-overrides: parent < files < portool (external review: an
+    /// explicitly passed .env.test must beat a stale parent DATABASE_URL).
+    #[test]
+    fn compose_with_overrides_lets_files_beat_the_parent() {
+        let (map, to_set) = compose(
+            vec![vec![("C".into(), file_value("file"))]],
+            vec![("C".into(), "parent".into()), ("P".into(), "parent".into())],
+            vec![("D".into(), "portool".into())],
+            true,
+        );
+        assert_eq!(raw_of(&map["C"]), "file", "file wins over parent");
+        assert_eq!(
+            raw_of(&map["P"]),
+            "parent",
+            "parent-only vars still visible"
+        );
+        assert_eq!(raw_of(&map["D"]), "portool");
+        let names: Vec<&str> = to_set.iter().map(String::as_str).collect();
+        assert_eq!(
+            names,
+            ["C", "D"],
+            "parent-only vars are inherited, not re-set"
+        );
+    }
+
+    /// Portool variables stay on top regardless of the flag.
+    #[test]
+    fn compose_with_overrides_keeps_portool_on_top() {
+        let (map, _) = compose(
+            vec![vec![("D".into(), file_value("file"))]],
+            vec![("D".into(), "parent".into())],
+            vec![("D".into(), "portool".into())],
+            true,
+        );
+        assert_eq!(raw_of(&map["D"]), "portool");
     }
 }

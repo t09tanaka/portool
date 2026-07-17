@@ -164,7 +164,8 @@ Runs a command with the current worktree's assignments injected as
 environment variables — no `source`, no per-worktree launcher scripts:
 
 ```sh
-portool exec [-e <PATH>]... [--strict] [--reallocate-on-conflict] -- <COMMAND> [ARGS...]
+portool exec [-e <PATH>]... [--check-ports] [--strict] [--reallocate-on-conflict]
+             [--env-file-overrides] -- <COMMAND> [ARGS...]
 ```
 
 In order, `exec` locates the current worktree, runs the equivalent of
@@ -202,13 +203,16 @@ variable, same as `sync`. Env-file paths are resolved relative to the
 current working directory, and a missing file is an error — nothing
 (`.env`, `.env.test`, …) is ever read implicitly.
 
-**Execution-boundary check.** After syncing, `exec` bind-checks the
-allocated block on `127.0.0.1` — the one moment it's worth confirming the
-ports are actually free. Because that can't distinguish a foreign process
-from this worktree's *own* already-running server, the default is a neutral
-stderr advisory and the command still runs. Pass `--strict` to fail (exit 1)
-on a conflict, or `--reallocate-on-conflict` to move to a fresh block first
-(equivalent to running `portool reallocate`).
+**Execution-boundary check (opt-in).** `exec` can bind-check the allocated
+block on `127.0.0.1` right after syncing — the one moment it's worth
+confirming the ports are actually free — but doesn't by default: a
+worktree's own already-running dev server legitimately occupies its block,
+so a default-on check was noise on every second `exec`. Pass
+`--check-ports` to get a neutral stderr advisory when the block is in use
+(the command still runs), `--strict` to fail (exit 1) on a conflict
+instead, or `--reallocate-on-conflict` to move to a fresh block first
+(equivalent to running `portool reallocate`). `--strict` and
+`--reallocate-on-conflict` each imply `--check-ports`.
 
 The payoff of these rules is that one committed env file serves both
 worlds. Write a `.env.test` like:
@@ -295,7 +299,8 @@ What the IDs survive:
 ```
 portool init       [--hook-only | --gitignore-only]
 portool sync       [--quiet]
-portool exec       [-e <PATH>]... [--strict] [--reallocate-on-conflict] -- <COMMAND> [ARGS...]
+portool exec       [-e <PATH>]... [--check-ports] [--strict] [--reallocate-on-conflict]
+                   [--env-file-overrides] -- <COMMAND> [ARGS...]
 portool reallocate [--quiet]
 portool ls         [--json] [--all]
 portool prune      [--all] [--dry-run]
@@ -375,6 +380,18 @@ of being pushed onto a different one. This is what the git hook calls after
 every checkout; when nothing has changed it's a lock-free read that writes
 nothing.
 
+If a changed manifest no longer fits the current block, `sync` first tries
+to **grow the block in place** — keeping its start, extending only the
+tail, and bind-checking only the newly added ports (the existing ones are
+expected to be in use by this worktree's own processes). Only when that
+extension doesn't fit (blocked by a neighboring block/reservation, or the
+end of the pool) does `sync` fall back to moving the worktree to a
+different block via the general allocator — and if the *current* block's
+ports are still in use at that point, moving would split the worktree
+across old and new ports, so `sync` refuses with an error instead: stop the
+processes and re-run `sync`, or run `portool reallocate` to move it
+explicitly and accept the split.
+
 | Flag | Effect |
 |---|---|
 | `--quiet` | Suppress the normal-case summary line on stdout (used by the hook). Warnings and errors always go to stderr regardless. |
@@ -387,13 +404,15 @@ Runs `<COMMAND>` with the composed environment — covered in detail in
 | Flag | Effect |
 |---|---|
 | `-e, --env-file <PATH>` | An env file to load before composing. Repeatable; later files override earlier ones. |
-| `--strict` | Fail (exit 1) instead of warning if the allocated block's ports are already in use. |
-| `--reallocate-on-conflict` | Move the worktree to a fresh block (like `portool reallocate`) if the allocated block's ports are in use, then run. |
+| `--check-ports` | Warn on stderr (advisory, not a failure) if the allocated block's ports are already in use. Off by default. |
+| `--strict` | Fail (exit 1) instead of warning if the allocated block's ports are already in use. Implies `--check-ports`. |
+| `--reallocate-on-conflict` | Move the worktree to a fresh block (like `portool reallocate`) if the allocated block's ports are in use, then run. Implies `--check-ports`. |
+| `--env-file-overrides` | Let the passed env files override the parent environment instead of losing to it (default precedence: parent beats files). |
 
-After syncing, `exec` bind-checks the block on `127.0.0.1`. Because that
-can't tell a foreign process from this worktree's *own* already-running
-server, the default is a neutral stderr advisory, not a failure — use
-`--strict` or `--reallocate-on-conflict` when you want it to act.
+`exec` doesn't bind-check the block on `127.0.0.1` by default — a
+worktree's own already-running dev server legitimately occupies it, so a
+default-on check would fire on every second `exec`. Pass `--check-ports`
+(or `--strict`/`--reallocate-on-conflict`, which imply it) to opt in.
 
 ### `portool reallocate`
 
@@ -605,14 +624,20 @@ Ledger writes always go through an exclusive `flock` on
 take the lock at all — and revalidate their snapshot against the ledger's
 per-worktree `generation` counter, so a concurrent move is always noticed.
 
-Moving a worktree to a different block (a manifest that outgrew its block,
-or `portool reallocate`) is a **two-phase update**: the target block is
-first reserved in the ledger *alongside* the old one, then `.env.portool`
-is rewritten, then the move is finalized. A crash at any point leaves the
-block your env file points at reserved in the ledger — it can never be
-handed to another worktree — and the next `sync` resolves the interrupted
-move automatically (forward if the env was already rewritten, backward
-otherwise).
+A manifest that outgrows its block is grown **in place** first — same
+start, only the added tail ports bind-checked — before the general
+allocator is ever consulted; see [`portool sync`](#portool-sync) above.
+Moving a worktree to a genuinely different block (in-place growth doesn't
+fit, or `portool reallocate`) is a **two-phase update**: the target block
+is first reserved in the ledger *alongside* the old one, then
+`.env.portool` is rewritten, then the move is finalized. A crash at any
+point leaves the block your env file points at reserved in the ledger — it
+can never be handed to another worktree — and the next `sync` resolves the
+interrupted move automatically (forward if the env was already rewritten,
+backward otherwise). `sync` (unlike `reallocate`) refuses to start this
+move at all if the current block's ports are still in use, since moving
+them out from under a running process would split the worktree across old
+and new ports.
 
 The ledger is **fail-closed**, like the config: a corrupt, unreadable, or
 newer-schema `registry.json` makes every command error out (exit 1) without
@@ -626,6 +651,17 @@ than guess, and points at `--repair --abandon-other-projects` — the one
 destructive path, and the only way an unsupported-version ledger (written
 by a newer portool) is ever discarded. Either way, `doctor` then rebuilds
 the current project's entries from its worktrees' `.env.portool` files.
+
+Every write portool makes — the ledger, `.env.portool`, and
+`registry.json.bak` — goes through the same durable-write path: a temp
+file in the target's own directory, `fsync`ed, then renamed into place
+(with a best-effort directory `fsync` afterward so the rename itself
+survives a crash), so a crash mid-write can never leave a truncated or
+half-written file. The backup is written this same way — temp file +
+rename, not an in-place copy — so a crash mid-backup can't leave it
+half-overwritten either. This is the standard POSIX `fsync`/`rename`
+durability guarantee; portool does not additionally issue macOS's stronger
+`F_FULLFSYNC`.
 
 ### `post-checkout` hook
 

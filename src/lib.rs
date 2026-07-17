@@ -13,11 +13,15 @@ pub mod cmd;
 #[doc(hidden)]
 pub mod config;
 #[doc(hidden)]
+pub mod display;
+#[doc(hidden)]
 pub mod envfile;
 #[doc(hidden)]
 pub mod envread;
 #[doc(hidden)]
 pub mod error;
+#[doc(hidden)]
+pub mod fault;
 #[doc(hidden)]
 pub mod gc;
 #[doc(hidden)]

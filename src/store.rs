@@ -7,6 +7,7 @@
 //! [`move_aside`].
 
 use crate::error::{Error, Result};
+use crate::fault;
 use crate::registry::Registry;
 use std::fs;
 use std::io::Write;
@@ -128,35 +129,66 @@ pub fn copy_aside(path: &Path) -> Result<PathBuf> {
     Ok(corrupt_path)
 }
 
-/// Saves `registry` to `path` atomically: writes pretty-printed JSON to a
-/// temp file in the same directory, then renames it into place. The parent
-/// directory is created if necessary. On success, also refreshes `<path>.bak`
-/// (see [`backup_path`]) as a best-effort copy: a backup failure is a
-/// warning on stderr, never a command failure.
+/// Saves `registry` to `path` atomically and durably, then refreshes
+/// `<path>.bak` (see [`backup_path`]) the same way: a backup failure is a
+/// warning on stderr, never a command failure. The backup is written via
+/// temp-file + rename too (external review 3rd round P1-3) -- a crash mid-
+/// backup can no longer leave a partially overwritten `.bak`.
 pub fn save(path: &Path, registry: &Registry) -> Result<()> {
-    let dir = path.parent().ok_or_else(|| {
-        Error::General(format!(
-            "registry path {} has no parent directory",
-            path.display()
-        ))
-    })?;
-    fs::create_dir_all(dir)?;
-
     let json = serde_json::to_string_pretty(registry)?;
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
-    tmp.write_all(json.as_bytes())?;
-    tmp.persist(path).map_err(|e| Error::from(e.error))?;
+    write_atomic_impl(path, json.as_bytes(), None)?;
+    fault::point("after_registry_write");
 
-    // Best-effort backup refresh: the primary save already succeeded, so a
-    // backup failure is a loud warning, not a command failure.
     let bak = backup_path(path);
-    if let Err(err) = fs::copy(path, &bak) {
+    if let Err(err) = write_atomic_impl(&bak, json.as_bytes(), Some("during_backup")) {
         eprintln!(
             "portool: warning: failed to update backup {}: {err}",
             bak.display()
         );
     }
     Ok(())
+}
+
+/// Writes `contents` to `path` atomically and durably: temp file in the
+/// same directory, `sync_all`, rename into place, then a best-effort fsync
+/// of the parent directory so the rename itself survives power loss. The
+/// parent directory is created if necessary.
+pub fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+    write_atomic_impl(path, contents, None)
+}
+
+fn write_atomic_impl(
+    path: &Path,
+    contents: &[u8],
+    fault_before_rename: Option<&str>,
+) -> Result<()> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| Error::General(format!("{} has no parent directory", path.display())))?;
+    fs::create_dir_all(dir)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.write_all(contents)?;
+    tmp.as_file().sync_all()?;
+    if let Some(name) = fault_before_rename {
+        fault::point(name);
+    }
+    tmp.persist(path).map_err(|e| Error::from(e.error))?;
+    fsync_dir(dir);
+    Ok(())
+}
+
+/// Best-effort directory fsync after a rename. Failure is a stderr warning,
+/// not an error: the rename already succeeded, and some filesystems refuse
+/// directory fsyncs.
+fn fsync_dir(dir: &Path) {
+    if let Ok(handle) = fs::File::open(dir) {
+        if let Err(err) = handle.sync_all() {
+            eprintln!(
+                "portool: warning: failed to fsync directory {}: {err}",
+                dir.display()
+            );
+        }
+    }
 }
 
 /// `<path>.bak`: a byte-exact copy of the last successfully saved ledger,
@@ -443,6 +475,41 @@ mod tests {
         assert_eq!(
             load_strict(&backup_path(&path)).unwrap(),
             Some(sample_registry())
+        );
+    }
+
+    #[test]
+    fn write_atomic_writes_contents_and_leaves_no_temp_residue() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("nested").join("file.txt");
+
+        write_atomic(&path, b"hello").unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"hello");
+        assert_eq!(
+            dir_entries(path.parent().unwrap()),
+            vec!["file.txt".to_string()],
+            "no temp residue"
+        );
+    }
+
+    #[test]
+    fn save_backup_is_atomic_not_a_plain_copy() {
+        // After save, .bak must be byte-identical AND the directory must hold
+        // exactly registry.json + registry.json.bak (no .bak.tmp residue).
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("registry.json");
+        save(&path, &sample_registry()).unwrap();
+
+        let mut entries = dir_entries(tmp.path());
+        entries.sort();
+        assert_eq!(
+            entries,
+            vec!["registry.json".to_string(), "registry.json.bak".to_string()]
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            fs::read(backup_path(&path)).unwrap()
         );
     }
 }
