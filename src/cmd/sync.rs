@@ -111,8 +111,16 @@ fn try_fast_path(ctx: &GitCtx) -> Result<Option<SyncOutcome>> {
         &identity::project_id(&ctx.common_dir),
         &identity::worktree_id(&ctx.common_dir, &ctx.worktree_root),
     );
+    // Batch D #14: even when block/manifest/env all match, fall through to
+    // the (locked) slow path to refresh metadata when the branch changed or
+    // `last_seen_at` is on an earlier calendar day -- so `branch` reflects
+    // the current branch and `last_seen_at` is a real last-touched date. Day
+    // granularity keeps the same-branch, same-day common case lock-free.
+    let metadata_current = entry.branch.as_deref() == ctx.branch.as_deref()
+        && entry.last_seen_at.date_naive() == Local::now().date_naive();
+
     let actual = std::fs::read(ctx.worktree_root.join(".env.portool"));
-    if matches!(actual, Ok(bytes) if bytes == expected.as_bytes()) {
+    if metadata_current && matches!(actual, Ok(bytes) if bytes == expected.as_bytes()) {
         Ok(Some(SyncOutcome {
             block: entry.block,
             manifest: manifest_state.manifest,

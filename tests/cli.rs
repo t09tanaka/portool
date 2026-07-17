@@ -1485,3 +1485,100 @@ fn exec_strict_fails_when_block_port_in_use() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+// --- Batch D: check / release / deinit / doctor ---------------------------
+
+/// `portool check` succeeds on a healthy setup and fails (non-zero) on a
+/// corrupt ledger.
+#[test]
+fn check_reports_health_and_corruption() {
+    let env = TestEnv::new();
+    let repo = env.path("repo");
+    init_repo(&repo);
+    assert!(env.run(&repo, &["sync"]).status.success());
+    assert!(
+        env.run(&repo, &["check"]).status.success(),
+        "check must pass on a healthy ledger"
+    );
+
+    // Corrupt the ledger; check must now fail.
+    fs::write(env.registry_path(), b"{ not json").unwrap();
+    assert!(
+        !env.run(&repo, &["check"]).status.success(),
+        "check must fail on a corrupt ledger"
+    );
+}
+
+/// `portool release` removes the worktree's entry and `.env.portool`.
+#[test]
+fn release_frees_the_block_and_removes_env_file() {
+    let env = TestEnv::new();
+    let repo = env.path("repo");
+    init_repo(&repo);
+    assert!(env.run(&repo, &["sync"]).status.success());
+    assert!(repo.join(".env.portool").exists());
+
+    assert!(env.run(&repo, &["release"]).status.success());
+    assert!(!repo.join(".env.portool").exists(), "env file must be gone");
+    let registry = env.registry();
+    let project = registry["projects"].get(common_dir_key(&repo));
+    // Either the project entry is gone, or it has no worktree entry.
+    let has_entry = project
+        .and_then(|p| p["worktrees"].get(worktree_key(&repo)))
+        .is_some();
+    assert!(!has_entry, "the worktree entry must be released");
+}
+
+/// `portool deinit` removes portool's hooks and the `.gitignore` entry.
+#[test]
+fn deinit_removes_hooks_and_gitignore_entry() {
+    let env = TestEnv::new();
+    let repo = env.path("repo");
+    init_repo(&repo);
+    assert!(env.run(&repo, &["init"]).status.success());
+    assert!(repo.join(".git/hooks/post-checkout").exists());
+    assert!(repo.join(".git/hooks/post-merge").exists());
+
+    assert!(env.run(&repo, &["deinit"]).status.success());
+    assert!(
+        !repo.join(".git/hooks/post-checkout").exists(),
+        "portool's standalone post-checkout must be removed"
+    );
+    assert!(!repo.join(".git/hooks/post-merge").exists());
+    let gitignore = fs::read_to_string(repo.join(".gitignore")).unwrap_or_default();
+    assert!(
+        !gitignore.lines().any(|l| l == ".env.portool"),
+        ".gitignore entry must be removed"
+    );
+}
+
+/// `portool doctor` rebuilds a ledger entry from a live worktree's
+/// `.env.portool` after the ledger has lost it.
+#[test]
+fn doctor_rebuilds_a_lost_entry_from_the_env_file() {
+    let env = TestEnv::new();
+    let repo = env.path("repo");
+    init_repo(&repo);
+    assert!(env.run(&repo, &["sync"]).status.success());
+    let block_before = env.registry()["projects"][common_dir_key(&repo)]["worktrees"]
+        [worktree_key(&repo)]["block"]
+        .clone();
+
+    // Simulate a corruption reset: wipe the ledger, but the worktree still
+    // has its .env.portool.
+    fs::remove_file(env.registry_path()).unwrap();
+    assert!(repo.join(".env.portool").exists());
+
+    assert!(
+        env.run(&repo, &["doctor"]).status.success(),
+        "doctor must succeed"
+    );
+
+    let block_after = env.registry()["projects"][common_dir_key(&repo)]["worktrees"]
+        [worktree_key(&repo)]["block"]
+        .clone();
+    assert_eq!(
+        block_before, block_after,
+        "doctor must re-import the same block recorded in .env.portool"
+    );
+}
