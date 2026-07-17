@@ -74,7 +74,7 @@ pub fn run(
     } else {
         eprintln!(
             "portool: ports {}-{} are in use -- this may be this worktree's own \
-             running processes (pass --strict to fail instead)",
+             running processes (pass --reallocate-on-conflict to move, --strict to fail)",
             outcome.block.0, outcome.block.1
         );
         if strict {
