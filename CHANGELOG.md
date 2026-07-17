@@ -5,7 +5,7 @@ All notable changes to portool are documented here. The format is based on
 [Semantic Versioning](https://semver.org/) (pre-1.0: a breaking change bumps
 the minor version).
 
-## [Unreleased]
+## [0.5.1] - 2026-07-17
 
 Fixes from the post-0.5.0 external review: the state-transition gaps between
 the ledger, `.env.portool`, and Git hooks.
