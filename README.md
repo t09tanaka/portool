@@ -559,10 +559,10 @@ range = [3000, 9999]      # the full port pool
 block_align = 5           # block-size rounding unit (and minimum block size)
 ```
 
-(`subrange_size` and `gc_days` were both removed from the effective config
-in earlier hardening releases — GC is condition-based (a worktree's
-directory is gone and its ports are free), not age-based, and blocks are
-allocated directly from `range`. A config that still sets either is
+(`subrange_size` — removed in 0.5.0 — and `gc_days` — removed in 0.7.0 —
+are no longer part of the effective config: blocks are allocated directly
+from `range`, and GC is condition-based (a worktree's directory is gone
+and its ports are free), not age-based. A config that still sets either is
 accepted with a deprecation warning and otherwise ignored.)
 
 Changing this file only affects *new* allocations — existing blocks are
