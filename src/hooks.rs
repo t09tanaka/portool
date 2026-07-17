@@ -25,7 +25,10 @@ pub const HOOK_BLOCK_BEGIN: &str = "# >>> portool >>>";
 pub const HOOK_BLOCK_END: &str = "# <<< portool <<<";
 
 /// True when `content` carries any portool hook form: an owned standalone
-/// script, a managed block, or a legacy appended line.
+/// script, a managed block, or a legacy appended line. Intentionally a
+/// loose substring heuristic -- used only for warnings/hints (e.g. `sync`'s
+/// missing-hook nag), never for install/deinit decisions, which use the
+/// line-exact checks in `crate::cmd::init`.
 pub fn contains_portool_invocation(content: &str) -> bool {
     content.contains(HOOK_OWNED_COMMENT)
         || content.contains(HOOK_BLOCK_BEGIN)

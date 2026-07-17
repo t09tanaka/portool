@@ -54,21 +54,25 @@ const GITIGNORE_LINE: &str = ".env.portool";
 /// wherever `portool` was installed; external review P1-4). Falls back to
 /// `None` (meaning: look up `portool` on PATH at hook-run time) when the
 /// path can't be embedded: `current_exe()` failed, or the path contains a
-/// character (`"`, `'`, `\`, `$`, or newline) that would escape the double
-/// quotes it's interpolated inside in the POSIX `sh` script.
+/// character that isn't [`sh_safe_in_double_quotes`].
 fn portool_bin_path() -> Option<String> {
     let exe = std::env::current_exe().ok()?;
     let exe = exe.canonicalize().unwrap_or(exe);
     let s = exe.to_str()?.to_string();
-    if s.contains('"')
-        || s.contains('\'')
-        || s.contains('\\')
-        || s.contains('$')
-        || s.contains('\n')
-    {
+    if !sh_safe_in_double_quotes(&s) {
         return None;
     }
     Some(s)
+}
+
+/// True when `s` can be interpolated inside double quotes in a POSIX `sh`
+/// script without escaping them or triggering an expansion. Rejects `"`,
+/// `\`, `$`, and a backtick (all of which stay active *inside* double
+/// quotes -- backticks perform command substitution there), plus `'` and
+/// newline out of caution.
+fn sh_safe_in_double_quotes(s: &str) -> bool {
+    !s.chars()
+        .any(|c| matches!(c, '"' | '\'' | '\\' | '$' | '`' | '\n'))
 }
 
 /// The `PORTOOL_BIN=...` preamble shared by both hook forms: the absolute
@@ -245,7 +249,7 @@ fn deinit_hook(hook_path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    if existing.contains(crate::hooks::HOOK_BLOCK_BEGIN) {
+    if has_managed_block(&existing) {
         if let Some(stripped) = replace_managed_block(&existing, "") {
             atomic_write(hook_path, stripped.as_bytes())?;
         }
@@ -358,7 +362,7 @@ fn install_into(hook_path: &Path, script: &str, block: &str) -> Result<()> {
             let original_mode = fs::metadata(hook_path)?.permissions().mode();
 
             // 2. Managed block present: refresh it in place when stale.
-            if existing.contains(crate::hooks::HOOK_BLOCK_BEGIN) {
+            if has_managed_block(&existing) {
                 if let Some(rewritten) = replace_managed_block(&existing, block) {
                     atomic_write(hook_path, rewritten.as_bytes())?;
                     set_mode(hook_path, original_mode | 0o100)?;
@@ -414,6 +418,17 @@ fn install_into(hook_path: &Path, script: &str, block: &str) -> Result<()> {
 /// comment has been the second line since the very first release.
 fn is_owned_standalone(content: &str) -> bool {
     content.lines().nth(1).map(str::trim) == Some(crate::hooks::HOOK_OWNED_COMMENT)
+}
+
+/// True when `content` carries a portool managed block: the begin marker as
+/// a full (trimmed) line. Deliberately line-exact, matching how
+/// [`replace_managed_block`] scans -- a mid-line occurrence of the marker
+/// text (e.g. inside an `echo` string) is not a block, and must not make
+/// `install_into` skip installing.
+fn has_managed_block(content: &str) -> bool {
+    content
+        .lines()
+        .any(|line| line.trim() == crate::hooks::HOOK_BLOCK_BEGIN)
 }
 
 /// Replaces the `# >>> portool >>> ... # <<< portool <<<` region (inclusive)
@@ -645,6 +660,52 @@ mod tests {
                 "if command -v portool >/dev/null 2>&1; then portool sync --quiet || true; fi"
             ),
             "legacy line must be replaced, not duplicated"
+        );
+    }
+
+    #[test]
+    fn sh_safe_in_double_quotes_rejects_every_active_character() {
+        for unsafe_path in [
+            "/opt/port`whoami`ool/portool", // backtick: command substitution INSIDE double quotes
+            "/opt/$HOME/portool",
+            "/opt/po\"rtool",
+            "/opt/po'rtool",
+            "/opt/po\\rtool",
+            "/opt/po\nrtool",
+        ] {
+            assert!(
+                !sh_safe_in_double_quotes(unsafe_path),
+                "must reject: {unsafe_path:?}"
+            );
+        }
+        assert!(sh_safe_in_double_quotes("/opt portool/bin/portool (v2)"));
+    }
+
+    #[test]
+    fn install_into_treats_a_mid_line_marker_mention_as_a_foreign_hook() {
+        let tmp = TempDir::new().unwrap();
+        let hooks_dir = tmp.path().join("repo/.git/hooks");
+        fs::create_dir_all(&hooks_dir).unwrap();
+        let hook_path = hooks_dir.join("post-checkout");
+        // The marker text appears only mid-line (not as its own trimmed
+        // line) -- NOT a managed block; install must still wire the hook.
+        fs::write(
+            &hook_path,
+            "#!/bin/sh\necho \"not a marker: # >>> portool >>>\"\n",
+        )
+        .unwrap();
+        let block = hook_append_block(Some("/p"));
+
+        install_into(&hook_path, &hook_script(Some("/p")), &block).unwrap();
+
+        let content = fs::read_to_string(&hook_path).unwrap();
+        assert!(
+            content.starts_with("#!/bin/sh\necho \"not a marker: # >>> portool >>>\"\n"),
+            "the foreign line must be preserved"
+        );
+        assert!(
+            content.ends_with(&block),
+            "a real managed block must be appended, got: {content}"
         );
     }
 
