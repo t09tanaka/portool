@@ -5,6 +5,61 @@ All notable changes to portool are documented here. The format is based on
 [Semantic Versioning](https://semver.org/) (pre-1.0: a breaking change bumps
 the minor version).
 
+## [0.8.0] - 2026-07-17
+
+The 3rd-round external review items: `exec`'s bind check stops being a
+default-on surprise, a manifest that outgrows its block tries to grow in
+place before moving, an implicit block move is refused while it would split
+a still-running worktree across ports, and the ledger/env/backup writes get
+real durability guarantees. **No ledger schema change** (still v3).
+
+### Breaking
+
+- **`exec` no longer bind-checks the block by default.** A worktree's own
+  already-running dev servers legitimately occupy it, so the default-on
+  check was noise on every second `portool exec`. Pass `--check-ports` for
+  the advisory warning (unchanged behavior otherwise); `--strict` and
+  `--reallocate-on-conflict` each imply the check, since acting on a
+  conflict requires detecting one.
+- **`sync` refuses an implicit block move while the current block's ports
+  are in use.** A manifest that outgrows its block and can't be extended
+  in place used to move to a fresh block unconditionally, which could split
+  a running worktree across its old and new ports. `sync` now errors
+  instead — stop the processes and re-run `sync`, or run `portool
+  reallocate` to move explicitly and accept the split.
+
+### Added
+
+- **In-place block growth is tried first** when a manifest outgrows its
+  block: the block is extended in place (keeping its start; only the newly
+  added tail is bind-checked) rather than handed to the general allocator,
+  which would otherwise tend to move it to an unrelated slot. The general
+  allocator (and the new implicit-move refusal above) only comes into play
+  when the extension doesn't fit — blocked by a neighboring block/
+  reservation or the end of the pool.
+- **`exec --env-file-overrides`** — lets the passed `-e`/`--env-file`
+  files beat the parent environment instead of losing to it, so an
+  explicitly passed `.env.test` can't be silently shadowed by a stale
+  parent-shell variable of the same name. Default precedence is unchanged
+  (parent beats files); with the flag it becomes `parent < files <
+  portool-managed variables`.
+
+### Fixed
+
+- **Ledger, env, and backup writes are fsynced and rename-atomic.** Every
+  write goes through a temp file in the same directory, `fsync`s it, then
+  renames it into place (with a best-effort directory fsync after), so a
+  crash mid-write can never leave a partially written file. The backup
+  (`registry.json.bak`) is refreshed the same way — temp file + rename —
+  instead of an in-place copy, so a crash mid-backup can no longer leave it
+  half-overwritten. (This is a standard `fsync`/`rename` guarantee, not
+  macOS's stronger `F_FULLFSYNC`.)
+- **`ls` and sync's stdout output sanitize control characters** in
+  worktree paths, branch names, and labels — a newline or ANSI escape
+  sequence can no longer inject itself into a table or summary line — and
+  table columns align by Unicode display width instead of byte length, so
+  CJK and other wide characters no longer skew the table.
+
 ## [0.7.0] - 2026-07-17
 
 The trust-contract items from the post-0.6.0 external review: `doctor
