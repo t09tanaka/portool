@@ -67,9 +67,10 @@ fn prune_current(registry: &mut Registry, ctx: &GitCtx, dry_run: bool) -> Result
 
 /// Spec §8.2 `--all`: for every project, if its `common_dir` still exists,
 /// apply the same per-worktree reclamation as the default mode; if the
-/// `common_dir` itself is gone (the whole repository was deleted), the
-/// entire project entry is reclaimed once every port across all its
-/// worktrees is confirmed unused.
+/// `common_dir` itself is gone (the whole repository was deleted), reclaim
+/// each unpinned worktree entry whose ports are confirmed unused, and drop
+/// the project entry itself once no worktrees remain. Pinned entries are
+/// exempt, same as every other GC path.
 fn prune_all(registry: &mut Registry, dry_run: bool) -> bool {
     let mut changed = false;
     let keys: Vec<String> = registry.projects.keys().cloned().collect();
@@ -79,15 +80,30 @@ fn prune_all(registry: &mut Registry, dry_run: bool) -> bool {
         if !Path::new(key).exists() {
             let project = registry
                 .projects
-                .get(key)
+                .get_mut(key)
                 .expect("key came from registry.projects.keys()");
-            // A pending block (interrupted two-phase move) is part of an
-            // entry's footprint, same as in gc::collect.
-            let all_ports_free = project.worktrees.values().all(|w| {
-                ports::block_free(w.block) && w.pending_block.map(ports::block_free).unwrap_or(true)
-            });
-            if all_ports_free {
-                let verb = if dry_run { "would prune" } else { "pruned" };
+            // The repository is gone, but the pin contract still holds: pinned
+            // entries are exempt from every GC path, so reclaim only unpinned
+            // entries whose ports (block + pending) are confirmed unused, and
+            // drop the project entry only once nothing remains.
+            let reclaimable: Vec<String> = project
+                .worktrees
+                .iter()
+                .filter(|(_, w)| {
+                    !w.pinned
+                        && ports::block_free(w.block)
+                        && w.pending_block.map(ports::block_free).unwrap_or(true)
+                })
+                .map(|(path, _)| path.clone())
+                .collect();
+            let verb = if dry_run { "would prune" } else { "pruned" };
+            for path in &reclaimable {
+                let block = project.worktrees[path].block;
+                println!("{verb} {path} (block {}-{})", block.0, block.1);
+                project.worktrees.remove(path);
+                changed = true;
+            }
+            if project.worktrees.is_empty() {
                 println!("{verb} project {} ({key})", project.name);
                 projects_to_remove.push(key.clone());
                 changed = true;

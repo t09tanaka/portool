@@ -1455,6 +1455,89 @@ fn prune_all_reclaims_a_fully_deleted_project_and_leaves_others_untouched() {
     );
 }
 
+/// External review P1 (Task 4): the pin contract says pinned entries are
+/// exempt from every GC path -- including the `prune --all` branch that
+/// handles a *whole repository* having vanished (not just one worktree).
+/// A pinned worktree's entry, and therefore its project entry, must
+/// survive even when `common_dir` no longer exists.
+#[test]
+fn prune_all_preserves_pinned_entries_when_common_dir_is_gone() {
+    let env = TestEnv::new();
+    env.write_config("range = [19400, 19409]\n");
+
+    let repo = env.path("repo");
+    init_repo(&repo);
+    assert!(env.run(&repo, &["sync"]).status.success());
+    assert!(env.run(&repo, &["pin"]).status.success());
+
+    let repo_key = common_dir_key(&repo);
+    let wt_key = worktree_key(&repo);
+
+    fs::remove_dir_all(&repo).unwrap();
+
+    let outside = env.path("outside");
+    fs::create_dir_all(&outside).unwrap();
+
+    let output = env.run(&outside, &["prune", "--all"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let out = env.run(&outside, &["ls", "--json", "--all"]);
+    assert!(out.status.success());
+    let json: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout))
+        .expect("ls --json must emit valid JSON");
+    let allocations = json["allocations"].as_array().unwrap();
+    let pinned_alloc = allocations
+        .iter()
+        .find(|a| a["project_key"] == serde_json::json!(repo_key))
+        .expect("the pinned project's entry must survive prune --all");
+    assert_eq!(pinned_alloc["pinned"], serde_json::json!(true));
+
+    let registry = env.registry();
+    assert!(
+        registry["projects"][&repo_key]["worktrees"]
+            .get(&wt_key)
+            .is_some(),
+        "the pinned worktree entry must still be in the ledger"
+    );
+}
+
+/// Companion regression check for the fix above: with no pin in place, the
+/// pre-existing behavior (reclaim the whole project once its repository is
+/// gone and its ports are free) must still hold.
+#[test]
+fn prune_all_reclaims_unpinned_when_common_dir_is_gone() {
+    let env = TestEnv::new();
+    env.write_config("range = [19400, 19409]\n");
+
+    let repo = env.path("repo");
+    init_repo(&repo);
+    assert!(env.run(&repo, &["sync"]).status.success());
+
+    let repo_key = common_dir_key(&repo);
+
+    fs::remove_dir_all(&repo).unwrap();
+
+    let outside = env.path("outside");
+    fs::create_dir_all(&outside).unwrap();
+
+    let output = env.run(&outside, &["prune", "--all"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let registry = env.registry();
+    assert!(
+        registry["projects"].get(&repo_key).is_none(),
+        "an unpinned project's entry must still be reclaimed once its repo is gone"
+    );
+}
+
 /// P0-2 (external review): `prune --all` must NOT reclaim a project's
 /// entries when `git worktree list` fails for it (e.g. the common-dir
 /// path exists but is not a git repository). Enumeration failure is not
