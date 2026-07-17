@@ -109,7 +109,16 @@ pub fn run(repair: bool, abandon_other_projects: bool) -> Result<()> {
     let mut imported = 0usize;
 
     for wt in &live {
-        let wt_key = wt.to_string_lossy().into_owned();
+        let wt_key = match utf8_worktree_key(wt) {
+            Some(s) => s,
+            None => {
+                println!(
+                    "doctor: warning: skipping worktree with non-UTF-8 path: {}",
+                    wt.to_string_lossy()
+                );
+                continue;
+            }
+        };
         let already = registry
             .find_project(&common_dir_key)
             .map(|p| p.worktrees.contains_key(&wt_key))
@@ -121,6 +130,19 @@ pub fn run(repair: bool, abandon_other_projects: bool) -> Result<()> {
             Some(block) => block,
             None => continue,
         };
+        if let Some((env_project_id, env_worktree_id)) = crate::envfile::read_identity_from_env(wt)
+        {
+            let expect_p = crate::identity::project_id(&ctx.common_dir);
+            let expect_w = crate::identity::worktree_id(&ctx.common_dir, wt);
+            if env_project_id != expect_p || env_worktree_id != expect_w {
+                println!(
+                    "doctor: warning: {}/.env.portool identifies a different project/worktree \
+                     (copied from elsewhere?); not importing its block",
+                    wt_key
+                );
+                continue;
+            }
+        }
         if let Err(reason) = validate_block(block) {
             eprintln!(
                 "portool: doctor: {} records block {}-{}, which {reason}; skipping \
@@ -364,6 +386,16 @@ fn repair_corrupt(
     }
 }
 
+/// Converts a live worktree's path into its ledger key, or `None` when the
+/// path is not valid UTF-8. Ledger keys are JSON strings; a lossy
+/// conversion (`to_string_lossy`) could collide two distinct non-UTF-8
+/// paths onto the same key, reintroducing the risk `GitCtx::discover`
+/// deliberately fails closed on (external review P2 #7) -- so a non-UTF-8
+/// worktree path is skipped here rather than re-keyed.
+fn utf8_worktree_key(wt: &Path) -> Option<String> {
+    wt.to_str().map(str::to_owned)
+}
+
 /// The same per-block invariants [`Registry::validate`] enforces, applied
 /// to a single candidate before it is imported: ordered, and no port 0.
 fn validate_block(block: (u16, u16)) -> std::result::Result<(), &'static str> {
@@ -391,6 +423,26 @@ mod tests {
         assert!(validate_block((4000, 3999)).is_err());
         assert!(validate_block((3000, 3004)).is_ok());
         assert!(validate_block((3000, 3000)).is_ok());
+    }
+
+    #[test]
+    fn utf8_worktree_key_rejects_non_utf8_paths() {
+        // macOS's APFS enforces UTF-8 filenames, so this path can never be
+        // produced by a real worktree on this platform -- exercised directly
+        // via OsStr::from_bytes per the review-fix brief (external review
+        // P2 #7).
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let bad = Path::new(OsStr::from_bytes(b"/tmp/wt-\xff\xfe"));
+        assert_eq!(utf8_worktree_key(bad), None);
+    }
+
+    #[test]
+    fn utf8_worktree_key_accepts_utf8_paths() {
+        assert_eq!(
+            utf8_worktree_key(Path::new("/tmp/wt")),
+            Some("/tmp/wt".to_string())
+        );
     }
 
     #[test]

@@ -2525,6 +2525,57 @@ fn doctor_skips_invalid_block_headers() {
     );
 }
 
+/// `doctor` must not import a block from a `.env.portool` whose
+/// `PORTOOL_PROJECT_ID`/`PORTOOL_WORKTREE_ID` don't match the IDs derived
+/// from the current project/worktree paths -- e.g. a file copied in from
+/// another worktree (external review P2 #7).
+#[test]
+fn doctor_skips_env_file_with_foreign_identity() {
+    let env = TestEnv::new();
+    let repo = env.path("repo");
+    init_repo(&repo);
+    assert!(env.run(&repo, &["sync"]).status.success());
+
+    // Simulate a `.env.portool` copied in from a different worktree: valid
+    // shape, but its identity lines belong to someone else.
+    let contents = fs::read_to_string(repo.join(".env.portool")).unwrap();
+    let foreign: String = contents
+        .lines()
+        .map(|line| {
+            if line.starts_with("PORTOOL_PROJECT_ID=") {
+                "PORTOOL_PROJECT_ID=0000000000000000".to_string()
+            } else if line.starts_with("PORTOOL_WORKTREE_ID=") {
+                "PORTOOL_WORKTREE_ID=1111111111111111".to_string()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    fs::write(repo.join(".env.portool"), foreign).unwrap();
+
+    // Delete the ledger entry doctor would otherwise consider already
+    // present, forcing it down the rebuild/import path.
+    fs::remove_file(env.registry_path()).unwrap();
+
+    let output = env.run(&repo, &["doctor"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("identifies a different project/worktree"),
+        "doctor must report the foreign identity, got: {stdout}"
+    );
+    assert!(
+        !env.registry_path().exists(),
+        "nothing valid was imported, so no ledger may be written"
+    );
+}
+
 /// `doctor` diagnoses hook-effectiveness problems (external review P1-4):
 /// "installed" must mean "will actually run". Covers a missing hook and a
 /// hook with a dead embedded `PORTOOL_BIN` path.
