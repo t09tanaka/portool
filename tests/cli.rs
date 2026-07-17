@@ -869,7 +869,7 @@ fn ls_table_and_json_shapes() {
     assert!(output.status.success());
     let json: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&output.stdout))
         .expect("ls --json must emit valid JSON");
-    assert_eq!(json["version"], serde_json::json!(1));
+    assert_eq!(json["version"], serde_json::json!(2));
     assert_eq!(json["range"], serde_json::json!([3000, 9999]));
     let projects = json["projects"].as_object().unwrap();
     assert_eq!(projects.len(), 1);
@@ -1014,35 +1014,16 @@ fn sync_without_installed_hook_prints_the_exact_hint_line() {
     );
 }
 
-// --- 13. exit code 2: no subrange could ever fit even one block -----------
+// --- 14. exit code 3: the pool has no room for even one block -------------
+// (Batch C: exit code 2 / the per-project subrange model is retired; a block
+// that can't fit anywhere in the pool now fails with PoolExhausted = 3.)
 
 #[test]
-fn sync_exits_2_when_block_size_exceeds_subrange_size() {
+fn sync_exits_3_when_pool_cannot_fit_a_block() {
     let env = TestEnv::new();
-    // No manifest -> default block size == block_align == 5, which exceeds
-    // the configured subrange_size of 3: no subrange, however many are
-    // acquired, could ever hold one block (frozen decision 4).
-    env.write_config("range = [3000, 3009]\nsubrange_size = 3\nblock_align = 5\n");
-    let repo = env.path("repo");
-    init_repo(&repo);
-
-    let output = env.run(&repo, &["sync"]);
-    assert_eq!(
-        output.status.code(),
-        Some(2),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-// --- 14. exit code 3: the pool has no room for even one subrange ----------
-
-#[test]
-fn sync_exits_3_when_pool_has_no_room_for_a_subrange() {
-    let env = TestEnv::new();
-    // The pool is only 10 ports wide, far narrower than the requested
-    // subrange_size of 500: the very first subrange acquisition fails.
-    env.write_config("range = [3000, 3009]\nsubrange_size = 500\n");
+    // The pool is only 4 ports wide, narrower than the default 5-wide block:
+    // no block fits anywhere in the pool.
+    env.write_config("range = [3000, 3003]\nblock_align = 5\n");
     let repo = env.path("repo");
     init_repo(&repo);
 
@@ -1055,7 +1036,7 @@ fn sync_exits_3_when_pool_has_no_room_for_a_subrange() {
     );
 }
 
-// --- 15. prune --all reclaims a fully-deleted project's entry + subranges -
+// --- 15. prune --all reclaims a fully-deleted project's entry -------------
 
 #[test]
 fn prune_all_reclaims_a_fully_deleted_project_and_leaves_others_untouched() {
@@ -1107,8 +1088,8 @@ fn prune_all_reclaims_a_fully_deleted_project_and_leaves_others_untouched() {
         "--dry-run must not touch the surviving project either"
     );
 
-    // A real `prune --all` removes the dead project entry -- and with it
-    // its subranges -- while leaving the surviving repo's entries alone.
+    // A real `prune --all` removes the dead project entry while leaving the
+    // surviving repo's entries alone.
     let output = env.run(&outside, &["prune", "--all"]);
     assert!(
         output.status.success(),
@@ -1124,7 +1105,7 @@ fn prune_all_reclaims_a_fully_deleted_project_and_leaves_others_untouched() {
     let registry = env.registry();
     assert!(
         registry["projects"].get(&repo_a_key).is_none(),
-        "the dead project entry (and its subranges) must be gone"
+        "the dead project entry must be gone"
     );
 
     let repo_b_project = &registry["projects"][&repo_b_key];
@@ -1134,12 +1115,10 @@ fn prune_all_reclaims_a_fully_deleted_project_and_leaves_others_untouched() {
             .is_some(),
         "the surviving project's worktree entry must be untouched"
     );
-    // repo-b synced second, so its subrange is the pool's second slot
-    // (3000-3499 was already claimed by repo-a).
-    assert_eq!(
-        repo_b_project["subranges"],
-        serde_json::json!([[3500, 3999]]),
-        "the surviving project's subranges must be untouched"
+    // The v2 ledger no longer carries per-project subranges.
+    assert!(
+        repo_b_project.get("subranges").is_none(),
+        "v2 ledger must not have a subranges field"
     );
 }
 
@@ -1390,6 +1369,119 @@ fn malformed_config_is_fatal() {
         output.status.code(),
         Some(1),
         "a malformed config.toml must be a hard error (exit 1), stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// --- Batch C: allocation from the pool, reallocate, exec bind-recheck ------
+
+/// The core fix for the 14-repository exhaustion: blocks come straight from
+/// the pool, so a tiny pool holds exactly as many blocks as it has slots --
+/// not zero (which the old 500-wide subrange model produced for any pool
+/// under 500 ports).
+#[test]
+fn many_projects_share_the_pool_without_subrange_exhaustion() {
+    let env = TestEnv::new();
+    // A 15-port pool == exactly three 5-wide blocks. Under the old model a
+    // sub-500 pool could not place even one project. An isolated high range
+    // keeps this test's bind-checks clear of the port-binding tests below,
+    // which run in parallel on the shared 127.0.0.1 space.
+    env.write_config("range = [3900, 3914]\nblock_align = 5\n");
+
+    for i in 0..3 {
+        let repo = env.path(&format!("repo-{i}"));
+        init_repo(&repo);
+        let output = env.run(&repo, &["sync"]);
+        assert!(
+            output.status.success(),
+            "project {i} must allocate from the shared pool; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // The fourth project exhausts the pool -> exit 3 (not the old 2).
+    let repo = env.path("repo-3");
+    init_repo(&repo);
+    assert_eq!(env.run(&repo, &["sync"]).status.code(), Some(3));
+}
+
+/// Rewrites the ledger so `repo`'s worktree block is the single-port block
+/// `(port, port)`. Combined with a held ephemeral port, this creates a
+/// deterministic bind conflict at the execution boundary -- avoiding the race
+/// of binding a *predicted* port that a parallel test might grab first.
+fn pin_block_to_port(env: &TestEnv, repo: &Path, port: u16) {
+    let mut reg: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(env.registry_path()).unwrap()).unwrap();
+    reg["projects"][common_dir_key(repo)]["worktrees"][worktree_key(repo)]["block"] =
+        serde_json::json!([port, port]);
+    fs::write(env.registry_path(), serde_json::to_string(&reg).unwrap()).unwrap();
+}
+
+/// `portool reallocate` moves a worktree off a block whose port something
+/// else now holds.
+#[test]
+fn reallocate_moves_off_a_block_whose_port_is_in_use() {
+    let env = TestEnv::new();
+    let repo = env.path("repo");
+    init_repo(&repo);
+    fs::write(repo.join(".portool.toml"), "[ports]\nweb = 0\n").unwrap();
+    assert!(env.run(&repo, &["sync"]).status.success());
+
+    // Hold a guaranteed-free ephemeral port and pin the worktree onto it, so
+    // reallocate must move elsewhere.
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    pin_block_to_port(&env, &repo, port);
+
+    let output = env.run(&repo, &["reallocate"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let block1 = env.registry()["projects"][common_dir_key(&repo)]["worktrees"]
+        [worktree_key(&repo)]["block"]
+        .clone();
+    assert_ne!(
+        block1,
+        serde_json::json!([port, port]),
+        "reallocate must move off the occupied block"
+    );
+}
+
+/// `portool reallocate` errors when the worktree has no allocation yet.
+#[test]
+fn reallocate_without_allocation_errors() {
+    let env = TestEnv::new();
+    let repo = env.path("repo");
+    init_repo(&repo);
+
+    let output = env.run(&repo, &["reallocate"]);
+    assert_eq!(output.status.code(), Some(1));
+}
+
+/// `portool exec --strict` fails when the allocated block's port is in use at
+/// the execution boundary.
+#[test]
+fn exec_strict_fails_when_block_port_in_use() {
+    let env = TestEnv::new();
+    let repo = env.path("repo");
+    init_repo(&repo);
+    fs::write(repo.join(".portool.toml"), "[ports]\nweb = 0\n").unwrap();
+    assert!(env.run(&repo, &["sync"]).status.success());
+
+    // Hold a guaranteed-free ephemeral port and pin the worktree onto it, so
+    // the execution-boundary bind-recheck sees a real, deterministic conflict.
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    pin_block_to_port(&env, &repo, port);
+
+    let output = env.run(&repo, &["exec", "--strict", "--", "true"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "exec --strict must fail on a port conflict; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 }

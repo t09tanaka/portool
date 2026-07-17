@@ -27,8 +27,6 @@ pub struct Registry {
 pub struct ProjectEntry {
     /// Display name, inferred from the common-dir's parent directory name.
     pub name: String,
-    /// Subranges owned by this project, in acquisition order.
-    pub subranges: Vec<(u16, u16)>,
     /// Keyed by `realpath(worktree root)`.
     pub worktrees: BTreeMap<String, WorktreeEntry>,
 }
@@ -55,8 +53,10 @@ pub struct Reservation {
 }
 
 impl Registry {
-    /// The schema version this build reads and writes.
-    pub const CURRENT_VERSION: u32 = 1;
+    /// The schema version this build reads and writes. v2 dropped the
+    /// per-project `subranges` field (hardening batch C); worktree blocks are
+    /// allocated directly from the pool.
+    pub const CURRENT_VERSION: u32 = 2;
 
     /// A freshly created, empty ledger recording `range` for informational
     /// purposes.
@@ -66,6 +66,32 @@ impl Registry {
             range,
             projects: BTreeMap::new(),
             reservations: Vec::new(),
+        }
+    }
+
+    /// Parses a ledger from JSON, migrating older schema versions to the
+    /// current one **in memory** (hardening batch C). A v1 ledger (which
+    /// carried per-project `subranges`) is read and its `subranges` dropped,
+    /// preserving every worktree `block` verbatim -- blocks are absolute, so
+    /// no ports move on upgrade. Callers persist the migrated form only on a
+    /// locked write; a read-only caller sees v2 in memory and leaves the v1
+    /// file on disk.
+    ///
+    /// An unparseable body or an unrecognized version is an error, which
+    /// callers treat as corruption.
+    pub fn from_json(s: &str) -> Result<Registry> {
+        #[derive(Deserialize)]
+        struct VersionPeek {
+            version: u32,
+        }
+        let peek: VersionPeek = serde_json::from_str(s)?;
+        match peek.version {
+            2 => Ok(serde_json::from_str::<Registry>(s)?),
+            1 => Ok(serde_json::from_str::<v1::Registry>(s)?.into_current()),
+            other => Err(Error::General(format!(
+                "unsupported registry version {other} (this build understands version {})",
+                Self::CURRENT_VERSION
+            ))),
         }
     }
 
@@ -123,14 +149,6 @@ impl Registry {
         Ok(())
     }
 
-    /// All subranges owned by any project, in no particular order.
-    pub fn all_subranges(&self) -> Vec<(u16, u16)> {
-        self.projects
-            .values()
-            .flat_map(|p| p.subranges.iter().copied())
-            .collect()
-    }
-
     /// Every allocated block across all projects' worktrees plus all
     /// reservations, in no particular order.
     pub fn all_blocks(&self) -> Vec<(u16, u16)> {
@@ -159,11 +177,92 @@ pub fn overlaps(a: (u16, u16), b: (u16, u16)) -> bool {
     a.0 <= b.1 && b.0 <= a.1
 }
 
+/// The v1 ledger schema (pre-hardening), read only for migration to the
+/// current version. It differs from v2 solely in that `ProjectEntry` carried
+/// a `subranges` field; `WorktreeEntry` and `Reservation` are unchanged and
+/// reused from the current schema.
+mod v1 {
+    use super::{Reservation, WorktreeEntry};
+    use serde::Deserialize;
+    use std::collections::BTreeMap;
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct Registry {
+        // Present so `deny_unknown_fields` accepts the `version` key; the
+        // value is already known (1) from the version peek, so it is unread.
+        #[allow(dead_code)]
+        pub version: u32,
+        pub range: (u16, u16),
+        pub projects: BTreeMap<String, ProjectEntry>,
+        pub reservations: Vec<Reservation>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct ProjectEntry {
+        pub name: String,
+        #[allow(dead_code)]
+        pub subranges: Vec<(u16, u16)>,
+        pub worktrees: BTreeMap<String, WorktreeEntry>,
+    }
+
+    impl Registry {
+        /// Converts a parsed v1 ledger to the current (v2) schema, dropping
+        /// `subranges` and keeping every worktree block verbatim.
+        pub fn into_current(self) -> super::Registry {
+            super::Registry {
+                version: super::Registry::CURRENT_VERSION,
+                range: self.range,
+                projects: self
+                    .projects
+                    .into_iter()
+                    .map(|(key, project)| {
+                        (
+                            key,
+                            super::ProjectEntry {
+                                name: project.name,
+                                worktrees: project.worktrees,
+                            },
+                        )
+                    })
+                    .collect(),
+                reservations: self.reservations,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const SPEC_EXAMPLE: &str = r#"
+    {
+      "version": 2,
+      "range": [3000, 9999],
+      "projects": {
+        "/home/user/dev/myapp/.git": {
+          "name": "myapp",
+          "worktrees": {
+            "/home/user/dev/myapp": {
+              "block": [3000, 3004],
+              "branch": "main",
+              "manifest_hash": "a1b2c3d4e5f6",
+              "pinned": false,
+              "label": null,
+              "allocated_at": "2026-07-15T10:00:00+09:00",
+              "last_seen_at": "2026-07-15T12:00:00+09:00"
+            }
+          }
+        }
+      },
+      "reservations": []
+    }
+    "#;
+
+    /// A v1 ledger (with the old `subranges` field) for migration coverage.
+    const SPEC_EXAMPLE_V1: &str = r#"
     {
       "version": 1,
       "range": [3000, 9999],
@@ -191,11 +290,10 @@ mod tests {
     #[test]
     fn empty_has_no_projects_or_reservations() {
         let reg = Registry::empty((3000, 9999));
-        assert_eq!(reg.version, 1);
+        assert_eq!(reg.version, 2);
         assert_eq!(reg.range, (3000, 9999));
         assert!(reg.projects.is_empty());
         assert!(reg.reservations.is_empty());
-        assert!(reg.all_subranges().is_empty());
         assert!(reg.all_blocks().is_empty());
     }
 
@@ -209,15 +307,14 @@ mod tests {
 
     #[test]
     fn spec_example_round_trips() {
-        let reg: Registry = serde_json::from_str(SPEC_EXAMPLE).unwrap();
+        let reg = Registry::from_json(SPEC_EXAMPLE).unwrap();
 
-        assert_eq!(reg.version, 1);
+        assert_eq!(reg.version, 2);
         assert_eq!(reg.range, (3000, 9999));
         assert!(reg.reservations.is_empty());
 
         let project = reg.find_project("/home/user/dev/myapp/.git").unwrap();
         assert_eq!(project.name, "myapp");
-        assert_eq!(project.subranges, vec![(3000, 3499)]);
 
         let worktree = project.worktrees.get("/home/user/dev/myapp").unwrap();
         assert_eq!(worktree.block, (3000, 3004));
@@ -231,6 +328,29 @@ mod tests {
         let serialized = serde_json::to_string(&reg).unwrap();
         let reg_again: Registry = serde_json::from_str(&serialized).unwrap();
         assert_eq!(reg, reg_again);
+    }
+
+    #[test]
+    fn from_json_migrates_v1_dropping_subranges_and_keeping_blocks() {
+        let reg = Registry::from_json(SPEC_EXAMPLE_V1).unwrap();
+
+        // Migrated to the current version...
+        assert_eq!(reg.version, Registry::CURRENT_VERSION);
+        // ...with every worktree block preserved verbatim (no ports move).
+        let project = reg.find_project("/home/user/dev/myapp/.git").unwrap();
+        let worktree = project.worktrees.get("/home/user/dev/myapp").unwrap();
+        assert_eq!(worktree.block, (3000, 3004));
+        // The migrated ledger is valid and re-serializes without subranges.
+        assert!(reg.validate().is_ok());
+        let serialized = serde_json::to_string(&reg).unwrap();
+        assert!(!serialized.contains("subranges"));
+        assert!(serialized.contains("\"version\":2"));
+    }
+
+    #[test]
+    fn from_json_rejects_unknown_version() {
+        let json = r#"{"version":99,"range":[3000,9999],"projects":{},"reservations":[]}"#;
+        assert!(Registry::from_json(json).is_err());
     }
 
     #[test]

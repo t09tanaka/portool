@@ -75,7 +75,6 @@ mod tests {
     fn project_with(worktrees: BTreeMap<String, WorktreeEntry>) -> ProjectEntry {
         ProjectEntry {
             name: "p".to_string(),
-            subranges: vec![(3000, 3499)],
             worktrees,
         }
     }

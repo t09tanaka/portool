@@ -9,11 +9,9 @@ use std::fmt;
 pub enum Error {
     /// A general, unstructured error (exit code 1).
     General(String),
-    /// A subrange could not be allocated within after exhausting retries
-    /// (exit code 2).
-    SubrangeExhausted,
-    /// The configured pool has no room left for a new subrange (exit code
-    /// 3).
+    /// The configured pool has no room left for a block anywhere in the
+    /// range (exit code 3). Exit code 2 is retired along with the old
+    /// per-project subrange model (hardening batch C).
     PoolExhausted,
     /// Acquiring the registry lock timed out (exit code 4).
     LockTimeout,
@@ -30,7 +28,6 @@ impl Error {
     pub fn exit_code(&self) -> i32 {
         match self {
             Error::General(_) => 1,
-            Error::SubrangeExhausted => 2,
             Error::PoolExhausted => 3,
             Error::LockTimeout => 4,
             Error::CommandNotExecutable(_) => 126,
@@ -43,7 +40,6 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::General(msg) => write!(f, "{msg}"),
-            Error::SubrangeExhausted => write!(f, "subrange exhausted"),
             Error::PoolExhausted => write!(f, "pool exhausted"),
             Error::LockTimeout => write!(f, "lock timeout"),
             Error::CommandNotFound(cmd) => write!(f, "command not found: {cmd}"),
@@ -82,7 +78,6 @@ mod tests {
     #[test]
     fn exit_code_mapping() {
         assert_eq!(Error::General("x".into()).exit_code(), 1);
-        assert_eq!(Error::SubrangeExhausted.exit_code(), 2);
         assert_eq!(Error::PoolExhausted.exit_code(), 3);
         assert_eq!(Error::LockTimeout.exit_code(), 4);
         assert_eq!(Error::CommandNotExecutable("x".into()).exit_code(), 126);
@@ -92,7 +87,6 @@ mod tests {
     #[test]
     fn display_messages() {
         assert_eq!(Error::General("boom".into()).to_string(), "boom");
-        assert_eq!(Error::SubrangeExhausted.to_string(), "subrange exhausted");
         assert_eq!(Error::PoolExhausted.to_string(), "pool exhausted");
         assert_eq!(Error::LockTimeout.to_string(), "lock timeout");
         assert_eq!(

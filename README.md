@@ -276,11 +276,12 @@ What the IDs survive:
 ## CLI reference
 
 ```
-portool init  [--hook-only | --gitignore-only]
-portool sync  [--quiet]
-portool exec  [-e <PATH>]... -- <COMMAND> [ARGS...]
-portool ls    [--json] [--all]
-portool prune [--all] [--dry-run]
+portool init       [--hook-only | --gitignore-only]
+portool sync       [--quiet]
+portool exec       [-e <PATH>]... [--strict] [--reallocate-on-conflict] -- <COMMAND> [ARGS...]
+portool reallocate [--quiet]
+portool ls         [--json] [--all]
+portool prune      [--all] [--dry-run]
 ```
 
 ### `portool init`
@@ -316,6 +317,24 @@ Runs `<COMMAND>` with the composed environment — covered in detail in
 | Flag | Effect |
 |---|---|
 | `-e, --env-file <PATH>` | An env file to load before composing. Repeatable; later files override earlier ones. |
+| `--strict` | Fail (exit 1) instead of warning if the allocated block's ports are already in use. |
+| `--reallocate-on-conflict` | Move the worktree to a fresh block (like `portool reallocate`) if the allocated block's ports are in use, then run. |
+
+After syncing, `exec` bind-checks the block on `127.0.0.1`. Because that
+can't tell a foreign process from this worktree's *own* already-running
+server, the default is a neutral stderr advisory, not a failure — use
+`--strict` or `--reallocate-on-conflict` when you want it to act.
+
+### `portool reallocate`
+
+Forces the current worktree onto a fresh free-and-bindable block, excluding
+its current one, and rewrites `.env.portool`. Use it to move off a block
+whose ports something else now holds. Requires the worktree to already have
+an allocation (run `sync` first).
+
+| Flag | Effect |
+|---|---|
+| `--quiet` | Suppress the normal-case summary line on stdout. |
 
 ### `portool ls`
 
@@ -355,10 +374,11 @@ entire project's `common_dir` — the whole repository clone — is gone.
 |---|---|
 | 0 | Success (including a no-op sync). |
 | 1 | General error — outside a git repository, a malformed `.portool.toml` or `config.toml`, an unreadable or corrupt ledger, an I/O failure, etc. |
-| 2 | No subrange, however many are acquired, could ever fit one block (the manifest's block size exceeds `subrange_size`). |
-| 3 | The pool has no room left for a new subrange. |
+| 3 | The pool has no room left for a block. |
 | 4 | Timed out (10s) waiting for the registry lock. |
 | 64 | CLI usage error (unknown subcommand or bad flags). Kept distinct from portool's semantic codes above. |
+
+(Exit code 2 was retired with the per-project subrange model.)
 
 `portool exec` is the exception: once the child command starts, its exit
 code is passed through unchanged (with `127` for command not found and
@@ -371,10 +391,13 @@ field is optional and falls back to its default:
 
 ```toml
 range = [3000, 9999]      # the full port pool
-subrange_size = 500       # width of each subrange a project acquires
 block_align = 5           # block-size rounding unit (and minimum block size)
 gc_days = 30              # reserved for future cross-project GC
 ```
+
+(`subrange_size` was removed in the hardening release — blocks are allocated
+directly from `range`. A config that still sets it is accepted with a
+deprecation warning and otherwise ignored.)
 
 Changing this file only affects *new* allocations — existing blocks are
 left in place.
@@ -388,24 +411,24 @@ absolute path (per the XDG Base Directory spec); a relative value is ignored.
 
 ## How it works
 
-Allocation is layered:
+Allocation is two levels:
 
 1. **Pool** — the full port range (`[3000, 9999]` by default).
-2. **Subrange** — each project (identified by the realpath of its git
-   common-dir, so all its worktrees share one identity) claims a
-   `subrange_size`-wide slice of the pool the first time it's synced.
-   Projects acquire additional subranges from the pool if their first one
-   fills up.
-3. **Block** — within a subrange, each worktree gets one contiguous block
-   sized from its `.portool.toml` (or `block_align` if it has none).
+2. **Block** — each worktree gets one contiguous block, sized from its
+   `.portool.toml` (or `block_align` if it has none), carved **directly from
+   the pool**. There is no per-project reservation, so the pool serves far
+   more projects than the old fixed-slice model — which capped the default
+   pool at ~14 repositories regardless of how few ports each actually used.
 
-Within a subrange, slot selection is deterministic: a worktree on `main` or
-`master` always prefers slot 0, so **a project's subrange start is, by
-convention, wherever `main` lives**. Every other branch prefers
-`FNV-1a-32(branch) % slots` — a stable hash, so re-creating a worktree on
-the same branch tends to land back on the same block. If the preferred slot
-is taken (or something outside the ledger is already listening on it),
-`portool` scans forward, wrapping, for the next free and bindable slot.
+Block placement is deterministic: a worktree on `main`/`master` prefers the
+pool start, and every other branch prefers `FNV-1a-32(branch) % slots` (a
+detached worktree hashes its path instead) — a stable hash, so re-creating a
+worktree on the same branch tends to return to the same block. If the
+preferred slot is taken (or something outside the ledger is already listening
+on it), `portool` scans forward, wrapping, for the next free and bindable
+slot. The ports a block actually uses are verified at
+[`portool exec`](#portool-exec) time; run `portool reallocate` to move a
+worktree off a block whose ports something else now holds.
 
 Ledger writes always go through an exclusive `flock` on
 `registry.json.lock`; reads for the common case (nothing changed) never

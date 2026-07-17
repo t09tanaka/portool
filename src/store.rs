@@ -86,10 +86,11 @@ pub fn load(path: &Path, heal: bool) -> LoadResult {
         }
     };
 
-    // A ledger is corrupt if it fails to parse as JSON *or* parses but
+    // A ledger is corrupt if it fails to parse / migrate *or* parses but
     // violates a semantic invariant (batch B #9): being valid JSON is
-    // necessary but not sufficient to trust it.
-    match serde_json::from_str::<Registry>(&contents) {
+    // necessary but not sufficient to trust it. `from_json` also migrates an
+    // older (v1) schema to the current one in memory (batch C).
+    match Registry::from_json(&contents) {
         Ok(registry) => match registry.validate() {
             Ok(()) => LoadResult {
                 registry,
@@ -198,7 +199,6 @@ mod tests {
             "/home/user/dev/myapp/.git".to_string(),
             ProjectEntry {
                 name: "myapp".to_string(),
-                subranges: vec![(3000, 3499)],
                 worktrees,
             },
         );

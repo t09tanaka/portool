@@ -47,9 +47,21 @@ enum Command {
         /// Env file(s) to load, in order; later files override earlier ones.
         #[arg(short = 'e', long = "env-file", value_name = "PATH")]
         env_file: Vec<std::path::PathBuf>,
+        /// Fail (exit 1) if the allocated block's ports are already in use.
+        #[arg(long)]
+        strict: bool,
+        /// Move to a fresh block if the allocated block's ports are in use.
+        #[arg(long)]
+        reallocate_on_conflict: bool,
         /// The command to run (everything after `--`).
         #[arg(last = true, required = true, value_name = "COMMAND")]
         command: Vec<std::ffi::OsString>,
+    },
+    /// Force the current worktree onto a fresh port block.
+    Reallocate {
+        /// Suppress the normal-case summary line on stdout.
+        #[arg(long)]
+        quiet: bool,
     },
     /// Reclaim stale worktree entries.
     Prune {
@@ -88,7 +100,13 @@ fn main() {
         } => cmd::init::run(hook_only, gitignore_only),
         Command::Sync { quiet } => cmd::sync::run(quiet),
         Command::Ls { json, all } => cmd::ls::run(json, all),
-        Command::Exec { env_file, command } => cmd::exec::run(&env_file, &command),
+        Command::Exec {
+            env_file,
+            strict,
+            reallocate_on_conflict,
+            command,
+        } => cmd::exec::run(&env_file, &command, strict, reallocate_on_conflict),
+        Command::Reallocate { quiet } => cmd::sync::reallocate_cmd(quiet),
         Command::Prune { all, dry_run } => cmd::prune::run(all, dry_run),
     };
 
