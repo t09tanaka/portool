@@ -1,10 +1,14 @@
-//! `portool init` (spec §9.1, frozen decisions 2, 6, 7, 8; hardening batch
-//! A): installs the `post-checkout` and `post-merge` hooks into the
+//! `portool init` (spec §9.1, frozen decisions 2, 6, 7, 8; hardening batch A;
+//! Task 6): installs the `post-checkout` and `post-merge` hooks into the
 //! repository's *effective* hooks location (honoring `core.hooksPath` /
 //! Husky, and refusing shared global/system scope -- see `crate::hooks`),
-//! appends `.env.portool` to `.gitignore`, and runs `sync` once. The
-//! installed hooks always exit 0, so a portool failure never fails the
-//! caller's git command.
+//! appends `.env.portool` to `$GIT_COMMON_DIR/info/exclude` (never the
+//! tracked `.gitignore`), and runs `sync` once. The installed hooks always
+//! exit 0, so a portool failure never fails the caller's git command.
+//!
+//! `portool unhook` and `portool deinit` reverse this: `unhook` removes just
+//! the hooks, `deinit` also releases the project's ledger allocations, its
+//! env files, and the `info/exclude` entry.
 
 use crate::cmd::sync;
 use crate::error::{Error, Result};
@@ -12,7 +16,7 @@ use crate::gitctx::GitCtx;
 use crate::hooks::HooksLocation;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The single line appended to an existing (foreign) hook by portool <= 0.5.
 /// `|| true` means portool's invocation -- the last line of the hook -- can
@@ -46,7 +50,12 @@ const UNSAFE_PORTOOL_LINES: &[&str] = &[
     "if command -v portool >/dev/null 2>&1; then portool sync --quiet; fi",
 ];
 
-const GITIGNORE_LINE: &str = ".env.portool";
+const EXCLUDE_COMMENT: &str = "# managed by portool";
+const IGNORE_LINE: &str = ".env.portool";
+
+fn exclude_path(common_dir: &Path) -> PathBuf {
+    common_dir.join("info").join("exclude")
+}
 
 /// The absolute path of the running `portool` binary, canonicalized, for
 /// embedding in the hook script (so it works even when the process that
@@ -116,8 +125,10 @@ fn hook_append_block(bin: Option<&str>) -> String {
 }
 
 /// Runs `portool init`. With neither flag, installs the hooks, updates
-/// `.gitignore`, and runs `sync`; `--hook-only`/`--gitignore-only` (clap
-/// enforces they're mutually exclusive) each perform just their one step.
+/// `$GIT_COMMON_DIR/info/exclude`, and runs `sync`; `--hook-only`/
+/// `--gitignore-only` (clap enforces they're mutually exclusive) each perform
+/// just their one step. `--gitignore-only` keeps its pre-1.0 name even though
+/// it now touches `info/exclude`, not the tracked `.gitignore`.
 pub fn run(hook_only: bool, gitignore_only: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let ctx = GitCtx::discover(&cwd)?;
@@ -126,11 +137,11 @@ pub fn run(hook_only: bool, gitignore_only: bool) -> Result<()> {
         return install_hook(&ctx);
     }
     if gitignore_only {
-        return update_gitignore(&ctx.worktree_root);
+        return update_exclude(&ctx.common_dir);
     }
 
     install_hook(&ctx)?;
-    update_gitignore(&ctx.worktree_root)?;
+    update_exclude(&ctx.common_dir)?;
     sync::run(false)
 }
 
@@ -205,26 +216,86 @@ fn install_hook(ctx: &GitCtx) -> Result<()> {
     }
 }
 
-/// Runs `portool deinit` (batch D #5): reverses `init` by removing portool's
-/// lines from the effective `post-checkout`/`post-merge` hooks and removing
-/// `.env.portool` from `.gitignore`. Idempotent and symmetric with `init`.
-pub fn deinit() -> Result<()> {
+/// Runs `portool unhook`: removes portool's content from the effective
+/// post-checkout/post-merge hooks and nothing else.
+pub fn unhook() -> Result<()> {
     let cwd = std::env::current_dir()?;
     let ctx = GitCtx::discover(&cwd)?;
-    let loc = HooksLocation::resolve(&ctx);
+    remove_hooks(&ctx)?;
+    println!("portool: removed portool's hooks");
+    Ok(())
+}
+
+fn remove_hooks(ctx: &GitCtx) -> Result<()> {
+    let loc = HooksLocation::resolve(ctx);
     for name in ["post-checkout", "post-merge"] {
         if let Some(path) = loc.hook_file(name) {
             deinit_hook(&path)?;
         }
     }
-    deinit_gitignore(&ctx.worktree_root)?;
-    println!("portool: removed portool's hooks and .gitignore entry");
     Ok(())
 }
 
-/// Removes portool's content from one hook (Task 6 will restructure this
-/// further; for now it just learns the new forms so `deinit` stays
-/// symmetric with `init`):
+/// Runs `portool deinit`: releases every allocation of the current project,
+/// removes generated env files, hooks, and the `info/exclude` entry. The
+/// tracked `.gitignore` is never edited (ownership of a bare line there is
+/// unknowable) -- a leftover line only earns a hint.
+pub fn deinit(keep_allocations: bool) -> Result<()> {
+    use crate::{lock, paths, store};
+    use std::time::Duration;
+
+    let cwd = std::env::current_dir()?;
+    let ctx = GitCtx::discover(&cwd)?;
+    let common_dir_key = ctx.common_dir.to_string_lossy().into_owned();
+
+    if !keep_allocations {
+        let _lock = lock::acquire(&paths::lock_path()?, Duration::from_secs(10))?;
+        let registry_path = paths::registry_path()?;
+        if let Some(mut registry) = store::load_strict(&registry_path)? {
+            if let Some(project) = registry.find_project(&common_dir_key) {
+                // Env files first, ledger second (same ordering rationale as
+                // `release`): a failed removal keeps the block reserved.
+                for path in project.worktrees.keys() {
+                    let env_path = Path::new(path).join(".env.portool");
+                    match fs::remove_file(&env_path) {
+                        Ok(()) => {}
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(err) => {
+                            return Err(Error::General(format!(
+                                "failed to remove {}: {err}; no allocations were released",
+                                env_path.display()
+                            )))
+                        }
+                    }
+                }
+                registry.projects.remove(&common_dir_key);
+                store::save(&registry_path, &registry)?;
+                println!("portool: released all of this project's allocations");
+            }
+        }
+    }
+
+    remove_hooks(&ctx)?;
+    deinit_exclude(&ctx.common_dir)?;
+
+    let gitignore = ctx.worktree_root.join(".gitignore");
+    if fs::read_to_string(&gitignore)
+        .map(|c| c.lines().any(|l| l == IGNORE_LINE))
+        .unwrap_or(false)
+    {
+        println!(
+            "portool: note: {} still lists '.env.portool' (added by an older portool \
+             or by hand); remove it yourself if unwanted -- portool no longer edits \
+             tracked files",
+            gitignore.display()
+        );
+    }
+    println!("portool: deinitialized this project");
+    Ok(())
+}
+
+/// Removes portool's content from one hook. Shared by `unhook` and `deinit`
+/// via `remove_hooks`:
 ///
 /// - An **owned standalone** script (any shape -- current or legacy,
 ///   identified by [`is_owned_standalone`]) is deleted outright.
@@ -274,21 +345,32 @@ fn deinit_hook(hook_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn deinit_gitignore(worktree_root: &Path) -> Result<()> {
-    let path = worktree_root.join(".gitignore");
+/// Removes exactly the pair `update_exclude` wrote (comment + following
+/// `.env.portool` line). A bare user-added line is left alone.
+fn deinit_exclude(common_dir: &Path) -> Result<()> {
+    let path = exclude_path(common_dir);
     let existing = match fs::read_to_string(&path) {
         Ok(content) => content,
         Err(_) => return Ok(()),
     };
-    if !existing.lines().any(|line| line == GITIGNORE_LINE) {
-        return Ok(());
+    let mut out: Vec<&str> = Vec::new();
+    let mut lines = existing.lines().peekable();
+    let mut changed = false;
+    while let Some(line) = lines.next() {
+        if line.trim() == EXCLUDE_COMMENT && lines.peek().map(|l| l.trim()) == Some(IGNORE_LINE) {
+            lines.next();
+            changed = true;
+            continue;
+        }
+        out.push(line);
     }
-    let kept: Vec<&str> = existing.lines().filter(|l| *l != GITIGNORE_LINE).collect();
-    let mut out = kept.join("\n");
-    if existing.ends_with('\n') && !out.is_empty() {
-        out.push('\n');
+    if changed {
+        let mut content = out.join("\n");
+        if existing.ends_with('\n') && !content.is_empty() {
+            content.push('\n');
+        }
+        atomic_write(&path, content.as_bytes())?;
     }
-    fs::write(&path, out)?;
     Ok(())
 }
 
@@ -551,28 +633,30 @@ fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Frozen decision 7: appends `.env.portool` to the current worktree root's
-/// `.gitignore`, idempotently (no-op if that exact line is already present).
-fn update_gitignore(worktree_root: &Path) -> Result<()> {
-    let path = worktree_root.join(".gitignore");
+/// Adds the managed `.env.portool` pair to `$GIT_COMMON_DIR/info/exclude`
+/// (external review P0-3): repo-specific but never committed, and shared by
+/// every linked worktree, unlike the old tracked-`.gitignore` edit (frozen
+/// decision 7, superseded by Task 6). Idempotent: a no-op when any line is
+/// already exactly `.env.portool`.
+fn update_exclude(common_dir: &Path) -> Result<()> {
+    let path = exclude_path(common_dir);
     let existing = match fs::read_to_string(&path) {
         Ok(content) => content,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(err) => return Err(Error::from(err)),
     };
-
-    if existing.lines().any(|line| line == GITIGNORE_LINE) {
+    if existing.lines().any(|line| line.trim() == IGNORE_LINE) {
         return Ok(());
     }
-
     let mut content = existing;
     if !content.is_empty() && !content.ends_with('\n') {
         content.push('\n');
     }
-    content.push_str(GITIGNORE_LINE);
+    content.push_str(EXCLUDE_COMMENT);
     content.push('\n');
-    fs::write(&path, content)?;
-    Ok(())
+    content.push_str(IGNORE_LINE);
+    content.push('\n');
+    atomic_write(&path, content.as_bytes())
 }
 
 #[cfg(test)]
@@ -1019,26 +1103,83 @@ mod tests {
     }
 
     #[test]
-    fn update_gitignore_creates_and_is_idempotent() {
+    fn update_exclude_creates_and_is_idempotent() {
         let tmp = TempDir::new().unwrap();
-        let root = tmp.path();
+        let common_dir = tmp.path();
 
-        update_gitignore(root).unwrap();
-        update_gitignore(root).unwrap();
+        update_exclude(common_dir).unwrap();
+        update_exclude(common_dir).unwrap();
 
-        let content = fs::read_to_string(root.join(".gitignore")).unwrap();
-        assert_eq!(content, ".env.portool\n");
+        let content = fs::read_to_string(exclude_path(common_dir)).unwrap();
+        assert_eq!(content, "# managed by portool\n.env.portool\n");
     }
 
     #[test]
-    fn update_gitignore_preserves_existing_content() {
+    fn update_exclude_preserves_existing_content() {
         let tmp = TempDir::new().unwrap();
-        let root = tmp.path();
-        fs::write(root.join(".gitignore"), "node_modules\n").unwrap();
+        let common_dir = tmp.path();
+        let path = exclude_path(common_dir);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "node_modules\n").unwrap();
 
-        update_gitignore(root).unwrap();
+        update_exclude(common_dir).unwrap();
 
-        let content = fs::read_to_string(root.join(".gitignore")).unwrap();
-        assert_eq!(content, "node_modules\n.env.portool\n");
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            content,
+            "node_modules\n# managed by portool\n.env.portool\n"
+        );
+    }
+
+    #[test]
+    fn update_exclude_skips_a_bare_user_added_line() {
+        let tmp = TempDir::new().unwrap();
+        let common_dir = tmp.path();
+        let path = exclude_path(common_dir);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "node_modules\n.env.portool\n").unwrap();
+
+        update_exclude(common_dir).unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            content, "node_modules\n.env.portool\n",
+            "already-present line means no managed pair is added"
+        );
+    }
+
+    #[test]
+    fn deinit_exclude_removes_only_the_managed_pair() {
+        let tmp = TempDir::new().unwrap();
+        let common_dir = tmp.path();
+        let path = exclude_path(common_dir);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            "node_modules\n# managed by portool\n.env.portool\nother.log\n",
+        )
+        .unwrap();
+
+        deinit_exclude(common_dir).unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "node_modules\nother.log\n");
+    }
+
+    #[test]
+    fn deinit_exclude_leaves_a_bare_user_added_line() {
+        let tmp = TempDir::new().unwrap();
+        let common_dir = tmp.path();
+        let path = exclude_path(common_dir);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "node_modules\n.env.portool\n").unwrap();
+
+        deinit_exclude(common_dir).unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            content, "node_modules\n.env.portool\n",
+            "a bare line the user added themselves must be left alone"
+        );
     }
 }

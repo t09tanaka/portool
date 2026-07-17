@@ -18,12 +18,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Install the post-checkout hook, update .gitignore, and run sync.
+    /// Install the post-checkout hook, update git's info/exclude, and run
+    /// sync.
     Init {
         /// Only install the post-checkout hook.
         #[arg(long, conflicts_with = "gitignore_only")]
         hook_only: bool,
-        /// Only append `.env.portool` to .gitignore.
+        /// Only add `.env.portool` to $GIT_COMMON_DIR/info/exclude.
         #[arg(long)]
         gitignore_only: bool,
     },
@@ -89,8 +90,16 @@ enum Command {
     },
     /// Free the current worktree's block and remove its `.env.portool`.
     Release,
-    /// Remove portool's hooks and `.gitignore` entry (reverses `init`).
-    Deinit,
+    /// Remove portool's lines from this repo's git hooks (and nothing else).
+    Unhook,
+    /// Release this project's allocations and remove portool's env files,
+    /// hooks, and ignore rule (full reverse of init).
+    Deinit {
+        /// Keep the ledger allocations and .env.portool files; only remove
+        /// hooks and the ignore rule.
+        #[arg(long)]
+        keep_allocations: bool,
+    },
 }
 
 fn main() {
@@ -133,7 +142,8 @@ fn main() {
             abandon_other_projects,
         } => cmd::doctor::run(repair, abandon_other_projects),
         Command::Release => cmd::release::run(),
-        Command::Deinit => cmd::init::deinit(),
+        Command::Unhook => cmd::init::unhook(),
+        Command::Deinit { keep_allocations } => cmd::init::deinit(keep_allocations),
     };
 
     if let Err(err) = result {

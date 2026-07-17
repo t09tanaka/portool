@@ -452,10 +452,10 @@ fn manifest_shrink_keeps_the_block_and_updates_only_env() {
     assert!(!env_file.contains("EXTRA_PORT"));
 }
 
-// --- 8. init: hook install, .gitignore, idempotency -----------------------
+// --- 8. init: hook install, info/exclude, idempotency ----------------------
 
 #[test]
-fn init_installs_hook_and_gitignore_and_is_idempotent() {
+fn init_installs_hook_and_exclude_and_is_idempotent() {
     let env = TestEnv::new();
     let repo = env.path("repo");
     init_repo(&repo);
@@ -495,11 +495,25 @@ fn init_installs_hook_and_gitignore_and_is_idempotent() {
         "post-merge hook must be executable"
     );
 
-    let gitignore_1 = fs::read_to_string(repo.join(".gitignore")).unwrap();
-    assert!(gitignore_1.lines().any(|l| l == ".env.portool"));
+    // Task 6: init no longer touches the tracked .gitignore -- it writes a
+    // managed pair to $GIT_COMMON_DIR/info/exclude instead.
+    assert!(
+        !repo.join(".gitignore").exists(),
+        "init must not create/modify the tracked .gitignore"
+    );
+    let exclude_1 = fs::read_to_string(repo.join(".git/info/exclude")).unwrap();
+    assert!(exclude_1.contains("# managed by portool"));
+    assert!(exclude_1.lines().any(|l| l == ".env.portool"));
 
     // init also runs sync once.
     assert!(repo.join(".env.portool").exists());
+
+    // .env.portool is actually ignored via info/exclude.
+    let status = git(&repo, &["status", "--porcelain"]);
+    assert!(
+        !String::from_utf8_lossy(&status.stdout).contains(".env.portool"),
+        ".env.portool must be ignored via info/exclude"
+    );
 
     // Second init must be a no-op on both files' contents.
     let output = env.run(&repo, &["init"]);
@@ -507,12 +521,12 @@ fn init_installs_hook_and_gitignore_and_is_idempotent() {
 
     let hook_content_2 = fs::read_to_string(&hook_path).unwrap();
     assert_eq!(hook_content_2, hook_content_1);
-    let gitignore_2 = fs::read_to_string(repo.join(".gitignore")).unwrap();
-    assert_eq!(gitignore_2, gitignore_1);
+    let exclude_2 = fs::read_to_string(repo.join(".git/info/exclude")).unwrap();
+    assert_eq!(exclude_2, exclude_1);
     assert_eq!(
-        gitignore_2.lines().filter(|l| *l == ".env.portool").count(),
+        exclude_2.lines().filter(|l| *l == ".env.portool").count(),
         1,
-        "the .gitignore line must not be duplicated"
+        "the info/exclude line must not be duplicated"
     );
 }
 
@@ -1609,27 +1623,105 @@ fn release_frees_the_block_and_removes_env_file() {
     assert!(!has_entry, "the worktree entry must be released");
 }
 
-/// `portool deinit` removes portool's hooks and the `.gitignore` entry.
+/// `portool deinit` releases all of this project's allocations, and removes
+/// portool's hooks, env files, and `info/exclude` entry.
 #[test]
-fn deinit_removes_hooks_and_gitignore_entry() {
+fn deinit_releases_allocations_removes_env_hooks_and_exclude() {
     let env = TestEnv::new();
-    let repo = env.path("repo");
+    env.write_config("range = [18000, 18099]\n");
+    let repo = env.path("app");
     init_repo(&repo);
     assert!(env.run(&repo, &["init"]).status.success());
-    assert!(repo.join(".git/hooks/post-checkout").exists());
-    assert!(repo.join(".git/hooks/post-merge").exists());
+    assert!(repo.join(".env.portool").exists());
 
-    assert!(env.run(&repo, &["deinit"]).status.success());
+    let out = env.run(&repo, &["deinit"]);
     assert!(
-        !repo.join(".git/hooks/post-checkout").exists(),
-        "portool's standalone post-checkout must be removed"
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
-    assert!(!repo.join(".git/hooks/post-merge").exists());
-    let gitignore = fs::read_to_string(repo.join(".gitignore")).unwrap_or_default();
+
     assert!(
-        !gitignore.lines().any(|l| l == ".env.portool"),
-        ".gitignore entry must be removed"
+        !repo.join(".env.portool").exists(),
+        "env file must be removed"
     );
+    let reg = env.registry();
+    assert!(
+        reg["projects"].as_object().unwrap().is_empty(),
+        "the project's allocations must be released"
+    );
+    let hook = fs::read_to_string(repo.join(".git/hooks/post-checkout")).ok();
+    assert!(
+        hook.is_none_or(|c| !c.contains("portool")),
+        "hooks must be gone"
+    );
+    let exclude = fs::read_to_string(repo.join(".git/info/exclude")).unwrap_or_default();
+    assert!(!exclude.contains(".env.portool"));
+}
+
+/// `portool deinit --keep-allocations` only removes hooks and the
+/// `info/exclude` entry -- the ledger and `.env.portool` are left alone.
+#[test]
+fn deinit_keep_allocations_leaves_the_ledger_alone() {
+    let env = TestEnv::new();
+    env.write_config("range = [18100, 18199]\n");
+    let repo = env.path("app");
+    init_repo(&repo);
+    assert!(env.run(&repo, &["init"]).status.success());
+
+    let out = env.run(&repo, &["deinit", "--keep-allocations"]);
+    assert!(out.status.success());
+    assert!(repo.join(".env.portool").exists());
+    assert!(!env.registry()["projects"].as_object().unwrap().is_empty());
+}
+
+/// `deinit` never edits a tracked `.gitignore`, even when it carries a bare
+/// `.env.portool` line (added by portool <= 0.6, or by hand) -- ownership of
+/// that line is unknowable, so it's only hinted about.
+#[test]
+fn deinit_never_edits_a_user_gitignore() {
+    let env = TestEnv::new();
+    let repo = env.path("app");
+    init_repo(&repo);
+    // A user-owned .gitignore that happens to carry the line (e.g. from
+    // portool <= 0.6, or hand-written).
+    fs::write(repo.join(".gitignore"), "node_modules\n.env.portool\n").unwrap();
+    assert!(env.run(&repo, &["init"]).status.success());
+
+    let out = env.run(&repo, &["deinit"]);
+    assert!(out.status.success());
+    assert_eq!(
+        fs::read_to_string(repo.join(".gitignore")).unwrap(),
+        "node_modules\n.env.portool\n",
+        ".gitignore must be byte-identical after deinit"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains(".gitignore")
+            || String::from_utf8_lossy(&out.stderr).contains(".gitignore"),
+        "must hint about the leftover line"
+    );
+}
+
+/// `portool unhook` removes only the hooks -- the ledger, env file, and
+/// `info/exclude` entry are all left in place.
+#[test]
+fn unhook_removes_hooks_but_keeps_everything_else() {
+    let env = TestEnv::new();
+    env.write_config("range = [18200, 18299]\n");
+    let repo = env.path("app");
+    init_repo(&repo);
+    assert!(env.run(&repo, &["init"]).status.success());
+
+    let out = env.run(&repo, &["unhook"]);
+    assert!(out.status.success());
+    assert!(!repo.join(".git/hooks/post-checkout").exists());
+    assert!(repo.join(".env.portool").exists(), "env kept");
+    assert!(
+        !env.registry()["projects"].as_object().unwrap().is_empty(),
+        "ledger kept"
+    );
+    let exclude = fs::read_to_string(repo.join(".git/info/exclude")).unwrap();
+    assert!(exclude.contains(".env.portool"), "exclude kept");
 }
 
 /// `portool doctor` rebuilds a ledger entry from a live worktree's
