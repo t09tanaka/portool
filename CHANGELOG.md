@@ -5,6 +5,97 @@ All notable changes to portool are documented here. The format is based on
 [Semantic Versioning](https://semver.org/) (pre-1.0: a breaking change bumps
 the minor version).
 
+## [0.7.0] - 2026-07-17
+
+The trust-contract items from the post-0.6.0 external review: `doctor
+--repair` becomes restore-first, `deinit` fully reverses `init`, the ignore
+rule moves off the tracked `.gitignore`, `ls --json` gets a stable
+envelope, and the manifest/config parsers close the remaining
+silently-wrong-defaults gaps. **No ledger schema change** (still v3); the
+breaking changes are all in command semantics and output shapes.
+
+### Breaking
+
+- **`doctor --repair` is restore-first**, not destructive. A corrupt
+  ledger is now restored from `registry.json.bak` (every project kept);
+  the old move-aside-and-start-empty behavior only happens with the new,
+  explicit `--repair --abandon-other-projects` flag (also the only path
+  used for an unsupported-version ledger written by a newer portool).
+- **`deinit` now releases the project's ledger allocations and removes its
+  `.env.portool` files** in addition to hooks and the ignore rule — pass
+  `--keep-allocations` for the old, hooks-and-ignore-only behavior. Hook
+  removal on its own is the new `portool unhook`.
+- **`init` writes the ignore rule to `$GIT_COMMON_DIR/info/exclude`**, not
+  the tracked `.gitignore` — shared by every linked worktree, never
+  committed. `init` no longer edits `.gitignore`; a leftover line from an
+  older portool only earns a hint. `--gitignore-only` keeps its name but
+  now updates `info/exclude`.
+- **`init` exits non-zero when no hook location is installable** (a
+  `core.hooksPath` pointing at a directory that doesn't exist, or an
+  absolute `core.hooksPath` in shared `global`/`system` git config scope)
+  instead of silently succeeding with no hook installed.
+- **`ls --json` emits a versioned format v1 envelope**
+  (`format_version`/`ok`/`registry_schema_version`/`effective_config`/
+  `allocations`/`reservations`, or `{"format_version":1,"ok":false,
+  "error":...}` on failure) instead of the raw ledger. `format_version`
+  will only ever gain fields on 1.x; a breaking shape change bumps it.
+- **Manifest parsing is fail-closed**: an empty `[ports]` table, an
+  unknown top-level field, or a `portool`/`portool_*` key is now a hard
+  `.portool.toml` error instead of silently producing a full-pool block or
+  a colliding env var.
+- **Config `gc_days` is deprecated and ignored** (with a warning if set) —
+  GC is condition-based (gone worktree directory + free ports), not
+  age-based; the field is gone from `Config` itself.
+- **Preferred block placement no longer special-cases `main`/`master`.**
+  Every branch, including `main`, now hashes `project + branch` to a
+  preferred slot; only a detached worktree falls back to hashing its path.
+
+### Added
+
+- **`registry.json.bak`** is refreshed on every ledger save — the backup
+  `doctor --repair` restores from.
+- **`reserve <PORT|START-END> [--label]` / `unreserve`** — permanent
+  reservations for ports portool must never hand out (e.g. a stopped
+  Postgres that a bind check alone would read as "free"). `unreserve`
+  matches a single port against its containing reservation; a range must
+  match exactly.
+- **`pin [--label]` / `unpin`** — exempt the current worktree's allocation
+  from every GC path until unpinned. Reservations and pinned worktrees now
+  show up in `portool ls`'s table footer and JSON output.
+- **`portool exec` no longer requires a `.portool.toml`** — with no
+  manifest it injects a single `block_align`-wide block as `PORT`, same as
+  `sync`.
+- **Hook scripts embed the absolute `portool` binary path** at install
+  time (`PORTOOL_BIN="..."`, falling back to a PATH lookup if that path
+  stops existing), so GUI git clients with a minimal `PATH` can still find
+  it. A foreign hook now gets a managed `# >>> portool >>> ... # <<<
+  portool <<<` block instead of a single appended line, so re-running
+  `init` can refresh it cleanly.
+- **`doctor` diagnoses hook effectiveness** as advisories: missing, not
+  executable, not invoking portool, or invoking a dead embedded path.
+- **`examples/webapp`** ships inside the published crate (`cargo package
+  --list` now includes it), so `cargo install portool` and `crates.io`
+  users get the same runnable example as the repo.
+
+### Changed / Fixed
+
+- **`prune --all` no longer treats a `git worktree list` failure as "no
+  worktrees".** A project whose worktree enumeration fails is skipped
+  (with a stderr message) and its entries are kept, instead of being
+  treated as fully stale and pruned away.
+- **`ls --json` reports the real configured range** (`effective_config`)
+  even when no ledger exists yet, instead of fabricating
+  `Config::default()`.
+- **Port derivation uses checked arithmetic**: `checked_add` instead of a
+  saturating add, with in-block validation, so a manifest offset that
+  would overflow `u16` is now a clean error instead of a silently wrapped
+  or truncated port.
+- **Implicit GC now runs before allocation** in `sync`, so a worktree
+  re-created on the same branch reclaims the block it just vacated instead
+  of being forced onto a different one.
+- **`envfile::variables` / `envfile::render` return `Result`** instead of
+  panicking or silently producing a partial environment on a bad manifest.
+
 ## [0.6.0] - 2026-07-17
 
 The design-change items from the post-0.5.0 external review: transactional
