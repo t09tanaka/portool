@@ -55,7 +55,7 @@ enum Command {
         check_ports: bool,
         /// Fail (exit 1) if the allocated block's ports are already in use
         /// (implies --check-ports).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "reallocate_on_conflict")]
         strict: bool,
         /// Move to a fresh block if the allocated block's ports are in use
         /// (implies --check-ports). DANGER: processes already running keep
