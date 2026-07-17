@@ -2167,6 +2167,88 @@ fn deinit_never_edits_a_user_gitignore() {
     );
 }
 
+/// P2 (external review,指摘8): a lost ledger must not leave `.env.portool`
+/// behind. `deinit` unions git's live worktree list with the ledger's
+/// recorded paths, so even with no `registry.json`/`.bak` at all it still
+/// finds and removes the env file via `git worktree list`.
+#[test]
+fn deinit_without_registry_removes_live_env_files() {
+    let env = TestEnv::new();
+    env.write_config("range = [19000, 19009]\n");
+    let repo = env.path("app");
+    init_repo(&repo);
+    assert!(env.run(&repo, &["init"]).status.success());
+    assert!(env.run(&repo, &["sync"]).status.success());
+    assert!(repo.join(".env.portool").exists());
+
+    fs::remove_file(env.registry_path()).unwrap();
+    fs::remove_file(env.state.join("portool").join("registry.json.bak")).unwrap();
+
+    let out = env.run(&repo, &["deinit"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !repo.join(".env.portool").exists(),
+        "env file must be removed even with no ledger at all"
+    );
+}
+
+/// A linked worktree's entry can go missing from the ledger (e.g. hand-
+/// edited, or a prior partial failure) while its `.env.portool` still sits
+/// on disk. `deinit` must still find and remove it via the live worktree
+/// union, alongside the worktree that IS still tracked in the ledger.
+#[test]
+fn deinit_removes_env_files_missing_from_registry() {
+    let env = TestEnv::new();
+    env.write_config("range = [19010, 19029]\n");
+    let repo = env.path("app");
+    init_repo(&repo);
+    assert!(env.run(&repo, &["init"]).status.success());
+    assert!(env.run(&repo, &["sync"]).status.success());
+    assert!(repo.join(".env.portool").exists());
+
+    let wt = env.path("app-wt");
+    git(&repo, &["branch", "feature-x"]);
+    git(
+        &repo,
+        &["worktree", "add", wt.to_str().unwrap(), "feature-x"],
+    );
+    assert!(env.run(&wt, &["sync"]).status.success());
+    assert!(wt.join(".env.portool").exists());
+
+    // Hand-remove just the linked worktree's ledger entry, simulating a
+    // lost/corrupted-and-partially-repaired entry -- its env file is still
+    // on disk and git still reports it as a live worktree.
+    let mut registry = env.registry();
+    registry["projects"][common_dir_key(&repo)]["worktrees"]
+        .as_object_mut()
+        .unwrap()
+        .remove(&worktree_key(&wt));
+    fs::write(
+        env.registry_path(),
+        serde_json::to_vec_pretty(&registry).unwrap(),
+    )
+    .unwrap();
+
+    let out = env.run(&repo, &["deinit"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !repo.join(".env.portool").exists(),
+        "the main worktree's env file (still in the ledger) must be removed"
+    );
+    assert!(
+        !wt.join(".env.portool").exists(),
+        "the linked worktree's env file (missing from the ledger) must be removed too"
+    );
+}
+
 /// `portool unhook` removes only the hooks -- the ledger, env file, and
 /// `info/exclude` entry are all left in place.
 #[test]

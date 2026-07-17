@@ -384,25 +384,35 @@ pub fn deinit(keep_allocations: bool) -> Result<()> {
     if !keep_allocations {
         let _lock = lock::acquire(&paths::lock_path()?, Duration::from_secs(10))?;
         let registry_path = paths::registry_path()?;
-        if let Some(mut registry) = store::load_strict(&registry_path)? {
+        let mut registry_opt = store::load_strict(&registry_path)?;
+
+        // Union of the ledger's recorded paths and the live worktrees git
+        // reports: the env files exist on disk regardless of ledger state,
+        // so a lost ledger must not leave them behind (README: full deinit
+        // removes every worktree's .env.portool).
+        let mut env_dirs: std::collections::BTreeSet<PathBuf> =
+            ctx.worktree_list()?.into_iter().collect();
+        if let Some(registry) = &registry_opt {
             if let Some(project) = registry.find_project(&common_dir_key) {
-                // Env files first, ledger second (same ordering rationale as
-                // `release`): a failed removal keeps the block reserved.
-                for path in project.worktrees.keys() {
-                    let env_path = Path::new(path).join(".env.portool");
-                    match fs::remove_file(&env_path) {
-                        Ok(()) => {}
-                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(err) => {
-                            return Err(Error::General(format!(
-                                "failed to remove {}: {err}; no allocations were released",
-                                env_path.display()
-                            )))
-                        }
-                    }
+                env_dirs.extend(project.worktrees.keys().map(PathBuf::from));
+            }
+        }
+        for dir in &env_dirs {
+            let env_path = dir.join(".env.portool");
+            match fs::remove_file(&env_path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(Error::General(format!(
+                        "failed to remove {}: {err}; no allocations were released",
+                        env_path.display()
+                    )))
                 }
-                registry.projects.remove(&common_dir_key);
-                store::save(&registry_path, &registry)?;
+            }
+        }
+        if let Some(registry) = &mut registry_opt {
+            if registry.projects.remove(&common_dir_key).is_some() {
+                store::save(&registry_path, registry)?;
                 println!("portool: released all of this project's allocations");
             }
         }
