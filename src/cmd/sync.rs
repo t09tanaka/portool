@@ -230,15 +230,41 @@ fn slow_path(ctx: &GitCtx, config: &Config, quiet: bool) -> Result<SyncOutcome> 
                 // keep it in place and only refresh the hash + env file.
                 entry.block
             } else {
-                allocate_or_reuse_block(
+                let mut bind_ok = |block: (u16, u16)| ports::block_free(block);
+                if let Some(grown) = try_grow_in_place(
                     &registry,
+                    entry.block,
                     block_size,
-                    config,
-                    &common_dir_key,
-                    ctx.branch.as_deref(),
-                    &worktree_key,
-                    Some(entry.block),
-                )?
+                    config.range.1,
+                    &mut bind_ok,
+                ) {
+                    grown
+                } else {
+                    // In-place growth is impossible, so satisfying the
+                    // manifest means moving. Moving while something is
+                    // still listening on the current block would split the
+                    // worktree across old and new ports (external review
+                    // 3rd round P1-1): refuse and ask for an explicit
+                    // action instead.
+                    if !ports::block_free(entry.block) {
+                        return Err(Error::General(format!(
+                            "the manifest now needs {} ports but block {}-{} cannot \
+                             grow in place, and something is still listening on it; \
+                             stop those processes and re-run 'portool sync', or run \
+                             'portool reallocate' to move this worktree explicitly",
+                            block_size, entry.block.0, entry.block.1
+                        )));
+                    }
+                    allocate_or_reuse_block(
+                        &registry,
+                        block_size,
+                        config,
+                        &common_dir_key,
+                        ctx.branch.as_deref(),
+                        &worktree_key,
+                        Some(entry.block),
+                    )?
+                }
             }
         }
         Some(entry) => entry.block,
@@ -274,8 +300,11 @@ fn slow_path(ctx: &GitCtx, config: &Config, quiet: bool) -> Result<SyncOutcome> 
             .expect("existing_entry implies the entry exists");
         entry.pending_block = Some(final_block);
         store::save(&registry_path, &registry)?;
+        crate::fault::point("after_pending_save");
 
+        crate::fault::point("before_env_write");
         store::write_atomic(&ctx.worktree_root.join(".env.portool"), rendered.as_bytes())?;
+        crate::fault::point("after_env_write");
     }
 
     {
@@ -375,6 +404,45 @@ fn allocate_or_reuse_block(
     .ok_or(Error::PoolExhausted)
 }
 
+/// Tries to widen `current` in place to `new_size` ports, keeping its start
+/// (external review 3rd round P1-1: the preferred-slot hash shifts when the
+/// block size changes, so the general allocator tends to move a growing
+/// worktree even when its own block could simply be extended). The
+/// extension must stay inside the pool and clear of every *other* block or
+/// reservation; only the newly added tail ports are bind-checked -- the
+/// current block's ports are expected to be in use by this worktree's own
+/// processes.
+fn try_grow_in_place(
+    registry: &Registry,
+    current: (u16, u16),
+    new_size: u16,
+    pool_end: u16,
+    bind_ok: &mut dyn FnMut((u16, u16)) -> bool,
+) -> Option<(u16, u16)> {
+    let end = u32::from(current.0) + u32::from(new_size) - 1;
+    if end > u32::from(pool_end) {
+        return None;
+    }
+    let candidate = (current.0, end as u16);
+    let occupied: Vec<(u16, u16)> = registry
+        .all_blocks()
+        .into_iter()
+        .filter(|&b| b != current)
+        .collect();
+    if occupied
+        .iter()
+        .any(|&o| crate::registry::overlaps(o, candidate))
+    {
+        return None;
+    }
+    // new_size > current width, so the tail start never overflows past end.
+    let tail = (current.1 + 1, candidate.1);
+    if !bind_ok(tail) {
+        return None;
+    }
+    Some(candidate)
+}
+
 /// `portool reallocate`: discovers the current worktree and forces it onto a
 /// fresh block.
 pub fn reallocate_cmd(quiet: bool) -> Result<()> {
@@ -457,8 +525,11 @@ pub fn reallocate(ctx: &GitCtx, quiet: bool) -> Result<SyncOutcome> {
         entry.pending_block = Some(new_block);
     }
     store::save(&registry_path, &registry)?;
+    crate::fault::point("after_pending_save");
 
+    crate::fault::point("before_env_write");
     store::write_atomic(&ctx.worktree_root.join(".env.portool"), rendered.as_bytes())?;
+    crate::fault::point("after_env_write");
 
     let now = now_local();
     {
@@ -648,5 +719,66 @@ mod tests {
         );
 
         assert!(matches!(result, Err(Error::PoolExhausted)));
+    }
+
+    /// External review 3rd round P1-1: a manifest that outgrows its block must
+    /// first try extending the current block in place.
+    #[test]
+    fn try_grow_in_place_extends_keeping_the_start() {
+        let registry = Registry::empty((3000, 3999));
+        let mut bind_ok = |_b: (u16, u16)| true;
+        assert_eq!(
+            try_grow_in_place(&registry, (3000, 3004), 10, 3999, &mut bind_ok),
+            Some((3000, 3009))
+        );
+    }
+
+    #[test]
+    fn try_grow_in_place_fails_when_a_neighbor_occupies_the_extension() {
+        let mut registry = Registry::empty((3000, 3999));
+        registry.reservations.push(Reservation {
+            block: (3005, 3009),
+            label: None,
+            pinned: true,
+        });
+        let mut bind_ok = |_b: (u16, u16)| true;
+        assert_eq!(
+            try_grow_in_place(&registry, (3000, 3004), 10, 3999, &mut bind_ok),
+            None
+        );
+    }
+
+    #[test]
+    fn try_grow_in_place_fails_when_the_pool_ends() {
+        let registry = Registry::empty((3000, 3009));
+        let mut bind_ok = |_b: (u16, u16)| true;
+        assert_eq!(
+            try_grow_in_place(&registry, (3005, 3009), 10, 3009, &mut bind_ok),
+            None
+        );
+    }
+
+    /// Only the newly added tail is bind-checked: the current block's ports are
+    /// expected to be in use by this worktree's own processes.
+    #[test]
+    fn try_grow_in_place_bind_checks_only_the_added_tail() {
+        let registry = Registry::empty((3000, 3999));
+        let mut checked = Vec::new();
+        let mut bind_ok = |b: (u16, u16)| {
+            checked.push(b);
+            true
+        };
+        try_grow_in_place(&registry, (3000, 3004), 10, 3999, &mut bind_ok);
+        assert_eq!(checked, vec![(3005, 3009)]);
+    }
+
+    #[test]
+    fn try_grow_in_place_fails_when_the_tail_is_bound() {
+        let registry = Registry::empty((3000, 3999));
+        let mut bind_ok = |_b: (u16, u16)| false;
+        assert_eq!(
+            try_grow_in_place(&registry, (3000, 3004), 10, 3999, &mut bind_ok),
+            None
+        );
     }
 }

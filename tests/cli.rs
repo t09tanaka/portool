@@ -2958,3 +2958,108 @@ fn pin_without_allocation_is_an_error() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("sync"));
 }
+
+/// Rewrites the ledger so `repo`'s worktree block is exactly `block`,
+/// making grow/move scenarios deterministic despite hash-based placement.
+fn pin_block(env: &TestEnv, repo: &Path, block: (u16, u16)) {
+    let mut reg: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(env.registry_path()).unwrap()).unwrap();
+    reg["projects"][common_dir_key(repo)]["worktrees"][worktree_key(repo)]["block"] =
+        serde_json::json!([block.0, block.1]);
+    fs::write(env.registry_path(), serde_json::to_string(&reg).unwrap()).unwrap();
+}
+
+/// The (start, end) block of `repo`'s worktree entry in the registry.
+fn block_of(env: &TestEnv, repo: &Path) -> (u16, u16) {
+    let block = env.registry()["projects"][common_dir_key(repo)]["worktrees"][worktree_key(repo)]
+        ["block"]
+        .clone();
+    (
+        block[0].as_u64().unwrap() as u16,
+        block[1].as_u64().unwrap() as u16,
+    )
+}
+
+/// External review 3rd round P1-1: growing the manifest extends the current
+/// block in place instead of hopping to a new hash-preferred slot.
+#[test]
+fn sync_grows_the_block_in_place_when_the_manifest_expands() {
+    let env = TestEnv::new();
+    env.write_config("range = [18900, 18919]\n");
+    let repo = env.path("grow");
+    init_repo(&repo);
+    assert!(env.run(&repo, &["sync"]).status.success());
+    pin_block(&env, &repo, (18900, 18904));
+
+    // Grow to 10 ports (offset 9) -- must extend in place, keeping 18900.
+    fs::write(repo.join(".portool.toml"), "[ports]\nweb = 0\nworker = 9\n").unwrap();
+    let out = env.run(&repo, &["sync"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        block_of(&env, &repo),
+        (18900, 18909),
+        "in-place growth keeps the block start"
+    );
+}
+
+/// When the extension is blocked by a neighbor and nothing is listening on
+/// the current block, sync falls back to a clean move.
+#[test]
+fn sync_moves_when_growth_is_blocked_and_the_block_is_idle() {
+    let env = TestEnv::new();
+    env.write_config("range = [18920, 18939]\n");
+    let repo = env.path("blocked");
+    init_repo(&repo);
+    assert!(env.run(&repo, &["sync"]).status.success());
+    pin_block(&env, &repo, (18920, 18924));
+    // 18925-18929 を予約して in-place 拡張を塞ぐ。
+    assert!(env.run(&repo, &["reserve", "18925-18929"]).status.success());
+
+    fs::write(repo.join(".portool.toml"), "[ports]\nweb = 0\nworker = 9\n").unwrap();
+    let out = env.run(&repo, &["sync"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // 10-wide, 5-aligned candidates: 18920 (reservation overlap), 18925
+    // (overlap), 18930 -- the only clean landing spot.
+    assert_eq!(
+        block_of(&env, &repo),
+        (18930, 18939),
+        "blocked growth falls back to a move"
+    );
+}
+
+/// Moving with a live listener on the current block is refused with an
+/// actionable error (user decision: refuse + explicit action).
+#[test]
+fn sync_refuses_to_move_while_the_current_block_is_in_use() {
+    let env = TestEnv::new();
+    env.write_config("range = [18940, 18959]\n");
+    let repo = env.path("busy");
+    init_repo(&repo);
+    assert!(env.run(&repo, &["sync"]).status.success());
+    pin_block(&env, &repo, (18940, 18944));
+    assert!(env.run(&repo, &["reserve", "18945-18949"]).status.success());
+    // 現 block の先頭ポートで listener を立てて「稼働中」を再現。
+    let _listener = std::net::TcpListener::bind(("127.0.0.1", 18940)).unwrap();
+
+    fs::write(repo.join(".portool.toml"), "[ports]\nweb = 0\nworker = 9\n").unwrap();
+    let out = env.run(&repo, &["sync"]);
+    assert!(!out.status.success(), "must refuse the implicit move");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("portool reallocate"),
+        "must name the explicit way out: {stderr}"
+    );
+    assert_eq!(
+        block_of(&env, &repo),
+        (18940, 18944),
+        "the ledger must be unchanged after a refusal"
+    );
+}
