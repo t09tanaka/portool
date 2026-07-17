@@ -227,12 +227,16 @@ struct Row {
     branch: String,
     block: String,
     status: String,
+    label: String,
 }
 
 /// Frozen decision 11: `PROJECT WORKTREE BRANCH BLOCK STATUS`, two spaces
 /// between columns, columns left-justified to the widest cell (header
-/// included). Reservations are global, so they're printed (Task 9) after
-/// the table whenever any exist, regardless of the `--all` filter.
+/// included). `LABEL` is appended as the last column (Task 9, external
+/// review indication 10) -- the STATUS..BLOCK column order above is a
+/// frozen decision and must not be reordered. Reservations are global, so
+/// they're printed (Task 9) after the table whenever any exist, regardless
+/// of the `--all` filter.
 fn print_table(projects: &BTreeMap<String, ProjectEntry>, reservations: &[Reservation]) {
     let home = std::env::var("HOME").ok().filter(|h| !h.is_empty());
 
@@ -252,6 +256,7 @@ fn print_table(projects: &BTreeMap<String, ProjectEntry>, reservations: &[Reserv
                 branch: crate::display::sanitize(worktree.branch.as_deref().unwrap_or("-")),
                 block: format!("{}-{}", worktree.block.0, worktree.block.1),
                 status: status.to_string(),
+                label: crate::display::sanitize(worktree.label.as_deref().unwrap_or("-")),
             });
         }
     }
@@ -263,16 +268,18 @@ fn print_table(projects: &BTreeMap<String, ProjectEntry>, reservations: &[Reserv
         branch: "BRANCH".to_string(),
         block: "BLOCK".to_string(),
         status: "STATUS".to_string(),
+        label: "LABEL".to_string(),
     };
 
     let w_project = column_width(&rows, &header, |r| &r.project);
     let w_worktree = column_width(&rows, &header, |r| &r.worktree);
     let w_branch = column_width(&rows, &header, |r| &r.branch);
     let w_block = column_width(&rows, &header, |r| &r.block);
+    let w_status = column_width(&rows, &header, |r| &r.status);
 
-    print_row(&header, w_project, w_worktree, w_branch, w_block);
+    print_row(&header, w_project, w_worktree, w_branch, w_block, w_status);
     for row in &rows {
-        print_row(row, w_project, w_worktree, w_branch, w_block);
+        print_row(row, w_project, w_worktree, w_branch, w_block, w_status);
     }
 
     if !reservations.is_empty() {
@@ -296,15 +303,23 @@ fn column_width(rows: &[Row], header: &Row, get: impl Fn(&Row) -> &String) -> us
         .unwrap_or(0)
 }
 
-fn print_row(row: &Row, w_project: usize, w_worktree: usize, w_branch: usize, w_block: usize) {
+fn print_row(
+    row: &Row,
+    w_project: usize,
+    w_worktree: usize,
+    w_branch: usize,
+    w_block: usize,
+    w_status: usize,
+) {
     use crate::display::pad;
     println!(
-        "{}  {}  {}  {}  {}",
+        "{}  {}  {}  {}  {}  {}",
         pad(&row.project, w_project),
         pad(&row.worktree, w_worktree),
         pad(&row.branch, w_branch),
         pad(&row.block, w_block),
-        row.status,
+        pad(&row.status, w_status),
+        row.label,
     );
 }
 

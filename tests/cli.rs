@@ -1193,7 +1193,7 @@ fn ls_table_and_json_shapes() {
     let header = lines.next().unwrap();
     assert_eq!(
         header.split_whitespace().collect::<Vec<_>>(),
-        vec!["PROJECT", "WORKTREE", "BRANCH", "BLOCK", "STATUS"]
+        vec!["PROJECT", "WORKTREE", "BRANCH", "BLOCK", "STATUS", "LABEL"]
     );
     let data_lines: Vec<&str> = lines.collect();
     assert_eq!(data_lines.len(), 1, "only repo-a's row should be shown");
@@ -3434,11 +3434,43 @@ fn pin_protects_a_stale_entry_from_prune() {
         .unwrap());
 }
 
-/// `unpin` clears `pinned` but keeps the label (only `pin --label`
-/// overwrites it). Runs from a live worktree, since `unpin` discovers the
-/// current worktree via git.
+/// External review P2 (indication 10): `pin --label` claims (help + README)
+/// the label shows up in `ls`, but the human table had no LABEL column.
+/// This asserts the header includes `LABEL` and the labeled row shows it.
 #[test]
-fn pin_then_unpin_clears_pinned_and_keeps_label() {
+fn human_ls_displays_pin_label() {
+    let env = TestEnv::new();
+    env.write_config("range = [18810, 18819]\n");
+    let repo = env.path("app");
+    init_repo(&repo);
+    assert!(env.run(&repo, &["sync"]).status.success());
+    assert!(env
+        .run(&repo, &["pin", "--label", "webapp"])
+        .status
+        .success());
+
+    let output = env.run(&repo, &["ls"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = stdout.lines();
+    let header = lines.next().unwrap();
+    assert_eq!(
+        header.split_whitespace().collect::<Vec<_>>(),
+        vec!["PROJECT", "WORKTREE", "BRANCH", "BLOCK", "STATUS", "LABEL"]
+    );
+    let data_line = lines.next().unwrap();
+    assert!(
+        data_line.contains("webapp"),
+        "labeled row must show the label in the human table, got: {data_line}"
+    );
+}
+
+/// A label's lifetime is the pin's lifetime (external review P2, indication
+/// 10): `unpin` must clear the label so a later label-less `pin` cannot
+/// resurrect a stale name. Runs from a live worktree, since `unpin`
+/// discovers the current worktree via git.
+#[test]
+fn unpin_clears_label() {
     let env = TestEnv::new();
     env.write_config("range = [18800, 18809]\n");
     let repo = env.path("app");
@@ -3478,8 +3510,8 @@ fn pin_then_unpin_clears_pinned_and_keeps_label() {
     assert_eq!(unpinned["pinned"], serde_json::json!(false));
     assert_eq!(
         unpinned["label"],
-        serde_json::json!("keep-me"),
-        "unpin must clear pinned but keep the label"
+        serde_json::json!(null),
+        "unpin must clear the label so a later label-less pin can't resurrect it"
     );
 }
 
