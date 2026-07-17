@@ -665,14 +665,97 @@ fn init_with_custom_hookspath_appends_to_existing_hook() {
 
     let content = fs::read_to_string(repo.join("ci-hooks/post-checkout")).unwrap();
     assert!(
-        content.starts_with("#!/bin/sh\necho existing\n"),
-        "the pre-existing hook body must be preserved"
+        content.starts_with("#!/bin/sh\n# >>> portool >>>\n"),
+        "the managed block must be inserted right after the shebang, not appended at EOF, got: {content}"
+    );
+    assert!(
+        content.ends_with("echo existing\n"),
+        "the pre-existing hook body must be preserved, got: {content}"
     );
     assert!(portool::hooks::contains_portool_invocation(&content));
     assert_eq!(
         content.matches(portool::hooks::HOOK_BLOCK_BEGIN).count(),
         1,
         "re-running init must not duplicate the managed block"
+    );
+}
+
+/// Regression (external review): a pre-existing hook ending in a top-level
+/// `exit 0` used to swallow portool's block, since it was appended at EOF --
+/// unreachable code after the `exit`. The block must be inserted right after
+/// the shebang instead, so it still runs.
+#[test]
+fn existing_hook_exit_before_managed_block_regression() {
+    let env = TestEnv::new();
+    let repo = env.path("app");
+    init_repo(&repo);
+    let hooks_dir = repo.join(".git/hooks");
+    fs::create_dir_all(&hooks_dir).unwrap();
+    fs::write(hooks_dir.join("post-checkout"), "#!/bin/sh\nexit 0\n").unwrap();
+
+    assert!(env.run(&repo, &["init"]).status.success());
+
+    let content = fs::read_to_string(hooks_dir.join("post-checkout")).unwrap();
+    let block_pos = content
+        .find(portool::hooks::HOOK_BLOCK_BEGIN)
+        .expect("managed block must be present");
+    let exit_pos = content
+        .find("exit 0")
+        .expect("the original 'exit 0' must be preserved");
+    assert!(
+        block_pos < exit_pos,
+        "the managed block must sit before the pre-existing 'exit 0', got: {content}"
+    );
+
+    // The hook must actually fire despite the trailing 'exit 0': remove
+    // .env.portool, then let a real `git checkout` re-run the hook.
+    fs::remove_file(repo.join(".env.portool")).unwrap();
+    let output = git_with_portool(&env, &repo, &["checkout", "-q", "-b", "feature"]);
+    assert!(output.status.success());
+    assert!(
+        repo.join(".env.portool").exists(),
+        "sync must have run via the post-checkout hook"
+    );
+}
+
+/// External review: a hook location that resolves to a symlink means
+/// nothing was actually installed there; `init` must not exit 0 as if it had
+/// succeeded, even though the exclude update and `sync` already ran.
+#[test]
+fn init_exits_nonzero_when_hook_cannot_be_installed() {
+    let env = TestEnv::new();
+    let repo = env.path("app");
+    init_repo(&repo);
+    let hooks_dir = repo.join(".git/hooks");
+    fs::create_dir_all(&hooks_dir).unwrap();
+    std::os::unix::fs::symlink("/nonexistent", hooks_dir.join("post-checkout")).unwrap();
+
+    let out = env.run(&repo, &["init"]);
+    assert!(
+        !out.status.success(),
+        "init must fail when the post-checkout hook could not be installed"
+    );
+    assert!(
+        repo.join(".env.portool").exists(),
+        "the exclude update and sync must still have run before the hook failure is reported"
+    );
+}
+
+/// External review: a hook that can't be read (e.g. non-UTF-8 content) used
+/// to make `unhook` silently do nothing while still exiting 0.
+#[test]
+fn unhook_unreadable_hook_exits_nonzero() {
+    let env = TestEnv::new();
+    let repo = env.path("app");
+    init_repo(&repo);
+    assert!(env.run(&repo, &["init"]).status.success());
+
+    fs::write(repo.join(".git/hooks/post-checkout"), [0xFF, 0xFE]).unwrap();
+
+    let out = env.run(&repo, &["unhook"]);
+    assert!(
+        !out.status.success(),
+        "unhook must fail when a hook can't be read, not silently succeed while doing nothing"
     );
 }
 
