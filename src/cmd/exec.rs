@@ -11,6 +11,7 @@ use crate::envread::{self, Entry, FileValue};
 use crate::error::{Error, Result};
 use crate::gitctx::GitCtx;
 use crate::identity;
+use crate::ports;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -18,7 +19,16 @@ use std::path::PathBuf;
 /// Runs `portool exec`. On success this never returns: the process image
 /// is replaced by `command`. Any failure — sync, env construction, or the
 /// exec itself — happens before the child runs (spec §5, §10).
-pub fn run(env_files: &[PathBuf], command: &[OsString]) -> Result<()> {
+///
+/// `strict` turns the execution-boundary bind conflict (batch C #1) into a
+/// hard failure; `reallocate_on_conflict` moves the worktree to a fresh
+/// block instead of warning. Both default off.
+pub fn run(
+    env_files: &[PathBuf],
+    command: &[OsString],
+    strict: bool,
+    reallocate_on_conflict: bool,
+) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let ctx = GitCtx::discover(&cwd)?;
 
@@ -33,6 +43,30 @@ pub fn run(env_files: &[PathBuf], command: &[OsString]) -> Result<()> {
 
     // Spec §5 step 3: sync first; if it fails the child is never started.
     let outcome = sync::ensure(&ctx, true)?;
+
+    // Batch C #1: exec is the execution boundary -- the one place worth
+    // verifying the block's ports are actually free right now. A conflict
+    // here may just be this worktree's own already-running server, so the
+    // default is a neutral advisory, not a failure or a silent move.
+    let outcome = if ports::block_free(outcome.block) {
+        outcome
+    } else if reallocate_on_conflict {
+        sync::reallocate(&ctx, true)?
+    } else {
+        eprintln!(
+            "portool: ports {}-{} are in use -- this may be this worktree's own running \
+             processes (pass --reallocate-on-conflict to move, --strict to fail)",
+            outcome.block.0, outcome.block.1
+        );
+        if strict {
+            return Err(Error::General(format!(
+                "ports {}-{} are in use and --strict was given",
+                outcome.block.0, outcome.block.1
+            )));
+        }
+        outcome
+    };
+
     let portool_vars = envfile::variables(
         outcome.block,
         outcome.manifest.as_ref(),

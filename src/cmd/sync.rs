@@ -20,10 +20,6 @@ use std::time::Duration;
 
 const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The chosen block for a worktree, plus its project's (possibly grown)
-/// subranges list.
-type BlockAllocation = ((u16, u16), Vec<(u16, u16)>);
-
 /// The result of a successful sync: the worktree's block and its parsed
 /// manifest (if any), for callers that need the allocated values.
 pub struct SyncOutcome {
@@ -164,39 +160,33 @@ fn slow_path(ctx: &GitCtx, quiet: bool) -> Result<SyncOutcome> {
         .and_then(|p| p.worktrees.get(&worktree_key))
         .cloned();
 
-    let (final_block, updated_subranges) = match &existing_entry {
-        None => {
-            let (block, subs) = allocate_or_reuse_block(
-                &registry,
-                &common_dir_key,
-                block_size,
-                ctx.branch.as_deref(),
-                &worktree_key,
-                &config,
-                None,
-            )?;
-            (block, Some(subs))
-        }
+    let final_block = match &existing_entry {
+        None => allocate_or_reuse_block(
+            &registry,
+            block_size,
+            &config,
+            ctx.branch.as_deref(),
+            &worktree_key,
+            None,
+        )?,
         Some(entry) if entry.manifest_hash != manifest_state.hash => {
             let current_width = u32::from(entry.block.1) - u32::from(entry.block.0) + 1;
             if u32::from(block_size) <= current_width {
                 // Spec §6.4: the new size still fits the existing block;
                 // keep it in place and only refresh the hash + env file.
-                (entry.block, None)
+                entry.block
             } else {
-                let (block, subs) = allocate_or_reuse_block(
+                allocate_or_reuse_block(
                     &registry,
-                    &common_dir_key,
                     block_size,
+                    &config,
                     ctx.branch.as_deref(),
                     &worktree_key,
-                    &config,
                     Some(entry.block),
-                )?;
-                (block, Some(subs))
+                )?
             }
         }
-        Some(entry) => (entry.block, None),
+        Some(entry) => entry.block,
     };
 
     let now = now_local();
@@ -207,12 +197,8 @@ fn slow_path(ctx: &GitCtx, quiet: bool) -> Result<SyncOutcome> {
             .entry(common_dir_key.clone())
             .or_insert_with(|| ProjectEntry {
                 name: project_name,
-                subranges: Vec::new(),
                 worktrees: std::collections::BTreeMap::new(),
             });
-        if let Some(subs) = updated_subranges {
-            project.subranges = subs;
-        }
 
         let entry = project
             .worktrees
@@ -276,70 +262,136 @@ fn slow_path(ctx: &GitCtx, quiet: bool) -> Result<SyncOutcome> {
     })
 }
 
-/// Finds a block for this worktree within `registry`'s current state
-/// (spec §6.2-6.4, frozen decisions 3-5). `existing_block`, if given, is
-/// excluded from the occupied set so a worktree being reallocated may
-/// resettle into its own freed slot.
-///
-/// Returns the chosen block and the project's (possibly grown) subranges
-/// list; the caller is responsible for writing both back into the
-/// registry.
-#[allow(clippy::too_many_arguments)]
+/// Finds a block for this worktree directly from the configured pool
+/// (hardening batch C). `existing_block`, if given, is excluded from the
+/// occupied set so a worktree being reallocated may resettle into its own
+/// freed slot. Errors with [`Error::PoolExhausted`] when the pool has no
+/// free, bindable, `block_size`-wide slot left.
 fn allocate_or_reuse_block(
     registry: &Registry,
-    common_dir_key: &str,
     block_size: u16,
+    config: &Config,
     branch: Option<&str>,
     worktree_key: &str,
-    config: &Config,
     existing_block: Option<(u16, u16)>,
-) -> Result<BlockAllocation> {
-    let mut subranges: Vec<(u16, u16)> = registry
-        .find_project(common_dir_key)
-        .map(|p| p.subranges.clone())
-        .unwrap_or_default();
-    // Spec §6.2: a newly acquired subrange must avoid both existing
-    // subranges and reservations.
-    let mut global_subranges = registry.all_subranges();
-    global_subranges.extend(registry.reservations.iter().map(|r| r.block));
-
+) -> Result<(u16, u16)> {
     let occupied: Vec<(u16, u16)> = registry
         .all_blocks()
         .into_iter()
         .filter(|&b| Some(b) != existing_block)
         .collect();
 
-    loop {
-        let mut bind_ok = |block: (u16, u16)| ports::block_free(block);
-        if let Some(block) = alloc::allocate_block(
-            &subranges,
-            block_size,
-            branch,
-            worktree_key,
-            &occupied,
-            &mut bind_ok,
-        ) {
-            return Ok((block, subranges));
-        }
+    let mut bind_ok = |block: (u16, u16)| ports::block_free(block);
+    alloc::allocate_block(
+        config.range,
+        block_size,
+        config.block_align,
+        branch,
+        worktree_key,
+        &occupied,
+        &mut bind_ok,
+    )
+    .ok_or(Error::PoolExhausted)
+}
 
-        if block_size > config.subrange_size {
-            // Frozen decision 4 (spec §12: config changes affect only new
-            // acquisitions): the project's existing subranges -- possibly
-            // wider than the current config -- were already tried above.
-            // Acquiring a NEW subrange can never help here, since it would
-            // be capped at the configured width, so stop before looping
-            // forever.
-            return Err(Error::SubrangeExhausted);
-        }
+/// `portool reallocate`: discovers the current worktree and forces it onto a
+/// fresh block.
+pub fn reallocate_cmd(quiet: bool) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let ctx = GitCtx::discover(&cwd)?;
+    reallocate(&ctx, quiet).map(|_| ())
+}
 
-        match alloc::find_free_subrange(config.range, &global_subranges, config.subrange_size) {
-            Some(new_subrange) => {
-                subranges.push(new_subrange);
-                global_subranges.push(new_subrange);
-            }
-            None => return Err(Error::PoolExhausted),
-        }
+/// Forces `ctx`'s worktree onto a fresh free+bindable block, excluding its
+/// current one, and rewrites `.env.portool` (hardening batch C #1). Errors if
+/// the worktree has no ledger entry yet (run `sync` first). Its own current
+/// block stays eligible, so with no conflict it may keep it; the point is to
+/// escape a block whose ports something else now holds.
+pub fn reallocate(ctx: &GitCtx, quiet: bool) -> Result<SyncOutcome> {
+    let _lock = lock::acquire(&paths::lock_path()?, LOCK_TIMEOUT)?;
+
+    let registry_path = paths::registry_path()?;
+    let load_result = store::load(&registry_path, true);
+    if load_result.read_error {
+        return Err(Error::General(format!(
+            "failed to read {}; aborting without writing to avoid clobbering an intact ledger",
+            registry_path.display()
+        )));
     }
+    let mut registry = load_result.registry;
+    let config = Config::load()?;
+
+    let common_dir_key = key(&ctx.common_dir);
+    let worktree_key = key(&ctx.worktree_root);
+
+    let existing = registry
+        .find_project(&common_dir_key)
+        .and_then(|p| p.worktrees.get(&worktree_key))
+        .cloned()
+        .ok_or_else(|| {
+            Error::General(format!(
+                "{} has no allocated block yet; run 'portool sync' first",
+                ctx.worktree_root.display()
+            ))
+        })?;
+
+    let manifest_state = load_manifest_state(&ctx.worktree_root)?;
+    let block_size = manifest_state
+        .manifest
+        .as_ref()
+        .map(|m| m.block_size(config.block_align))
+        .unwrap_or_else(|| default_block_size(config.block_align));
+
+    let new_block = allocate_or_reuse_block(
+        &registry,
+        block_size,
+        &config,
+        ctx.branch.as_deref(),
+        &worktree_key,
+        Some(existing.block),
+    )?;
+
+    let now = now_local();
+    {
+        let project = registry
+            .projects
+            .get_mut(&common_dir_key)
+            .expect("entry existed above");
+        let entry = project
+            .worktrees
+            .get_mut(&worktree_key)
+            .expect("entry existed above");
+        entry.block = new_block;
+        entry.branch = ctx.branch.clone();
+        entry.manifest_hash = manifest_state.hash.clone();
+        entry.last_seen_at = now;
+    }
+
+    store::save(&registry_path, &registry)?;
+
+    let rendered = envfile::render(
+        &ctx.project_name,
+        &worktree_key,
+        new_block,
+        manifest_state.manifest.as_ref(),
+        &identity::project_id(&ctx.common_dir),
+        &identity::worktree_id(&ctx.common_dir, &ctx.worktree_root),
+    );
+    write_atomic(&ctx.worktree_root.join(".env.portool"), rendered.as_bytes())?;
+
+    if !quiet {
+        println!(
+            "portool: reallocated {}-{} for {}",
+            new_block.0,
+            new_block.1,
+            ctx.worktree_root.display()
+        );
+    }
+
+    Ok(SyncOutcome {
+        block: new_block,
+        manifest: manifest_state.manifest,
+    })
 }
 
 /// Frozen decision 10 (+ batch A #2): warns on stderr if the post-checkout
@@ -392,109 +444,78 @@ mod tests {
     use super::*;
     use crate::registry::Reservation;
 
-    /// Spec §6.2 deviation fix: subrange acquisition must avoid
-    /// reservations, not just other projects' subranges.
+    /// Batch C: blocks come directly from the pool; a block must avoid an
+    /// existing reservation.
     #[test]
-    fn allocate_or_reuse_block_avoids_reservation_when_acquiring_first_subrange() {
+    fn allocate_or_reuse_block_avoids_a_reservation() {
         let mut registry = Registry::empty((3000, 3999));
         registry.reservations.push(Reservation {
-            block: (3000, 3499),
+            block: (3000, 3004),
             label: None,
             pinned: true,
         });
         let config = Config {
             range: (3000, 3999),
-            subrange_size: 500,
             block_align: 5,
             gc_days: 30,
         };
 
-        let (block, subranges) = allocate_or_reuse_block(
-            &registry,
-            "/project/.git",
-            5,
-            Some("main"),
-            "/project",
-            &config,
-            None,
-        )
-        .unwrap();
+        let block =
+            allocate_or_reuse_block(&registry, 5, &config, Some("main"), "/project", None).unwrap();
 
-        assert_eq!(
-            subranges,
-            vec![(3500, 3999)],
-            "the newly acquired subrange must not overlap the reservation"
-        );
-        assert_eq!(block, (3500, 3504));
-    }
-
-    /// Spec §12: config changes affect only new acquisitions. A project
-    /// that already owns a wide subrange must still be able to allocate a
-    /// block larger than a since-shrunk `subrange_size`, because the
-    /// allocation happens inside the existing subrange -- no NEW subrange
-    /// is ever acquired.
-    #[test]
-    fn allocate_or_reuse_block_fits_within_existing_wide_subrange_after_config_shrinks() {
-        let mut registry = Registry::empty((3000, 3999));
-        registry.projects.insert(
-            "/project/.git".to_string(),
-            ProjectEntry {
-                name: "project".to_string(),
-                subranges: vec![(3000, 3499)],
-                worktrees: std::collections::BTreeMap::new(),
-            },
-        );
-        // subrange_size shrunk to 5 well after the project acquired its
-        // 500-wide subrange; block_size (10) now exceeds it.
-        let config = Config {
-            range: (3000, 3999),
-            subrange_size: 5,
-            block_align: 5,
-            gc_days: 30,
-        };
-
-        let (block, subranges) = allocate_or_reuse_block(
-            &registry,
-            "/project/.git",
-            10,
-            Some("main"),
-            "/project",
-            &config,
-            None,
-        )
-        .expect("must allocate inside the existing, wider subrange");
-
-        assert_eq!(subranges, vec![(3000, 3499)], "no new subrange acquired");
         assert!(
-            block.0 >= 3000 && block.1 <= 3499,
-            "block {block:?} must fall within the existing subrange"
+            !crate::registry::overlaps(block, (3000, 3004)),
+            "block {block:?} must not overlap the reservation"
         );
+        assert!(block.0 >= 3000 && block.1 <= 3999);
     }
 
-    /// Inverse of the above: a project with NO existing subranges, whose
-    /// block size exceeds the configured `subrange_size`, can never be
-    /// helped by acquiring a new subrange (frozen decision 4) and must
-    /// fail fast with `SubrangeExhausted`.
+    /// Batch C: a block larger than the old (removed) subrange_size is fine --
+    /// it is simply carved from the whole pool.
     #[test]
-    fn allocate_or_reuse_block_errors_when_no_subranges_and_block_exceeds_subrange_size() {
+    fn allocate_or_reuse_block_allocates_a_large_block_from_the_pool() {
         let registry = Registry::empty((3000, 3999));
         let config = Config {
             range: (3000, 3999),
-            subrange_size: 3,
             block_align: 5,
             gc_days: 30,
         };
 
-        let result = allocate_or_reuse_block(
+        let block = allocate_or_reuse_block(
             &registry,
-            "/project/.git",
-            5,
+            600, // far wider than the old default subrange_size of 500
+            &config,
             Some("main"),
             "/project",
-            &config,
             None,
-        );
+        )
+        .expect("a 600-wide block fits the 1000-wide pool");
 
-        assert!(matches!(result, Err(Error::SubrangeExhausted)));
+        assert_eq!(block.1 - block.0, 599);
+        assert!(block.0 >= 3000 && block.1 <= 3999);
+    }
+
+    /// Batch C: when the pool has no free slot left, allocation fails with
+    /// `PoolExhausted` (exit 3); the old `SubrangeExhausted` (exit 2) is gone.
+    #[test]
+    fn allocate_or_reuse_block_errors_when_pool_is_full() {
+        let mut registry = Registry::empty((3000, 3009));
+        // Two 5-wide reservations fill the entire 10-wide pool.
+        for block in [(3000, 3004), (3005, 3009)] {
+            registry.reservations.push(Reservation {
+                block,
+                label: None,
+                pinned: true,
+            });
+        }
+        let config = Config {
+            range: (3000, 3009),
+            block_align: 5,
+            gc_days: 30,
+        };
+
+        let result = allocate_or_reuse_block(&registry, 5, &config, Some("main"), "/project", None);
+
+        assert!(matches!(result, Err(Error::PoolExhausted)));
     }
 }

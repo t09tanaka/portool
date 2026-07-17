@@ -1,5 +1,6 @@
-//! Pure allocation algorithm: FNV-1a hashing, subrange scanning, and block
-//! allocation (spec §6). No I/O; bind checks are injected via closure.
+//! Pure allocation algorithm: FNV-1a hashing and block allocation directly
+//! from the pool (hardening batch C -- the old per-project subrange model is
+//! gone). No I/O; bind checks are injected via closure.
 
 use crate::registry::overlaps;
 
@@ -16,81 +17,40 @@ pub fn fnv1a_32(bytes: &[u8]) -> u32 {
     hash
 }
 
-/// Scans `pool` from its start for the first `size`-wide inclusive interval
-/// that does not overlap any interval in `occupied`. Returns `None` if no
-/// such interval fits within `pool`.
-pub fn find_free_subrange(
-    pool: (u16, u16),
-    occupied: &[(u16, u16)],
-    size: u16,
-) -> Option<(u16, u16)> {
-    if size == 0 {
-        return None;
-    }
-
-    let pool_start = u32::from(pool.0);
-    let pool_end = u32::from(pool.1);
-    let size = u32::from(size);
-
-    let mut occ: Vec<(u32, u32)> = occupied
-        .iter()
-        .map(|&(s, e)| (u32::from(s), u32::from(e)))
-        .collect();
-    occ.sort_unstable_by_key(|&(s, _)| s);
-
-    let mut candidate_start = pool_start;
-    for (s, e) in occ {
-        if candidate_start + size - 1 < s {
-            // `candidate_start` only ever grows across iterations, so once
-            // it overshoots the pool here it can never shrink back into
-            // bounds on a later iteration either.
-            return if candidate_start + size - 1 <= pool_end {
-                Some((candidate_start as u16, (candidate_start + size - 1) as u16))
-            } else {
-                None
-            };
-        }
-        if e >= candidate_start {
-            candidate_start = e + 1;
-        }
-        if candidate_start > pool_end {
-            return None;
-        }
-    }
-
-    if candidate_start + size - 1 <= pool_end {
-        Some((candidate_start as u16, (candidate_start + size - 1) as u16))
-    } else {
-        None
-    }
-}
-
-/// The preferred slot index for a worktree: slot 0 for `main`/`master`,
-/// otherwise `FNV-1a-32(branch ?? worktree_path) % slots`.
-pub fn preferred_slot(branch: Option<&str>, worktree_path: &str, slots: u32) -> u32 {
-    if slots == 0 {
+/// The preferred candidate slot index for a worktree, in `[0, num_slots)`.
+///
+/// `main`/`master` prefer slot 0 (the pool start), so the first project to
+/// sync tends to land its main worktree at the bottom of the pool. Every
+/// other branch prefers `FNV-1a-32(branch) % num_slots` -- a stable hash, so
+/// re-creating a worktree on the same branch tends to return to the same
+/// block -- and a detached worktree hashes its path instead. This is a
+/// preference, not a reservation: the caller scans forward from here.
+pub fn preferred_slot(branch: Option<&str>, worktree_path: &str, num_slots: u32) -> u32 {
+    if num_slots == 0 {
         return 0;
     }
     match branch {
         Some(b) if b == "main" || b == "master" => 0,
-        Some(b) => fnv1a_32(b.as_bytes()) % slots,
-        None => fnv1a_32(worktree_path.as_bytes()) % slots,
+        Some(b) => fnv1a_32(b.as_bytes()) % num_slots,
+        None => fnv1a_32(worktree_path.as_bytes()) % num_slots,
     }
 }
 
-/// Allocates a block for a worktree from `subranges` (spec §6.3, frozen
-/// decision 3).
+/// Allocates a `block_size`-wide block for a worktree directly from `pool`
+/// (hardening batch C).
 ///
-/// `subranges` is scanned in array order. Within each subrange,
-/// `slots = floor(width / block_size)` candidate slots are considered
-/// (subranges too narrow for even one block are skipped), starting from
-/// [`preferred_slot`] and wrapping around modulo `slots`. A candidate slot
-/// is accepted if it does not overlap any interval in `occupied` and
-/// `bind_ok` reports the block as bindable. Returns `None` if every
-/// subrange is exhausted.
+/// Candidate block starts are the `block_align`-aligned positions
+/// `pool.0 + k*block_align` that keep the whole block within `pool`. Starting
+/// from [`preferred_slot`] and wrapping, the first candidate that overlaps
+/// nothing in `occupied` and that `bind_ok` reports as bindable is returned.
+/// `occupied` is every block already recorded anywhere in the ledger (plus
+/// reservations); passing a finer `block_align` than `block_size` is fine --
+/// the overlap check prevents blocks of differing sizes from colliding.
+/// Returns `None` when every candidate is taken (the pool is exhausted).
 pub fn allocate_block(
-    subranges: &[(u16, u16)],
+    pool: (u16, u16),
     block_size: u16,
+    block_align: u16,
     branch: Option<&str>,
     worktree_path: &str,
     occupied: &[(u16, u16)],
@@ -99,28 +59,32 @@ pub fn allocate_block(
     if block_size == 0 {
         return None;
     }
-    let block_size = u32::from(block_size);
+    let align = u32::from(block_align.max(1));
+    let pool_start = u32::from(pool.0);
+    let pool_end = u32::from(pool.1);
+    let size = u32::from(block_size);
 
-    for &(sub_start, sub_end) in subranges {
-        let width = u32::from(sub_end) - u32::from(sub_start) + 1;
-        let slots = width / block_size;
-        if slots == 0 {
+    // The block can't fit in the pool at all.
+    if pool_start + size - 1 > pool_end {
+        return None;
+    }
+
+    // Number of aligned positions where the whole block still fits.
+    let num_slots = (pool_end - pool_start + 1 - size) / align + 1;
+    let preferred = preferred_slot(branch, worktree_path, num_slots);
+
+    for i in 0..num_slots {
+        let slot = (preferred + i) % num_slots;
+        let start = pool_start + slot * align;
+        let end = start + size - 1;
+        // `end <= pool_end` holds by the `num_slots` bound above.
+        let candidate = (start as u16, end as u16);
+
+        if occupied.iter().any(|&o| overlaps(o, candidate)) {
             continue;
         }
-
-        let preferred = preferred_slot(branch, worktree_path, slots);
-        for i in 0..slots {
-            let slot = (preferred + i) % slots;
-            let start = u32::from(sub_start) + slot * block_size;
-            let end = start + block_size - 1;
-            let candidate = (start as u16, end as u16);
-
-            if occupied.iter().any(|&o| overlaps(o, candidate)) {
-                continue;
-            }
-            if bind_ok(candidate) {
-                return Some(candidate);
-            }
+        if bind_ok(candidate) {
+            return Some(candidate);
         }
     }
 
@@ -131,6 +95,10 @@ pub fn allocate_block(
 mod tests {
     use super::*;
 
+    fn always_free() -> impl FnMut((u16, u16)) -> bool {
+        |_block: (u16, u16)| true
+    }
+
     #[test]
     fn fnv1a_32_known_vectors() {
         assert_eq!(fnv1a_32(b""), 0x811c_9dc5);
@@ -138,142 +106,115 @@ mod tests {
     }
 
     #[test]
-    fn find_free_subrange_returns_pool_start_when_empty() {
-        let found = find_free_subrange((3000, 9999), &[], 500);
-        assert_eq!(found, Some((3000, 3499)));
-    }
-
-    #[test]
-    fn find_free_subrange_fills_gap_between_occupied_ranges() {
-        let occupied = [(3000, 3499), (4000, 4499)];
-        let found = find_free_subrange((3000, 9999), &occupied, 500);
-        assert_eq!(found, Some((3500, 3999)));
-    }
-
-    #[test]
-    fn find_free_subrange_returns_none_when_pool_exhausted() {
-        let occupied = [(3000, 3999)];
-        let found = find_free_subrange((3000, 3999), &occupied, 500);
-        assert_eq!(found, None);
-    }
-
-    #[test]
-    fn find_free_subrange_none_when_only_gap_overshoots_a_shrunk_pool() {
-        // Reproduces a bug where the in-loop early return lacked the
-        // `<= pool_end` bound the post-loop return has: the gap before the
-        // sole occupied range (which itself lies entirely outside this
-        // shrunk pool) is wide enough for `size`, but only by extending
-        // past `pool_end`, so no subrange should be returned. This is
-        // reachable when the pool is shrunk in config while an old
-        // allocation above the new pool end is still respected (spec §12).
-        let found = find_free_subrange((3000, 3400), &[(5000, 5499)], 500);
-        assert_eq!(found, None);
-    }
-
-    #[test]
-    fn find_free_subrange_ignores_unsorted_and_unrelated_occupied() {
-        let occupied = [(9000, 9999), (3000, 3499)];
-        let found = find_free_subrange((3000, 9999), &occupied, 500);
-        assert_eq!(found, Some((3500, 3999)));
-    }
-
-    #[test]
     fn preferred_slot_main_and_master_are_zero() {
-        assert_eq!(preferred_slot(Some("main"), "/whatever", 8), 0);
-        assert_eq!(preferred_slot(Some("master"), "/whatever", 8), 0);
+        assert_eq!(preferred_slot(Some("main"), "/w", 100), 0);
+        assert_eq!(preferred_slot(Some("master"), "/w", 100), 0);
     }
 
     #[test]
-    fn preferred_slot_feature_branch_matches_fnv_formula() {
-        let slots = 7;
-        let expected = fnv1a_32(b"feature/api") % slots;
+    fn preferred_slot_feature_branch_matches_hash() {
+        let slots = 97;
         assert_eq!(
-            preferred_slot(Some("feature/api"), "/anything", slots),
-            expected
+            preferred_slot(Some("feature/api"), "/w", slots),
+            fnv1a_32(b"feature/api") % slots
         );
     }
 
     #[test]
-    fn preferred_slot_distributes_across_branches() {
-        let slots = 1000;
-        let a = preferred_slot(Some("feature/alpha"), "/x", slots);
-        let b = preferred_slot(Some("feature/beta"), "/x", slots);
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn preferred_slot_detached_head_uses_worktree_path() {
-        let slots = 8;
-        let expected = fnv1a_32(b"/home/user/dev/myapp-wt/detached") % slots;
+    fn preferred_slot_detached_uses_worktree_path() {
+        let slots = 97;
         assert_eq!(
-            preferred_slot(None, "/home/user/dev/myapp-wt/detached", slots),
-            expected
+            preferred_slot(None, "/home/dev/wt", slots),
+            fnv1a_32(b"/home/dev/wt") % slots
         );
     }
 
     #[test]
-    fn allocate_block_picks_preferred_slot_when_free() {
-        let subranges = [(3000, 3499)];
-        let mut bind_ok = |_block: (u16, u16)| true;
-        let result = allocate_block(&subranges, 5, Some("main"), "/whatever", &[], &mut bind_ok);
-        assert_eq!(result, Some((3000, 3004)));
+    fn allocate_block_main_lands_at_the_pool_start_when_free() {
+        let mut bind_ok = always_free();
+        let block =
+            allocate_block((3000, 9999), 5, 5, Some("main"), "/w", &[], &mut bind_ok).unwrap();
+        assert_eq!(block, (3000, 3004));
     }
 
     #[test]
-    fn allocate_block_skips_occupied_slot() {
-        let subranges = [(3000, 3499)];
+    fn allocate_block_uses_the_full_pool_not_a_500_wide_subrange() {
+        // A 600-wide block (larger than the old default subrange) fits fine.
+        let mut bind_ok = always_free();
+        let block =
+            allocate_block((3000, 9999), 600, 5, Some("main"), "/w", &[], &mut bind_ok).unwrap();
+        assert_eq!(block.1 - block.0, 599);
+        assert!(block.0 >= 3000 && block.1 <= 9999);
+    }
+
+    #[test]
+    fn allocate_block_skips_occupied_preferred_slot() {
         let occupied = [(3000, 3004)];
-        let mut bind_ok = |_block: (u16, u16)| true;
-        let result = allocate_block(
-            &subranges,
+        let mut bind_ok = always_free();
+        let block = allocate_block(
+            (3000, 9999),
+            5,
             5,
             Some("main"),
-            "/whatever",
+            "/w",
             &occupied,
             &mut bind_ok,
+        )
+        .unwrap();
+        assert_eq!(
+            block,
+            (3005, 3009),
+            "must scan forward past the occupied slot"
         );
-        assert_eq!(result, Some((3005, 3009)));
     }
 
     #[test]
-    fn allocate_block_skips_slot_that_fails_bind_check() {
-        let subranges = [(3000, 3499)];
+    fn allocate_block_skips_a_slot_that_fails_bind() {
         let mut bind_ok = |block: (u16, u16)| block != (3000, 3004);
-        let result = allocate_block(&subranges, 5, Some("main"), "/whatever", &[], &mut bind_ok);
-        assert_eq!(result, Some((3005, 3009)));
+        let block =
+            allocate_block((3000, 9999), 5, 5, Some("main"), "/w", &[], &mut bind_ok).unwrap();
+        assert_eq!(block, (3005, 3009));
     }
 
     #[test]
-    fn allocate_block_returns_none_when_subrange_fully_occupied() {
-        let subranges = [(3000, 3009)]; // exactly two slots of size 5
+    fn allocate_block_returns_none_when_pool_is_full() {
         let occupied = [(3000, 3004), (3005, 3009)];
-        let mut bind_ok = |_block: (u16, u16)| true;
-        let result = allocate_block(
-            &subranges,
+        let mut bind_ok = always_free();
+        let block = allocate_block(
+            (3000, 3009),
+            5,
             5,
             Some("main"),
-            "/whatever",
+            "/w",
             &occupied,
             &mut bind_ok,
         );
-        assert_eq!(result, None);
+        assert_eq!(block, None);
     }
 
     #[test]
-    fn allocate_block_returns_none_when_bind_always_fails() {
-        let subranges = [(3000, 3009)];
-        let mut bind_ok = |_block: (u16, u16)| false;
-        let result = allocate_block(&subranges, 5, Some("main"), "/whatever", &[], &mut bind_ok);
-        assert_eq!(result, None);
+    fn allocate_block_returns_none_when_block_larger_than_pool() {
+        let mut bind_ok = always_free();
+        let block = allocate_block((3000, 3003), 5, 5, Some("main"), "/w", &[], &mut bind_ok);
+        assert_eq!(block, None);
     }
 
     #[test]
-    fn allocate_block_skips_subrange_too_narrow_for_one_block() {
-        // First subrange is narrower than block_size (must be skipped
-        // entirely), second subrange has room.
-        let subranges = [(3000, 3003), (4000, 4499)];
-        let mut bind_ok = |_block: (u16, u16)| true;
-        let result = allocate_block(&subranges, 5, Some("main"), "/whatever", &[], &mut bind_ok);
-        assert_eq!(result, Some((4000, 4004)));
+    fn allocate_block_packs_heterogeneous_sizes_without_overlap() {
+        // A 10-wide block sits at the pool start; a 5-wide main request must
+        // land clear of it (finer align than the existing block size).
+        let occupied = [(3000, 3009)];
+        let mut bind_ok = always_free();
+        let block = allocate_block(
+            (3000, 3019),
+            5,
+            5,
+            Some("main"),
+            "/w",
+            &occupied,
+            &mut bind_ok,
+        )
+        .unwrap();
+        assert!(!overlaps(block, (3000, 3009)));
     }
 }
