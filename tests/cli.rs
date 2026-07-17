@@ -2694,10 +2694,35 @@ fn reserve_blocks_allocation_and_unreserve_frees_it() {
 
     // Unreserving again is an error.
     assert!(!env.run(&repo, &["unreserve", "18602"]).status.success());
+
+    // Range-spec unreserve requires an EXACT block match: a sub-range must
+    // fail (exit 1) and leave the reservation in place; the exact range
+    // then removes it.
+    assert!(env.run(&repo, &["reserve", "18600-18604"]).status.success());
+    let out = env.run(&repo, &["unreserve", "18601-18604"]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a non-exact range spec must not match; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        env.registry()["reservations"].as_array().unwrap().len(),
+        1,
+        "the failed unreserve must leave the reservation in place"
+    );
+    assert!(env
+        .run(&repo, &["unreserve", "18600-18604"])
+        .status
+        .success());
+    assert!(env.registry()["reservations"]
+        .as_array()
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
-fn pin_protects_a_stale_entry_from_prune_and_unpin_releases_it() {
+fn pin_protects_a_stale_entry_from_prune() {
     let env = TestEnv::new();
     env.write_config("range = [18700, 18799]\n");
     let repo = env.path("app");
@@ -2713,6 +2738,23 @@ fn pin_protects_a_stale_entry_from_prune_and_unpin_releases_it() {
         .run(&wt, &["pin", "--label", "keep-me"])
         .status
         .success());
+
+    // Verify the pin took effect before the worktree disappears.
+    let reg = env.registry();
+    let entry = reg["projects"]
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap()["worktrees"]
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    assert_eq!(entry["pinned"], serde_json::json!(true));
+    assert_eq!(entry["label"], serde_json::json!("keep-me"));
 
     git(
         &repo,
@@ -2736,6 +2778,55 @@ fn pin_protects_a_stale_entry_from_prune_and_unpin_releases_it() {
     assert!(worktrees.values().next().unwrap()["pinned"]
         .as_bool()
         .unwrap());
+}
+
+/// `unpin` clears `pinned` but keeps the label (only `pin --label`
+/// overwrites it). Runs from a live worktree, since `unpin` discovers the
+/// current worktree via git.
+#[test]
+fn pin_then_unpin_clears_pinned_and_keeps_label() {
+    let env = TestEnv::new();
+    env.write_config("range = [18800, 18809]\n");
+    let repo = env.path("app");
+    init_repo(&repo);
+    assert!(env.run(&repo, &["sync"]).status.success());
+
+    let entry = |env: &TestEnv| {
+        env.registry()["projects"]
+            .as_object()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()["worktrees"]
+            .as_object()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .clone()
+    };
+
+    assert!(env
+        .run(&repo, &["pin", "--label", "keep-me"])
+        .status
+        .success());
+    let pinned = entry(&env);
+    assert_eq!(pinned["pinned"], serde_json::json!(true));
+    assert_eq!(pinned["label"], serde_json::json!("keep-me"));
+
+    let out = env.run(&repo, &["unpin"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let unpinned = entry(&env);
+    assert_eq!(unpinned["pinned"], serde_json::json!(false));
+    assert_eq!(
+        unpinned["label"],
+        serde_json::json!("keep-me"),
+        "unpin must clear pinned but keep the label"
+    );
 }
 
 #[test]
