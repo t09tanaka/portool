@@ -189,6 +189,17 @@ fn slow_path(ctx: &GitCtx, config: &Config, quiet: bool) -> Result<SyncOutcome> 
     // was reserved but never handed out).
     resolve_pending_move(&mut registry, &common_dir_key, &worktree_key, ctx);
 
+    // Spec §8.1 implicit GC, run BEFORE allocation (external review P1-8):
+    // freeing this project's stale entries first lets a re-created worktree
+    // on the same branch reclaim its just-freed block instead of forcing a
+    // fresh one that only becomes free after the fact.
+    if let Some(project) = registry.projects.get_mut(&common_dir_key) {
+        let live_worktrees = ctx.worktree_list()?;
+        let dir_exists = |p: &Path| p.exists();
+        let block_unused = |b: (u16, u16)| ports::block_free(b);
+        crate::gc::collect(project, &live_worktrees, &dir_exists, &block_unused);
+    }
+
     let manifest_state = load_manifest_state(&ctx.worktree_root)?;
     let block_size = manifest_state
         .manifest
@@ -207,6 +218,7 @@ fn slow_path(ctx: &GitCtx, config: &Config, quiet: bool) -> Result<SyncOutcome> 
             &registry,
             block_size,
             config,
+            &common_dir_key,
             ctx.branch.as_deref(),
             &worktree_key,
             None,
@@ -222,6 +234,7 @@ fn slow_path(ctx: &GitCtx, config: &Config, quiet: bool) -> Result<SyncOutcome> 
                     &registry,
                     block_size,
                     config,
+                    &common_dir_key,
                     ctx.branch.as_deref(),
                     &worktree_key,
                     Some(entry.block),
@@ -297,18 +310,6 @@ fn slow_path(ctx: &GitCtx, config: &Config, quiet: bool) -> Result<SyncOutcome> 
         entry.last_seen_at = now;
     }
 
-    // Spec §8.1: implicit GC of this project's own stale entries.
-    {
-        let project = registry
-            .projects
-            .get_mut(&common_dir_key)
-            .expect("just inserted above");
-        let live_worktrees = ctx.worktree_list()?;
-        let dir_exists = |p: &Path| p.exists();
-        let block_unused = |b: (u16, u16)| ports::block_free(b);
-        crate::gc::collect(project, &live_worktrees, &dir_exists, &block_unused);
-    }
-
     store::save(&registry_path, &registry)?;
 
     // For a non-move (fresh allocation or in-place refresh), the ledger
@@ -349,6 +350,7 @@ fn allocate_or_reuse_block(
     registry: &Registry,
     block_size: u16,
     config: &Config,
+    project_key: &str,
     branch: Option<&str>,
     worktree_key: &str,
     existing_block: Option<(u16, u16)>,
@@ -364,6 +366,7 @@ fn allocate_or_reuse_block(
         config.range,
         block_size,
         config.block_align,
+        project_key,
         branch,
         worktree_key,
         &occupied,
@@ -425,6 +428,7 @@ pub fn reallocate(ctx: &GitCtx, quiet: bool) -> Result<SyncOutcome> {
         &registry,
         block_size,
         &config,
+        &common_dir_key,
         ctx.branch.as_deref(),
         &worktree_key,
         None,
@@ -585,8 +589,16 @@ mod tests {
             gc_days: 30,
         };
 
-        let block =
-            allocate_or_reuse_block(&registry, 5, &config, Some("main"), "/project", None).unwrap();
+        let block = allocate_or_reuse_block(
+            &registry,
+            5,
+            &config,
+            "/p/.git",
+            Some("main"),
+            "/project",
+            None,
+        )
+        .unwrap();
 
         assert!(
             !crate::registry::overlaps(block, (3000, 3004)),
@@ -610,6 +622,7 @@ mod tests {
             &registry,
             600, // far wider than the old default subrange_size of 500
             &config,
+            "/p/.git",
             Some("main"),
             "/project",
             None,
@@ -639,7 +652,15 @@ mod tests {
             gc_days: 30,
         };
 
-        let result = allocate_or_reuse_block(&registry, 5, &config, Some("main"), "/project", None);
+        let result = allocate_or_reuse_block(
+            &registry,
+            5,
+            &config,
+            "/p/.git",
+            Some("main"),
+            "/project",
+            None,
+        );
 
         assert!(matches!(result, Err(Error::PoolExhausted)));
     }
