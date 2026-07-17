@@ -147,8 +147,9 @@ pub fn run(hook_only: bool, gitignore_only: bool) -> Result<()> {
 
 /// Installs portool's hooks where git will actually run them. When that's
 /// nowhere safe -- a `core.hooksPath` dir that doesn't exist / isn't Husky's
-/// (`Missing`), or an absolute global/system-scope shared dir
-/// (`SharedScope`) -- it warns with the manual line instead of writing.
+/// (`Missing`), or one that resolves outside the repository regardless of
+/// scope (`SharedScope`) -- it warns with the manual line instead of
+/// writing.
 fn install_hook(ctx: &GitCtx) -> Result<()> {
     let loc = HooksLocation::resolve(ctx);
     match &loc {
@@ -200,9 +201,9 @@ fn install_hook(ctx: &GitCtx) -> Result<()> {
             scope,
         } => {
             eprintln!(
-                "warning: core.hooksPath '{configured}' is a shared hooks dir in {scope} scope \
-                 ({}); refusing to auto-install portool's hook there -- it could run on every \
-                 repository's checkout",
+                "warning: core.hooksPath '{configured}' resolves outside this repository \
+                 ({}, {scope} scope); refusing to auto-install portool's hook there -- it \
+                 could run on every repository's checkout",
                 resolved.display()
             );
             eprintln!(

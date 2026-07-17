@@ -57,10 +57,12 @@ pub enum HooksLocation {
         configured: String,
         resolved: PathBuf,
     },
-    /// `core.hooksPath` is an absolute directory configured in `global` or
-    /// `system` git scope -- a hooks dir shared across unrelated repos.
-    /// Auto-installing here would run portool's hook on every repo's
-    /// checkout, so it is refused; `init` prints the manual line instead.
+    /// `core.hooksPath` resolves (after canonicalization) to a directory
+    /// outside this repository -- whatever scope set it, and however it
+    /// escaped (absolute path, relative `../`, or a symlink). Auto-installing
+    /// there could run portool's hook on every repo that shares -- or
+    /// symlinks to -- that directory, so it is refused; `init` prints the
+    /// manual line instead.
     SharedScope {
         configured: String,
         resolved: PathBuf,
@@ -72,33 +74,40 @@ impl HooksLocation {
     /// Resolves the effective hooks location for `ctx` by reading
     /// `core.hooksPath` (with `~` expanded) from the worktree.
     ///
-    /// An absolute `core.hooksPath` set in `global`/`system` scope is a
-    /// hooks dir shared across unrelated repos; it is reported as
+    /// Whatever scope set `core.hooksPath` (`local`, `worktree`, `global`,
+    /// `system`, or even `command`-line `-c`), and however the configured
+    /// value resolves -- an absolute path, a relative `../` escape, or a
+    /// symlink into another directory -- a resolved location outside this
+    /// repository (`worktree_root` / `common_dir`) is reported as
     /// [`HooksLocation::SharedScope`] so `init` refuses to auto-install
     /// there. This check runs *before* any other classification, so a
     /// shared dir cannot slip through by looking like Husky's `.husky/_`
-    /// (external review P1 #3). It is also fail-closed: an absolute path
-    /// whose scope cannot be determined (git < 2.26, or a git failure) is
-    /// treated as shared. A repo-relative value is inherently per-repo and
-    /// is never refused, whatever scope it came from.
+    /// (external review P1 #3, hardened further to close relative/symlink
+    /// escapes and non-global scopes).
     pub fn resolve(ctx: &GitCtx) -> HooksLocation {
         let configured = gitctx::config_path_value(&ctx.worktree_root, "core.hooksPath");
 
         if let Some(value) = configured.as_deref().filter(|v| !v.trim().is_empty()) {
-            if Path::new(value).is_absolute() {
+            let raw = PathBuf::from(value);
+            let resolved = if raw.is_absolute() {
+                raw
+            } else {
+                ctx.worktree_root.join(raw)
+            };
+            // canonicalize resolves symlinks; a nonexistent dir falls back to a
+            // lexical `..` resolution so `../x` cannot dodge the check by not
+            // existing yet.
+            let canonical = resolved
+                .canonicalize()
+                .unwrap_or_else(|_| lexical_normalize(&resolved));
+
+            if !is_inside_repo(&canonical, &ctx.worktree_root, &ctx.common_dir) {
                 let scope = gitctx::config_scope(&ctx.worktree_root, "core.hooksPath");
-                let shared = match scope.as_deref() {
-                    Some("global") | Some("system") => true,
-                    Some(_) => false, // local / worktree: per-repo
-                    None => true,     // undeterminable: fail closed
+                return HooksLocation::SharedScope {
+                    configured: value.to_string(),
+                    resolved: canonical,
+                    scope: scope.unwrap_or_else(|| "unknown".to_string()),
                 };
-                if shared {
-                    return HooksLocation::SharedScope {
-                        configured: value.to_string(),
-                        resolved: PathBuf::from(value),
-                        scope: scope.unwrap_or_else(|| "unknown".to_string()),
-                    };
-                }
             }
         }
 
@@ -162,6 +171,28 @@ fn classify(configured: Option<String>, worktree_root: &Path, common_dir: &Path)
             resolved,
         }
     }
+}
+
+/// True when `resolved` is inside this repository: under the worktree root
+/// or under the git common dir (both already canonical from `GitCtx`).
+fn is_inside_repo(resolved: &Path, worktree_root: &Path, common_dir: &Path) -> bool {
+    resolved.starts_with(worktree_root) || resolved.starts_with(common_dir)
+}
+
+/// Textual `.`/`..` resolution for paths that cannot be canonicalized
+/// (target does not exist). Does not touch the filesystem.
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// True for any path whose final two components are `.husky/_` (Husky's
@@ -320,5 +351,44 @@ mod tests {
         };
         assert_eq!(loc.hook_file("post-checkout"), None);
         assert_eq!(loc.hook_file("post-merge"), None);
+    }
+
+    #[test]
+    fn relative_hooks_path_escaping_repo_is_outside() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("shared-hooks")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let resolved = root.join("../shared-hooks");
+        assert!(!is_inside_repo(
+            &lexical_normalize(&resolved),
+            &root,
+            &root.join(".git")
+        ));
+    }
+
+    #[test]
+    fn symlinked_hooks_dir_outside_repo_is_outside() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(tmp.path().join("real-hooks")).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("real-hooks"), root.join("hooks-link")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let resolved = root.join("hooks-link").canonicalize().unwrap();
+        assert!(!is_inside_repo(&resolved, &root, &root.join(".git")));
+    }
+
+    #[test]
+    fn hooks_dir_inside_repo_is_inside() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("ci-hooks")).unwrap();
+        assert!(is_inside_repo(
+            &root.join("ci-hooks"),
+            &root,
+            &root.join(".git")
+        ));
     }
 }

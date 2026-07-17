@@ -718,8 +718,8 @@ fn init_refuses_global_scope_shared_hookspath() {
         "init must fail when no hook location is installable, stderr: {stderr}"
     );
     assert!(
-        stderr.contains("shared hooks dir") && stderr.contains("global"),
-        "must warn about the global-scope shared hooksPath, got: {stderr}"
+        stderr.contains("outside this repository") && stderr.contains("global"),
+        "must warn about the global-scope hooksPath resolving outside the repo, got: {stderr}"
     );
     assert!(
         stderr.contains("portool sync --quiet || true"),
@@ -728,6 +728,96 @@ fn init_refuses_global_scope_shared_hookspath() {
     assert!(
         !shared.join("post-checkout").exists(),
         "must not write into a shared global hooks dir"
+    );
+    assert!(
+        !repo.join(".git/hooks/post-checkout").exists(),
+        "must not fall back to the ignored default hooks dir"
+    );
+}
+
+/// External review P1 (v0.9.0): a *relative* `core.hooksPath` configured in
+/// global scope (`../shared-hooks`) resolves against the worktree root, not
+/// the config file's location -- so it can escape the repository just like
+/// an absolute shared path. `init` must refuse it regardless of scope.
+#[test]
+fn relative_global_hooks_path_escaping_repo_is_refused() {
+    let env = TestEnv::new();
+    let repo = env.path("repo");
+    init_repo(&repo);
+
+    let shared = env.path("shared-hooks");
+    fs::create_dir_all(&shared).unwrap();
+    let global_config = env.path("gitconfig-global");
+    fs::write(&global_config, "[core]\n\thooksPath = ../shared-hooks\n").unwrap();
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_portool"));
+    cmd.env_clear();
+    if let Ok(path) = std::env::var("PATH") {
+        cmd.env("PATH", path);
+    }
+    cmd.env("HOME", &env.home)
+        .env("XDG_STATE_HOME", &env.state)
+        .env("XDG_CONFIG_HOME", &env.config)
+        .env("GIT_CONFIG_GLOBAL", &global_config)
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .current_dir(&repo)
+        .args(["init", "--hook-only"]);
+    let output = cmd.output().expect("failed to spawn portool");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "init must fail when core.hooksPath escapes the repository, stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("outside"),
+        "must warn that the resolved hooksPath is outside the repo, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("portool sync --quiet || true"),
+        "must print the safe manual line, got: {stderr}"
+    );
+    assert!(
+        !shared.join("post-checkout").exists(),
+        "must not write into the repo's parent directory"
+    );
+    assert!(
+        !repo.join(".git/hooks/post-checkout").exists(),
+        "must not fall back to the ignored default hooks dir"
+    );
+}
+
+/// External review P1 (v0.9.0): a `core.hooksPath` set at `command` scope
+/// (highest-precedence `-c`/`GIT_CONFIG_*` env override, not `global` or
+/// `system`) that resolves outside the repository must be refused too --
+/// the old check only looked at `global`/`system` scope.
+#[test]
+fn command_scoped_hooks_path_is_refused() {
+    let env = TestEnv::new();
+    let repo = env.path("repo");
+    init_repo(&repo);
+
+    let outside = env.path("outside-hooks");
+    fs::create_dir_all(&outside).unwrap();
+
+    let output = env
+        .command()
+        .current_dir(&repo)
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+        .env("GIT_CONFIG_VALUE_0", outside.to_str().unwrap())
+        .args(["init", "--hook-only"])
+        .output()
+        .expect("failed to spawn portool");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "init must fail when a command-scoped core.hooksPath escapes the repository, stderr: {stderr}"
+    );
+    assert!(
+        !outside.join("post-checkout").exists(),
+        "must not write into a command-scoped hooksPath outside the repo"
     );
     assert!(
         !repo.join(".git/hooks/post-checkout").exists(),
@@ -2303,8 +2393,8 @@ fn init_refuses_global_husky_shaped_hookspath() {
         "init must fail when no hook location is installable, stderr: {stderr}"
     );
     assert!(
-        stderr.contains("shared hooks dir") && stderr.contains("global"),
-        "must warn about the global-scope shared hooksPath, got: {stderr}"
+        stderr.contains("outside this repository") && stderr.contains("global"),
+        "must warn about the global-scope hooksPath resolving outside the repo, got: {stderr}"
     );
     assert!(
         !shared.parent().unwrap().join("post-checkout").exists()
