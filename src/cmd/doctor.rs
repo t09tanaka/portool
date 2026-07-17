@@ -200,10 +200,88 @@ pub fn run(repair: bool, abandon_other_projects: bool) -> Result<()> {
         }
     }
 
-    if imported == 0 && in_use == 0 {
+    // 3. Hook effectiveness (external review P1-4): "installed" must mean
+    //    "will actually run".
+    let hook_findings = report_hook_health(&ctx);
+
+    if imported == 0 && in_use == 0 && hook_findings == 0 {
         println!("portool: doctor: nothing to repair for this project");
     }
     Ok(())
+}
+
+/// Diagnoses whether each managed hook is actually installed and will run:
+/// missing, non-executable, present but not invoking portool, or invoking a
+/// `PORTOOL_BIN` path that no longer exists (or relying on PATH lookup
+/// only). All advisories -- doctor's exit code is unaffected -- but a
+/// nonzero return suppresses the "nothing to repair" summary line.
+fn report_hook_health(ctx: &GitCtx) -> usize {
+    use crate::hooks::{self, HooksLocation};
+    use std::os::unix::fs::PermissionsExt;
+
+    let loc = HooksLocation::resolve(ctx);
+    let mut findings = 0usize;
+    for name in ["post-checkout", "post-merge"] {
+        let Some(path) = loc.hook_file(name) else {
+            println!("portool: doctor: hook {name}: no installable location (see 'portool init')");
+            findings += 1;
+            continue;
+        };
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(_) => {
+                println!("portool: doctor: hook {name}: not installed (run 'portool init')");
+                findings += 1;
+                continue;
+            }
+        };
+        if std::fs::metadata(&path)
+            .map(|m| m.permissions().mode() & 0o100 == 0)
+            .unwrap_or(true)
+        {
+            println!(
+                "portool: doctor: hook {name}: not executable (chmod +x {})",
+                path.display()
+            );
+            findings += 1;
+            continue;
+        }
+        if !hooks::contains_portool_invocation(&content) {
+            println!("portool: doctor: hook {name}: does not invoke portool (run 'portool init')");
+            findings += 1;
+            continue;
+        }
+        match embedded_bin_path(&content) {
+            Some(bin) if !Path::new(&bin).exists() => {
+                println!(
+                    "portool: doctor: hook {name}: embedded portool path {bin} no longer \
+                     exists; it falls back to PATH lookup, which GUI git clients may not \
+                     have (re-run 'portool init')"
+                );
+                findings += 1;
+            }
+            None => {
+                println!(
+                    "portool: doctor: hook {name}: uses PATH lookup only; GUI git clients \
+                     may not find portool (re-run 'portool init' to embed the absolute path)"
+                );
+                findings += 1;
+            }
+            Some(_) => {}
+        }
+    }
+    findings
+}
+
+/// Extracts the absolute path embedded as `PORTOOL_BIN="<path>"` in a hook
+/// script installed by v0.6.0+ `init`, if present.
+fn embedded_bin_path(content: &str) -> Option<String> {
+    content.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("PORTOOL_BIN=\"")
+            .and_then(|rest| rest.strip_suffix('"'))
+            .map(str::to_string)
+    })
 }
 
 /// The --repair path for a corrupt ledger. Restore-first: a valid

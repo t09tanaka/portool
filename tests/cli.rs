@@ -2060,6 +2060,40 @@ fn doctor_skips_invalid_block_headers() {
     );
 }
 
+/// `doctor` diagnoses hook-effectiveness problems (external review P1-4):
+/// "installed" must mean "will actually run". Covers a missing hook and a
+/// hook with a dead embedded `PORTOOL_BIN` path.
+#[test]
+fn doctor_reports_hook_problems() {
+    let env = TestEnv::new();
+    let repo = env.path("app");
+    init_repo(&repo);
+    assert!(env.run(&repo, &["sync"]).status.success());
+
+    // No hook installed at all.
+    let out = env.run(&repo, &["doctor"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("not installed"), "got: {stdout}");
+
+    // A hook with a dead embedded path.
+    let hooks = repo.join(".git/hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    fs::write(
+        hooks.join("post-checkout"),
+        "#!/bin/sh\n# installed by portool\nPORTOOL_BIN=\"/no/such/portool\"\nif ! [ -x \"$PORTOOL_BIN\" ]; then PORTOOL_BIN=portool; fi\nif command -v \"$PORTOOL_BIN\" >/dev/null 2>&1; then\n  \"$PORTOOL_BIN\" sync --quiet || true\nfi\nexit 0\n",
+    )
+    .unwrap();
+    fs::set_permissions(
+        hooks.join("post-checkout"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let out = env.run(&repo, &["doctor"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("/no/such/portool"), "got: {stdout}");
+}
+
 /// The config is validated before the lock-free fast path: a config broken
 /// *after* a successful sync still fails the next sync, instead of being
 /// skipped on the fast path and only surfacing days later (external review
