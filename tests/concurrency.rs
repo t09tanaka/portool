@@ -1,8 +1,8 @@
-//! Concurrency integration test (spec §11): spawns 8 real `portool sync`
-//! processes truly concurrently -- one per worktree, from 8 different
-//! worktrees of a single shared git repository -- all pointed at the same
-//! (isolated) `XDG_STATE_HOME`, and verifies the resulting ledger is valid
-//! JSON with 8 distinct, non-overlapping block allocations.
+//! Concurrency integration test (spec §11, hardening batch D #6): spawns 16
+//! real `portool sync` processes truly concurrently -- one per worktree, from
+//! 16 different worktrees of a single shared git repository -- all pointed at
+//! the same (isolated) `XDG_STATE_HOME`, and verifies the resulting ledger is
+//! valid JSON with 16 distinct, non-overlapping block allocations.
 //!
 //! Mirrors the isolation discipline established in `tests/cli.rs`: a
 //! per-test temp `HOME`/`XDG_STATE_HOME`/`XDG_CONFIG_HOME`, an `env_clear`-ed
@@ -109,18 +109,24 @@ fn canon(path: &Path) -> String {
         .into_owned()
 }
 
-/// Sets up one shared repo with 8 worktrees (the main worktree plus 7
-/// linked worktrees on distinct branches), spawns `portool sync` in every
-/// one of them truly concurrently (spawn all 8 first, then wait on all 8),
+/// Number of worktrees (and therefore concurrent `portool sync` processes).
+/// Batch D #6 raised this above the old 8 to exercise heavier lock
+/// contention; it is also >14, the number of projects the *old* subrange
+/// model could hold at all -- here 16 worktrees of one project coexist.
+const CONCURRENCY: usize = 16;
+
+/// Sets up one shared repo with [`CONCURRENCY`] worktrees (the main worktree
+/// plus linked worktrees on distinct branches), spawns `portool sync` in
+/// every one of them truly concurrently (spawn all first, then wait on all),
 /// and asserts: every process exits 0, the ledger ends up as valid JSON,
-/// and the 8 resulting blocks are pairwise non-overlapping.
-fn run_eight_concurrent_syncs() {
+/// and the resulting blocks are pairwise non-overlapping.
+fn run_concurrent_syncs() {
     let env = TestEnv::new();
     let repo = env.root.join("repo");
     init_repo(&repo);
 
     let mut worktrees: Vec<PathBuf> = vec![repo.clone()];
-    for i in 0..7 {
+    for i in 0..(CONCURRENCY - 1) {
         let wt = env.root.join(format!("repo-wt-{i}"));
         assert!(git(
             &repo,
@@ -137,10 +143,10 @@ fn run_eight_concurrent_syncs() {
         .success());
         worktrees.push(wt);
     }
-    assert_eq!(worktrees.len(), 8);
+    assert_eq!(worktrees.len(), CONCURRENCY);
 
-    // Spawn every `portool sync` first (no waiting in between), so all 8
-    // run genuinely concurrently and actually contend for the registry
+    // Spawn every `portool sync` first (no waiting in between), so all of
+    // them run genuinely concurrently and actually contend for the registry
     // lock, then wait for all of them.
     let children: Vec<Child> = worktrees
         .iter()
@@ -184,8 +190,8 @@ fn run_eight_concurrent_syncs() {
 
     assert_eq!(
         worktrees_obj.len(),
-        8,
-        "all 8 worktrees must be registered; registry: {registry:#}"
+        CONCURRENCY,
+        "all {CONCURRENCY} worktrees must be registered; registry: {registry:#}"
     );
 
     // Every worktree we created must actually be present under its own key.
@@ -214,7 +220,7 @@ fn run_eight_concurrent_syncs() {
         .collect();
     blocks.sort_unstable();
 
-    assert_eq!(blocks.len(), 8);
+    assert_eq!(blocks.len(), CONCURRENCY);
     for &(start, end) in &blocks {
         assert!(start <= end, "block ({start}, {end}) has start > end");
     }
@@ -229,6 +235,6 @@ fn run_eight_concurrent_syncs() {
 }
 
 #[test]
-fn eight_concurrent_syncs_get_distinct_non_overlapping_blocks() {
-    run_eight_concurrent_syncs();
+fn many_concurrent_syncs_get_distinct_non_overlapping_blocks() {
+    run_concurrent_syncs();
 }
