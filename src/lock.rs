@@ -26,9 +26,11 @@ impl Drop for Lock {
 /// Acquires an exclusive lock on `lock_path`, creating the file if it does
 /// not already exist (and its parent directory, if necessary).
 ///
-/// Polls [`fs2::FileExt::try_lock_exclusive`] every 50ms until it
-/// succeeds or `timeout` elapses, in which case [`Error::LockTimeout`] is
-/// returned.
+/// Polls [`fs2::FileExt::try_lock_exclusive`] every 50ms until it succeeds
+/// or `timeout` elapses, in which case [`Error::LockTimeout`] is returned.
+/// Only genuine lock *contention* is retried; any other flock failure (an
+/// unsupported filesystem, EIO, ...) is returned immediately as itself, so
+/// it can never masquerade as a 10-second timeout (external review P2 #8).
 pub fn acquire(lock_path: &Path, timeout: Duration) -> Result<Lock> {
     if let Some(parent) = lock_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -39,10 +41,18 @@ pub fn acquire(lock_path: &Path, timeout: Duration) -> Result<Lock> {
         .write(true)
         .open(lock_path)?;
 
+    let contended_kind = fs2::lock_contended_error().kind();
     let deadline = Instant::now() + timeout;
     loop {
-        if file.try_lock_exclusive().is_ok() {
-            return Ok(Lock { file });
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(Lock { file }),
+            Err(err) if err.kind() == contended_kind => {}
+            Err(err) => {
+                return Err(Error::General(format!(
+                    "failed to lock {}: {err}",
+                    lock_path.display()
+                )));
+            }
         }
         if Instant::now() >= deadline {
             return Err(Error::LockTimeout);

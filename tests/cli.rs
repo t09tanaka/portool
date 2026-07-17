@@ -1582,3 +1582,331 @@ fn doctor_rebuilds_a_lost_entry_from_the_env_file() {
         "doctor must re-import the same block recorded in .env.portool"
     );
 }
+
+// --- v0.5.1: fail-closed ledger, doctor --repair, and contract fixes -------
+
+/// A corrupt ledger makes `sync` fail (exit 1) instead of being silently
+/// moved aside and replaced with an empty one (external review P1 #1).
+#[test]
+fn corrupt_ledger_makes_sync_fail_and_is_left_in_place() {
+    let env = TestEnv::new();
+    let repo = env.path("repo");
+    init_repo(&repo);
+
+    let dir = env.registry_path().parent().unwrap().to_path_buf();
+    fs::create_dir_all(&dir).unwrap();
+    let garbage = b"{ this is not valid json".to_vec();
+    fs::write(env.registry_path(), &garbage).unwrap();
+
+    let output = env.run(&repo, &["sync"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "sync on a corrupt ledger must fail; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("doctor --repair"),
+        "the error must point at the recovery command, got: {stderr}"
+    );
+    assert_eq!(
+        fs::read(env.registry_path()).unwrap(),
+        garbage,
+        "the corrupt ledger must be left byte-identical in place"
+    );
+    let siblings: Vec<String> = fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.contains("corrupt"))
+        .collect();
+    assert!(
+        siblings.is_empty(),
+        "sync must not move the ledger aside, found: {siblings:?}"
+    );
+    assert!(
+        !repo.join(".env.portool").exists(),
+        "no allocation may be handed out from a corrupt ledger"
+    );
+}
+
+/// A ledger written by a *newer* portool (future schema version) is neither
+/// treated as corrupt nor auto-reset: sync fails and tells the user to
+/// upgrade, and the file is untouched.
+#[test]
+fn future_schema_ledger_is_not_auto_reset() {
+    let env = TestEnv::new();
+    let repo = env.path("repo");
+    init_repo(&repo);
+
+    let dir = env.registry_path().parent().unwrap().to_path_buf();
+    fs::create_dir_all(&dir).unwrap();
+    let future = br#"{"version":3,"range":[3000,9999],"projects":{},"reservations":[]}"#.to_vec();
+    fs::write(env.registry_path(), &future).unwrap();
+
+    let output = env.run(&repo, &["sync"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "sync must fail on a future-schema ledger; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("upgrade portool"),
+        "the error must steer toward upgrading portool, got: {stderr}"
+    );
+    assert_eq!(
+        fs::read(env.registry_path()).unwrap(),
+        future,
+        "the newer ledger must be left byte-identical in place"
+    );
+}
+
+/// The corrupt-ledger recovery path: `doctor` alone refuses, `doctor
+/// --repair` moves the file aside and rebuilds this project's entries from
+/// live worktrees' `.env.portool`.
+#[test]
+fn doctor_repair_moves_corrupt_ledger_aside_and_rebuilds() {
+    let env = TestEnv::new();
+    let repo = env.path("repo");
+    init_repo(&repo);
+    assert!(env.run(&repo, &["sync"]).status.success());
+    let block_before = env.registry()["projects"][common_dir_key(&repo)]["worktrees"]
+        [worktree_key(&repo)]["block"]
+        .clone();
+
+    fs::write(env.registry_path(), b"{ not json").unwrap();
+
+    // Without --repair: hard error, file untouched.
+    let output = env.run(&repo, &["doctor"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "doctor without --repair must fail on a corrupt ledger"
+    );
+    assert_eq!(fs::read(env.registry_path()).unwrap(), b"{ not json");
+
+    // With --repair: file moved aside, entry rebuilt from .env.portool.
+    let output = env.run(&repo, &["doctor", "--repair"]);
+    assert!(
+        output.status.success(),
+        "doctor --repair must succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let dir = env.registry_path().parent().unwrap().to_path_buf();
+    let moved: Vec<String> = fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.starts_with("registry.json.corrupt-"))
+        .collect();
+    assert_eq!(moved.len(), 1, "the corrupt file must be moved aside");
+
+    let block_after = env.registry()["projects"][common_dir_key(&repo)]["worktrees"]
+        [worktree_key(&repo)]["block"]
+        .clone();
+    assert_eq!(
+        block_before, block_after,
+        "doctor --repair must re-import the block recorded in .env.portool"
+    );
+}
+
+/// `doctor` must not import a nonsense block (port 0, reversed) from a
+/// hand-edited `.env.portool` header into the ledger (external review P2 #7).
+#[test]
+fn doctor_skips_invalid_block_headers() {
+    let env = TestEnv::new();
+    let repo = env.path("repo");
+    init_repo(&repo);
+    fs::write(
+        repo.join(".env.portool"),
+        "# generated by portool \u{2014} DO NOT EDIT\n# block: 0-0  project: p  worktree: /w\nPORT=0\n",
+    )
+    .unwrap();
+
+    let output = env.run(&repo, &["doctor"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("skipping re-import"),
+        "doctor must report the skipped invalid block, got: {stderr}"
+    );
+    assert!(
+        !env.registry_path().exists(),
+        "nothing valid was imported, so no ledger may be written"
+    );
+}
+
+/// The config is validated before the lock-free fast path: a config broken
+/// *after* a successful sync still fails the next sync, instead of being
+/// skipped on the fast path and only surfacing days later (external review
+/// P1 #4).
+#[test]
+fn fast_path_rejects_newly_malformed_config() {
+    let env = TestEnv::new();
+    let repo = env.path("repo");
+    init_repo(&repo);
+    assert!(env.run(&repo, &["sync"]).status.success());
+
+    env.write_config("range = [oops not a list\n");
+
+    let output = env.run(&repo, &["sync"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a no-op (fast-path) sync must still fail on a malformed config, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `reallocate` must always move to a *different* block, per its CLI
+/// contract, even when the current block is perfectly free and bindable
+/// (external review P2 #5).
+#[test]
+fn reallocate_moves_even_when_current_block_is_free() {
+    let env = TestEnv::new();
+    let repo = env.path("repo");
+    init_repo(&repo);
+    assert!(env.run(&repo, &["sync"]).status.success());
+    let block_before = env.registry()["projects"][common_dir_key(&repo)]["worktrees"]
+        [worktree_key(&repo)]["block"]
+        .clone();
+
+    let output = env.run(&repo, &["reallocate"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let block_after = env.registry()["projects"][common_dir_key(&repo)]["worktrees"]
+        [worktree_key(&repo)]["block"]
+        .clone();
+    assert_ne!(
+        block_before, block_after,
+        "reallocate must never re-select the current block"
+    );
+}
+
+/// A global-scope `core.hooksPath` pointing at a Husky-shaped dir
+/// (`.../.husky/_`) is still a shared hooks dir: `init` must refuse it, not
+/// classify it as Husky and write into it (external review P1 #3).
+#[test]
+fn init_refuses_global_husky_shaped_hookspath() {
+    let env = TestEnv::new();
+    let repo = env.path("repo");
+    init_repo(&repo);
+
+    let shared = env.path("shared/.husky/_");
+    fs::create_dir_all(&shared).unwrap();
+    let global_config = env.path("gitconfig-global");
+    fs::write(
+        &global_config,
+        format!("[core]\n\thooksPath = {}\n", shared.display()),
+    )
+    .unwrap();
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_portool"));
+    cmd.env_clear();
+    if let Ok(path) = std::env::var("PATH") {
+        cmd.env("PATH", path);
+    }
+    cmd.env("HOME", &env.home)
+        .env("XDG_STATE_HOME", &env.state)
+        .env("XDG_CONFIG_HOME", &env.config)
+        .env("GIT_CONFIG_GLOBAL", &global_config)
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .current_dir(&repo)
+        .args(["init", "--hook-only"]);
+    let output = cmd.output().expect("failed to spawn portool");
+
+    assert!(
+        output.status.success(),
+        "init must not fail: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("shared hooks dir") && stderr.contains("global"),
+        "must warn about the global-scope shared hooksPath, got: {stderr}"
+    );
+    assert!(
+        !shared.parent().unwrap().join("post-checkout").exists()
+            && !shared.join("post-checkout").exists(),
+        "must not write anywhere under a global Husky-shaped hooksPath"
+    );
+    assert!(
+        !repo.join(".git/hooks/post-checkout").exists(),
+        "must not fall back to the ignored default hooks dir"
+    );
+}
+
+/// If removing `.env.portool` fails, `release` must keep the ledger entry
+/// (block still reserved) and fail -- never free the block while the old
+/// env file keeps handing out its ports (external review P1 #2).
+#[test]
+fn release_env_delete_failure_keeps_the_ledger_entry() {
+    let env = TestEnv::new();
+    let repo = env.path("repo");
+    init_repo(&repo);
+    assert!(env.run(&repo, &["sync"]).status.success());
+    assert!(repo.join(".env.portool").exists());
+
+    // A read-only worktree dir makes the env-file unlink fail (EACCES).
+    let readonly = fs::Permissions::from_mode(0o555);
+    fs::set_permissions(&repo, readonly).unwrap();
+    let output = env.run(&repo, &["release"]);
+    fs::set_permissions(&repo, fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "release must fail when the env file can't be removed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        repo.join(".env.portool").exists(),
+        "the env file is still there"
+    );
+    let registry = env.registry();
+    assert!(
+        registry["projects"][common_dir_key(&repo)]["worktrees"]
+            .get(worktree_key(&repo))
+            .is_some(),
+        "the ledger entry must be kept while the env file still exists"
+    );
+}
+
+/// A manifest whose required block size cannot be represented in a u16 is
+/// rejected outright, instead of being clamped so that two declared offsets
+/// silently share one port (external review P2 #6).
+#[test]
+fn sync_rejects_manifest_wider_than_u16() {
+    let env = TestEnv::new();
+    let repo = env.path("repo");
+    init_repo(&repo);
+    fs::write(
+        repo.join(".portool.toml"),
+        "[ports]\na = 65534\nb = 65535\n",
+    )
+    .unwrap();
+
+    let output = env.run(&repo, &["sync"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid manifest"),
+        "the error must name the manifest, got: {stderr}"
+    );
+}

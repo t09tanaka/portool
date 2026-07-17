@@ -39,13 +39,18 @@ pub fn run(quiet: bool) -> Result<()> {
 /// Runs the sync algorithm for an already-discovered worktree and returns
 /// the resulting allocation.
 pub fn ensure(ctx: &GitCtx, quiet: bool) -> Result<SyncOutcome> {
+    // Fail-closed on the config *before* the fast path (external review P1
+    // #4): whether a malformed config.toml is an error must not depend on
+    // which path this run happens to take.
+    let config = Config::load()?;
+
     warn_if_hook_missing(ctx);
 
     if let Some(outcome) = try_fast_path(ctx)? {
         return Ok(outcome);
     }
 
-    slow_path(ctx, quiet)
+    slow_path(ctx, &config, quiet)
 }
 
 /// The manifest state for a worktree: the parsed manifest (if any) plus the
@@ -80,17 +85,18 @@ fn load_manifest_state(worktree_root: &Path) -> Result<ManifestState> {
 /// if the worktree's ledger entry, manifest hash, and `.env.portool` bytes
 /// all already match -- in which case sync is a complete no-op.
 fn try_fast_path(ctx: &GitCtx) -> Result<Option<SyncOutcome>> {
-    // Read-only, lock-free: never heal a corrupt ledger here (finding 3).
-    let load_result = store::load(&paths::registry_path()?, false);
-    if load_result.corrupt || load_result.read_error {
-        return Ok(None);
-    }
+    // Read-only, lock-free. Anything other than a valid ledger (missing,
+    // corrupt, unsupported version, unreadable) falls through to the slow
+    // path, which decides under the lock -- and fails closed there.
+    let registry = match store::load(&paths::registry_path()?) {
+        store::LedgerLoad::Loaded(registry) => registry,
+        _ => return Ok(None),
+    };
 
     let common_dir_key = key(&ctx.common_dir);
     let worktree_key = key(&ctx.worktree_root);
 
-    let entry = match load_result
-        .registry
+    let entry = match registry
         .find_project(&common_dir_key)
         .and_then(|p| p.worktrees.get(&worktree_key))
     {
@@ -130,28 +136,18 @@ fn try_fast_path(ctx: &GitCtx) -> Result<Option<SyncOutcome>> {
     }
 }
 
-/// Spec §7 steps 4-10: locked read-modify-write.
-fn slow_path(ctx: &GitCtx, quiet: bool) -> Result<SyncOutcome> {
+/// Spec §7 steps 4-10: locked read-modify-write. Fail-closed: a corrupt,
+/// unsupported-version, or unreadable ledger aborts here instead of being
+/// reset (external review P1 #1); `doctor --repair` is the explicit
+/// recovery path.
+fn slow_path(ctx: &GitCtx, config: &Config, quiet: bool) -> Result<SyncOutcome> {
     let _lock = lock::acquire(&paths::lock_path()?, LOCK_TIMEOUT)?;
 
     let registry_path = paths::registry_path()?;
-    let existed_before = registry_path.exists();
-    // Under the flock: safe to heal (rename aside) a corrupt ledger.
-    let load_result = store::load(&registry_path, true);
-    if load_result.read_error {
-        return Err(Error::General(format!(
-            "failed to read {}; aborting without writing to avoid clobbering an intact ledger",
-            registry_path.display()
-        )));
-    }
-    let mut registry = load_result.registry;
-
-    let config = Config::load()?;
-    if !existed_before || load_result.corrupt {
-        // Frozen decision 14: a freshly created ledger records the live
-        // pool at creation time; it is never updated after that.
-        registry.range = config.range;
-    }
+    // Frozen decision 14: a freshly created ledger records the live pool at
+    // creation time; it is never updated after that.
+    let mut registry =
+        store::load_strict(&registry_path)?.unwrap_or_else(|| Registry::empty(config.range));
 
     let common_dir_key = key(&ctx.common_dir);
     let worktree_key = key(&ctx.worktree_root);
@@ -161,6 +157,7 @@ fn slow_path(ctx: &GitCtx, quiet: bool) -> Result<SyncOutcome> {
         .manifest
         .as_ref()
         .map(|m| m.block_size(config.block_align))
+        .transpose()?
         .unwrap_or_else(|| default_block_size(config.block_align));
 
     let existing_entry = registry
@@ -172,7 +169,7 @@ fn slow_path(ctx: &GitCtx, quiet: bool) -> Result<SyncOutcome> {
         None => allocate_or_reuse_block(
             &registry,
             block_size,
-            &config,
+            config,
             ctx.branch.as_deref(),
             &worktree_key,
             None,
@@ -187,7 +184,7 @@ fn slow_path(ctx: &GitCtx, quiet: bool) -> Result<SyncOutcome> {
                 allocate_or_reuse_block(
                     &registry,
                     block_size,
-                    &config,
+                    config,
                     ctx.branch.as_deref(),
                     &worktree_key,
                     Some(entry.block),
@@ -272,9 +269,11 @@ fn slow_path(ctx: &GitCtx, quiet: bool) -> Result<SyncOutcome> {
 
 /// Finds a block for this worktree directly from the configured pool
 /// (hardening batch C). `existing_block`, if given, is excluded from the
-/// occupied set so a worktree being reallocated may resettle into its own
-/// freed slot. Errors with [`Error::PoolExhausted`] when the pool has no
-/// free, bindable, `block_size`-wide slot left.
+/// occupied set so a worktree whose manifest outgrew its block may resettle
+/// into (an extension of) its own freed slot; `reallocate` passes `None` so
+/// the current block can never be chosen again. Errors with
+/// [`Error::PoolExhausted`] when the pool has no free, bindable,
+/// `block_size`-wide slot left.
 fn allocate_or_reuse_block(
     registry: &Registry,
     block_size: u16,
@@ -310,53 +309,50 @@ pub fn reallocate_cmd(quiet: bool) -> Result<()> {
     reallocate(&ctx, quiet).map(|_| ())
 }
 
-/// Forces `ctx`'s worktree onto a fresh free+bindable block, excluding its
-/// current one, and rewrites `.env.portool` (hardening batch C #1). Errors if
-/// the worktree has no ledger entry yet (run `sync` first). Its own current
-/// block stays eligible, so with no conflict it may keep it; the point is to
-/// escape a block whose ports something else now holds.
+/// Forces `ctx`'s worktree onto a fresh free+bindable block -- always a
+/// *different* one, per the CLI contract (external review P2 #5) -- and
+/// rewrites `.env.portool` (hardening batch C #1). Errors if the worktree
+/// has no ledger entry yet (run `sync` first), and with `PoolExhausted`
+/// when no other block fits.
 pub fn reallocate(ctx: &GitCtx, quiet: bool) -> Result<SyncOutcome> {
     let _lock = lock::acquire(&paths::lock_path()?, LOCK_TIMEOUT)?;
 
-    let registry_path = paths::registry_path()?;
-    let load_result = store::load(&registry_path, true);
-    if load_result.read_error {
-        return Err(Error::General(format!(
-            "failed to read {}; aborting without writing to avoid clobbering an intact ledger",
-            registry_path.display()
-        )));
-    }
-    let mut registry = load_result.registry;
     let config = Config::load()?;
+    let registry_path = paths::registry_path()?;
+    let mut registry =
+        store::load_strict(&registry_path)?.unwrap_or_else(|| Registry::empty(config.range));
 
     let common_dir_key = key(&ctx.common_dir);
     let worktree_key = key(&ctx.worktree_root);
 
-    let existing = registry
+    if registry
         .find_project(&common_dir_key)
         .and_then(|p| p.worktrees.get(&worktree_key))
-        .cloned()
-        .ok_or_else(|| {
-            Error::General(format!(
-                "{} has no allocated block yet; run 'portool sync' first",
-                ctx.worktree_root.display()
-            ))
-        })?;
+        .is_none()
+    {
+        return Err(Error::General(format!(
+            "{} has no allocated block yet; run 'portool sync' first",
+            ctx.worktree_root.display()
+        )));
+    }
 
     let manifest_state = load_manifest_state(&ctx.worktree_root)?;
     let block_size = manifest_state
         .manifest
         .as_ref()
         .map(|m| m.block_size(config.block_align))
+        .transpose()?
         .unwrap_or_else(|| default_block_size(config.block_align));
 
+    // The current block stays in the occupied set, so the allocator can
+    // never hand it back: "reallocate" must actually move.
     let new_block = allocate_or_reuse_block(
         &registry,
         block_size,
         &config,
         ctx.branch.as_deref(),
         &worktree_key,
-        Some(existing.block),
+        None,
     )?;
 
     let now = now_local();

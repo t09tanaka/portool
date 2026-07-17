@@ -291,7 +291,7 @@ portool reallocate [--quiet]
 portool ls         [--json] [--all]
 portool prune      [--all] [--dry-run]
 portool check
-portool doctor
+portool doctor     [--repair]
 portool release
 portool deinit
 ```
@@ -299,8 +299,11 @@ portool deinit
 - **`check`** — validate the config and ledger; exits non-zero on any
   problem (read-only, script-friendly).
 - **`doctor`** — diagnose and repair the current project: re-import ledger
-  entries from live worktrees' `.env.portool` (e.g. after a corruption
-  reset), and report blocks whose ports are currently in use.
+  entries from live worktrees' `.env.portool`, and report blocks whose ports
+  are currently in use. `--repair` is the **only** way portool ever moves a
+  corrupt ledger aside (to `registry.json.corrupt-<ts>`) before rebuilding —
+  every other command fails closed on a corrupt or unsupported-version
+  ledger and leaves the file untouched.
 - **`release`** — free the current worktree's block from the ledger and
   remove its `.env.portool`.
 - **`deinit`** — reverse `init`: remove portool's `post-checkout` /
@@ -324,8 +327,8 @@ Installs the `post-checkout` hook (§ below), appends `.env.portool` to
 Allocates a block for the current worktree if it doesn't have one yet,
 refreshes `.env.portool` if the manifest changed, and reclaims this
 project's own stale worktree entries. This is what the git hook calls after
-every checkout; when nothing has changed it's a lock-free read that returns
-in well under a millisecond.
+every checkout; when nothing has changed it's a lock-free read that writes
+nothing.
 
 | Flag | Effect |
 |---|---|
@@ -455,6 +458,12 @@ worktree off a block whose ports something else now holds.
 Ledger writes always go through an exclusive `flock` on
 `registry.json.lock`; reads for the common case (nothing changed) never
 take the lock at all.
+
+The ledger is **fail-closed**, like the config: a corrupt, unreadable, or
+newer-schema `registry.json` makes every command error out (exit 1) without
+touching the file. The explicit recovery path is `portool doctor --repair`,
+which moves the bad file aside to `registry.json.corrupt-<ts>` and rebuilds
+the current project's entries from its worktrees' `.env.portool` files.
 
 ### `post-checkout` hook
 

@@ -10,10 +10,13 @@ use std::time::Duration;
 
 const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Runs `portool release`. Removes this worktree's entry from the ledger
-/// under the lock and deletes its `.env.portool`. A worktree that had no
-/// allocation is reported and treated as success (the desired end state --
-/// no allocation -- already holds).
+/// Runs `portool release`. Removes this worktree's `.env.portool` first,
+/// then its ledger entry under the lock -- in that order, so a failed env
+/// removal keeps the block reserved (external review P1 #2: the unsafe
+/// inconsistency would be "block freed in the ledger but the old env still
+/// hands out its ports"; the safe one is "env gone but block still
+/// reserved"). A worktree that had no allocation is reported and treated as
+/// success (the desired end state -- no allocation -- already holds).
 pub fn run() -> Result<()> {
     let cwd = std::env::current_dir()?;
     let ctx = GitCtx::discover(&cwd)?;
@@ -22,26 +25,36 @@ pub fn run() -> Result<()> {
 
     let _lock = lock::acquire(&paths::lock_path()?, LOCK_TIMEOUT)?;
     let registry_path = paths::registry_path()?;
-    let load = store::load(&registry_path, true);
-    if load.read_error {
-        return Err(Error::General(
-            "failed to read the ledger; aborting without writing".to_string(),
-        ));
-    }
-    let mut registry = load.registry;
+    let mut registry = match store::load_strict(&registry_path)? {
+        Some(registry) => registry,
+        None => {
+            // No ledger at all: there is nothing to free. Still remove a
+            // stray env file so the end state is consistent.
+            remove_env_file(&ctx)?;
+            println!(
+                "portool: {} had no allocation to release",
+                ctx.worktree_root.display()
+            );
+            return Ok(());
+        }
+    };
 
-    let removed = registry
-        .find_project_mut(&common_dir_key)
-        .and_then(|project| project.worktrees.remove(&worktree_key))
-        .is_some();
+    let has_entry = registry
+        .find_project(&common_dir_key)
+        .map(|project| project.worktrees.contains_key(&worktree_key))
+        .unwrap_or(false);
 
-    if removed {
+    // Env file first: if this fails, the ledger entry is left in place and
+    // the block stays reserved.
+    remove_env_file(&ctx)?;
+
+    if has_entry {
+        registry
+            .find_project_mut(&common_dir_key)
+            .expect("has_entry checked above")
+            .worktrees
+            .remove(&worktree_key);
         store::save(&registry_path, &registry)?;
-    }
-    // Remove the env file regardless (best effort): its absence is the point.
-    let _ = std::fs::remove_file(ctx.worktree_root.join(".env.portool"));
-
-    if removed {
         println!("portool: released {}", ctx.worktree_root.display());
     } else {
         println!(
@@ -50,4 +63,19 @@ pub fn run() -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Removes the worktree's `.env.portool`. Absence is success (it is the
+/// desired end state); any other failure is a hard error so the caller
+/// never frees the ledger entry while the env file still exists.
+fn remove_env_file(ctx: &GitCtx) -> Result<()> {
+    let env_path = ctx.worktree_root.join(".env.portool");
+    match std::fs::remove_file(&env_path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(Error::General(format!(
+            "failed to remove {}: {err}; the ledger entry was left in place",
+            env_path.display()
+        ))),
+    }
 }

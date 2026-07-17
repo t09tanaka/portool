@@ -1,7 +1,11 @@
-//! Ledger (`registry.json`) I/O: loading with corruption recovery, and
-//! atomic (temp-file + rename) saving (spec §5, §7).
+//! Ledger (`registry.json`) I/O: fail-closed loading and atomic (temp-file
+//! + rename) saving (spec §5, §7).
+//!
+//! Loading never mutates the ledger. A corrupt or unsupported-version file
+//! is reported as such and left exactly where it is; the only code path
+//! that moves a bad ledger aside is `portool doctor --repair`, via
+//! [`move_aside`].
 
-use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::registry::Registry;
 use std::fs;
@@ -9,133 +13,101 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// The outcome of [`load`].
+/// The outcome of [`load`]: every distinct on-disk state a caller may need
+/// to react to. `load` itself never prints, renames, or writes anything.
 #[derive(Debug)]
-pub struct LoadResult {
-    /// The loaded (or freshly-empty) registry.
-    pub registry: Registry,
-    /// Whether the on-disk file existed but failed to parse. Callers on
-    /// the sync fast path use this to force a fall-through to the slow
-    /// path, since a corrupt ledger can never satisfy the fast-path
-    /// equality checks.
-    pub corrupt: bool,
-    /// Whether the file exists but could not be read for a reason other
-    /// than "not found" (permissions, EIO, path is a directory, ...). The
-    /// returned `registry` is an empty placeholder, not a faithful read of
-    /// whatever is actually on disk. Callers that are about to overwrite
-    /// the ledger (the sync/prune slow paths, under the lock) must treat
-    /// this as fatal and abort *without* saving -- saving would silently
-    /// clobber a ledger that may well still be intact. This is distinct
-    /// from `corrupt`: a corrupt (unparseable) file has already been moved
-    /// aside by this call, so it is safe to proceed with the empty
-    /// registry in that case.
-    pub read_error: bool,
+pub enum LedgerLoad {
+    /// No ledger file exists yet.
+    Missing,
+    /// The ledger parsed, validated, and (if it was an older schema)
+    /// migrated in memory.
+    Loaded(Registry),
+    /// The file exists but is unparseable or violates a semantic invariant.
+    /// The file has been left in place.
+    Corrupt { reason: String },
+    /// The file parsed far enough to reveal a schema version this build
+    /// does not understand -- almost certainly written by a *newer*
+    /// portool. Deliberately distinct from [`LedgerLoad::Corrupt`]: the
+    /// right fix is upgrading portool, never "repairing" the file.
+    UnsupportedVersion { found: u32, supported: u32 },
+    /// The file exists but could not be read for a reason other than "not
+    /// found" (permissions, EIO, path is a directory, ...). The ledger may
+    /// well still be intact on disk, so callers must never overwrite it.
+    ReadError { reason: String },
 }
 
-/// Loads the registry at `path`.
-///
-/// - If the file does not exist, returns an empty registry (spec §5: "台帳が
-///   存在しない...場合は空台帳として再生成").
-/// - If the file cannot be read for any other reason (permissions, EIO,
-///   path is a directory, ...), a warning is printed to stderr before
-///   falling back to an empty registry — the ledger may well still exist,
-///   so this must never happen silently (a subsequent [`save`] would
-///   overwrite it with the empty one).
-/// - If the file exists but fails to parse as JSON, `corrupt` is reported as
-///   `true` and an empty registry is returned. `heal` controls what happens
-///   to the file itself:
-///     - `heal = true` (the caller holds the write lock and is about to
-///       overwrite the ledger anyway: the sync slow path, `prune`'s locked
-///       non-dry-run path): the file is renamed aside to
-///       `<path>.corrupt-<unix seconds>` and a warning is printed to
-///       stderr. If the rename itself fails, a warning is printed and
-///       loading still falls back to an empty registry (the original
-///       corrupt file is left in place, to be retried next call).
-///     - `heal = false` (a lock-free, read-only caller: the sync fast path,
-///       `ls`, `prune --dry-run`): the file is left untouched. Renaming it
-///       here would race a concurrent locked writer that is in the middle
-///       of repairing the same file, and could silently discard hand-edited
-///       `pinned`/`reservations` entries it just wrote -- a read-only
-///       command must never mutate ledger state.
-///
-/// The empty registry's `range` field is informational only; callers that
-/// detect a freshly-created ledger (`corrupt` or a missing file) and hold a
-/// live [`Config`] should overwrite `registry.range` with the config's pool
-/// before the first save, per the frozen decision that `range` reflects the
-/// pool at ledger-creation time.
-pub fn load(path: &Path, heal: bool) -> LoadResult {
+/// Loads the registry at `path` without ever touching the file.
+pub fn load(path: &Path) -> LedgerLoad {
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return LoadResult {
-                registry: Registry::empty(Config::default().range),
-                corrupt: false,
-                read_error: false,
-            };
-        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return LedgerLoad::Missing,
         Err(err) => {
-            eprintln!(
-                "portool: warning: failed to read {}: {err}; treating the ledger as empty",
-                path.display()
-            );
-            return LoadResult {
-                registry: Registry::empty(Config::default().range),
-                corrupt: false,
-                read_error: true,
-            };
+            return LedgerLoad::ReadError {
+                reason: err.to_string(),
+            }
         }
     };
 
-    // A ledger is corrupt if it fails to parse / migrate *or* parses but
-    // violates a semantic invariant (batch B #9): being valid JSON is
-    // necessary but not sufficient to trust it. `from_json` also migrates an
-    // older (v1) schema to the current one in memory (batch C).
-    match Registry::from_json(&contents) {
-        Ok(registry) => match registry.validate() {
-            Ok(()) => LoadResult {
-                registry,
-                corrupt: false,
-                read_error: false,
-            },
-            Err(validation_err) => handle_corrupt(path, heal, &validation_err.to_string()),
+    // A ledger is corrupt if it fails to parse *or* parses but violates a
+    // semantic invariant (batch B #9): being valid JSON is necessary but not
+    // sufficient to trust it. `from_json` also migrates an older (v1) schema
+    // to the current one in memory (batch C). An unrecognized schema version
+    // is kept distinct from corruption throughout.
+    let result = Registry::from_json(&contents).and_then(|registry| {
+        registry.validate()?;
+        Ok(registry)
+    });
+    match result {
+        Ok(registry) => LedgerLoad::Loaded(registry),
+        Err(Error::UnsupportedRegistryVersion { found, supported }) => {
+            LedgerLoad::UnsupportedVersion { found, supported }
+        }
+        Err(err) => LedgerLoad::Corrupt {
+            reason: err.to_string(),
         },
-        Err(parse_err) => handle_corrupt(path, heal, &parse_err.to_string()),
     }
 }
 
-/// Handles a corrupt ledger (unparseable, or parseable-but-invalid). With
-/// `heal` (the caller holds the write lock), the file is renamed aside; a
-/// read-only caller leaves it in place. Either way an empty registry is
-/// returned with `corrupt = true`.
-fn handle_corrupt(path: &Path, heal: bool, reason: &str) -> LoadResult {
-    if !heal {
-        eprintln!(
-            "portool: warning: {} is corrupt ({reason}); treating the ledger as empty",
+/// Loads the registry for a command that must be able to trust it
+/// (fail-closed): `Ok(None)` when no ledger exists yet, `Ok(Some(_))` for a
+/// valid one, and a hard error for everything else -- a corrupt,
+/// unsupported-version, or unreadable ledger is never silently replaced
+/// with an empty one (external review P1 #1).
+pub fn load_strict(path: &Path) -> Result<Option<Registry>> {
+    match load(path) {
+        LedgerLoad::Missing => Ok(None),
+        LedgerLoad::Loaded(registry) => Ok(Some(registry)),
+        LedgerLoad::Corrupt { reason } => Err(Error::General(format!(
+            "{} is corrupt ({reason}); refusing to touch it -- run 'portool doctor --repair' \
+             to move it aside and rebuild this project's entries",
             path.display()
-        );
-        return LoadResult {
-            registry: Registry::empty(Config::default().range),
-            corrupt: true,
-            read_error: false,
-        };
+        ))),
+        LedgerLoad::UnsupportedVersion { found, supported } => Err(Error::General(format!(
+            "{} uses registry schema version {found}, but this build understands version \
+             {supported}; upgrade portool instead of modifying the ledger",
+            path.display()
+        ))),
+        LedgerLoad::ReadError { reason } => Err(Error::General(format!(
+            "failed to read {} ({reason}); aborting without writing to avoid clobbering an \
+             intact ledger",
+            path.display()
+        ))),
     }
+}
+
+/// Renames the ledger aside to `<path>.corrupt-<unix seconds>` and returns
+/// the new path. Only `portool doctor --repair` calls this -- an explicit,
+/// user-requested reset is the single place a bad ledger may be moved.
+pub fn move_aside(path: &Path) -> Result<PathBuf> {
     let corrupt_path = corrupt_sibling_path(path);
-    match fs::rename(path, &corrupt_path) {
-        Ok(()) => eprintln!(
-            "portool: warning: {} is corrupt ({reason}); moved aside to {}",
+    fs::rename(path, &corrupt_path).map_err(|err| {
+        Error::General(format!(
+            "failed to move {} aside to {}: {err}",
             path.display(),
             corrupt_path.display()
-        ),
-        Err(rename_err) => eprintln!(
-            "portool: warning: {} is corrupt ({reason}); failed to move it aside: {rename_err}",
-            path.display()
-        ),
-    }
-    LoadResult {
-        registry: Registry::empty(Config::default().range),
-        corrupt: true,
-        read_error: false,
-    }
+        ))
+    })?;
+    Ok(corrupt_path)
 }
 
 /// Saves `registry` to `path` atomically: writes pretty-printed JSON to a
@@ -205,124 +177,122 @@ mod tests {
         registry
     }
 
-    #[test]
-    fn load_missing_file_returns_empty_registry() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("registry.json");
-
-        let result = load(&path, true);
-
-        assert!(!result.corrupt);
-        assert!(!result.read_error);
-        assert!(result.registry.projects.is_empty());
-        assert!(result.registry.reservations.is_empty());
+    fn dir_entries(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect()
     }
 
     #[test]
-    fn load_non_not_found_read_error_falls_back_to_empty_without_touching_the_file() {
+    fn load_missing_file_is_missing() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("registry.json");
+
+        assert!(matches!(load(&path), LedgerLoad::Missing));
+        assert_eq!(load_strict(&path).unwrap(), None);
+    }
+
+    #[test]
+    fn load_non_not_found_read_error_is_reported_without_touching_the_file() {
         let tmp = TempDir::new().unwrap();
         // A directory in place of registry.json is a deterministic
         // non-NotFound read error on every Unix platform.
         let path = tmp.path().join("registry.json");
         fs::create_dir(&path).unwrap();
 
-        let result = load(&path, true);
-
-        assert!(!result.corrupt);
+        assert!(matches!(load(&path), LedgerLoad::ReadError { .. }));
         assert!(
-            result.read_error,
-            "a non-NotFound read failure must be reported so callers can abort instead of saving"
+            load_strict(&path).is_err(),
+            "a non-NotFound read failure must abort fail-closed callers"
         );
-        assert!(result.registry.projects.is_empty());
-        // Unlike the corrupt-JSON path, a read error must not rename or
-        // remove anything: the ledger may still be intact on disk.
+        // A read error must not rename or remove anything: the ledger may
+        // still be intact on disk.
         assert!(path.is_dir(), "the unreadable path must be left in place");
-        let siblings: Vec<String> = fs::read_dir(tmp.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .collect();
-        assert_eq!(siblings, vec!["registry.json".to_string()]);
+        assert_eq!(dir_entries(tmp.path()), vec!["registry.json".to_string()]);
     }
 
     #[test]
-    fn load_corrupt_json_moves_it_aside_and_returns_empty_when_heal_is_true() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("registry.json");
-        fs::write(&path, b"{ this is not valid json").unwrap();
-
-        let result = load(&path, true);
-
-        assert!(result.corrupt);
-        assert!(!result.read_error);
-        assert!(result.registry.projects.is_empty());
-        assert!(
-            !path.exists(),
-            "original corrupt file should be moved aside"
-        );
-
-        let corrupt_files: Vec<String> = fs::read_dir(tmp.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .filter(|n| n.starts_with("registry.json.corrupt-"))
-            .collect();
-        assert_eq!(corrupt_files.len(), 1);
-    }
-
-    #[test]
-    fn load_corrupt_json_leaves_it_in_place_when_heal_is_false() {
-        // A read-only caller (sync's fast path, `ls`, `prune --dry-run`)
-        // must never rename a corrupt ledger aside: doing so could race a
-        // concurrent locked writer that is in the middle of repairing the
-        // very same file, silently discarding hand-edited pinned /
-        // reservations entries it just wrote.
+    fn load_corrupt_json_is_reported_and_left_in_place() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("registry.json");
         let original_contents = b"{ this is not valid json".to_vec();
         fs::write(&path, &original_contents).unwrap();
 
-        let result = load(&path, false);
-
-        assert!(result.corrupt);
-        assert!(!result.read_error);
-        assert!(result.registry.projects.is_empty());
-        assert!(path.exists(), "the corrupt file must be left in place");
-        assert_eq!(fs::read(&path).unwrap(), original_contents);
-
-        let siblings: Vec<String> = fs::read_dir(tmp.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .collect();
+        assert!(matches!(load(&path), LedgerLoad::Corrupt { .. }));
+        assert!(
+            load_strict(&path).is_err(),
+            "a corrupt ledger must be a hard error, never an empty registry"
+        );
         assert_eq!(
-            siblings,
+            fs::read(&path).unwrap(),
+            original_contents,
+            "loading must never modify the corrupt file"
+        );
+        assert_eq!(
+            dir_entries(tmp.path()),
             vec!["registry.json".to_string()],
-            "no corrupt-<timestamp> sibling should be created"
+            "no corrupt-<timestamp> sibling may be created by load"
         );
     }
 
     #[test]
-    fn load_semantically_invalid_ledger_is_corrupt() {
+    fn load_future_schema_is_unsupported_version_not_corrupt() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("registry.json");
-        // Valid JSON that parses to a Registry, but an unrecognized schema
-        // version -> validation fails -> treated as corrupt.
         fs::write(
             &path,
             br#"{"version":999,"range":[3000,9999],"projects":{},"reservations":[]}"#,
         )
         .unwrap();
 
-        let result = load(&path, false);
-
+        match load(&path) {
+            LedgerLoad::UnsupportedVersion { found, supported } => {
+                assert_eq!(found, 999);
+                assert_eq!(supported, Registry::CURRENT_VERSION);
+            }
+            other => panic!("expected UnsupportedVersion, got {other:?}"),
+        }
+        let err = load_strict(&path).unwrap_err();
         assert!(
-            result.corrupt,
-            "a parseable but semantically invalid ledger must be reported corrupt"
+            err.to_string().contains("upgrade portool"),
+            "the error must steer toward upgrading, got: {err}"
         );
-        assert!(result.registry.projects.is_empty());
-        // heal = false: the file is left in place (no move-aside).
-        assert!(path.exists());
+        assert!(path.exists(), "the newer-version ledger must be untouched");
+    }
+
+    #[test]
+    fn load_semantically_invalid_ledger_is_corrupt() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("registry.json");
+        // Valid JSON, current version, but a reversed block -> validation
+        // fails -> corrupt.
+        fs::write(
+            &path,
+            br#"{"version":2,"range":[3000,9999],"projects":{},"reservations":[{"block":[4000,3999],"label":null,"pinned":false}]}"#,
+        )
+        .unwrap();
+
+        assert!(matches!(load(&path), LedgerLoad::Corrupt { .. }));
+        assert!(path.exists(), "the file must be left in place");
+    }
+
+    #[test]
+    fn move_aside_renames_to_a_corrupt_sibling() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("registry.json");
+        fs::write(&path, b"{ this is not valid json").unwrap();
+
+        let moved_to = move_aside(&path).unwrap();
+
+        assert!(!path.exists(), "the original file must be gone");
+        assert!(moved_to.exists());
+        assert!(moved_to
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("registry.json.corrupt-"));
     }
 
     #[test]
@@ -332,11 +302,8 @@ mod tests {
         let registry = sample_registry();
 
         save(&path, &registry).unwrap();
-        let result = load(&path, true);
 
-        assert!(!result.corrupt);
-        assert!(!result.read_error);
-        assert_eq!(result.registry, registry);
+        assert_eq!(load_strict(&path).unwrap(), Some(registry));
     }
 
     #[test]
@@ -356,12 +323,7 @@ mod tests {
 
         save(&path, &Registry::empty((3000, 9999))).unwrap();
 
-        let entries: Vec<String> = fs::read_dir(tmp.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .collect();
-        assert_eq!(entries, vec!["registry.json".to_string()]);
+        assert_eq!(dir_entries(tmp.path()), vec!["registry.json".to_string()]);
     }
 
     #[test]
@@ -372,7 +334,6 @@ mod tests {
         save(&path, &Registry::empty((3000, 9999))).unwrap();
         save(&path, &sample_registry()).unwrap();
 
-        let result = load(&path, true);
-        assert_eq!(result.registry, sample_registry());
+        assert_eq!(load_strict(&path).unwrap(), Some(sample_registry()));
     }
 }

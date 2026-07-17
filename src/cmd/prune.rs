@@ -1,7 +1,7 @@
 //! `portool prune` (spec §8.2, §8.3, frozen decision 13): explicit GC,
 //! either for the current project or (`--all`) across the whole ledger.
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::gc;
 use crate::gitctx::{self, GitCtx};
 use crate::lock;
@@ -16,13 +16,18 @@ const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Runs `portool prune`. `--dry-run` never acquires the lock or writes the
 /// ledger; it loads its own snapshot, reports what it would reclaim, and
-/// discards it.
+/// discards it. Both modes are fail-closed on a corrupt, unsupported, or
+/// unreadable ledger: reclamation must never run against a placeholder
+/// empty registry.
 pub fn run(all: bool, dry_run: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
 
     if dry_run {
-        // Read-only, lock-free: never heal a corrupt ledger here.
-        let mut registry = load_registry_or_abort(false)?;
+        // Read-only, lock-free.
+        let mut registry = match store::load_strict(&paths::registry_path()?)? {
+            Some(registry) => registry,
+            None => return Ok(()), // no ledger -> nothing to prune
+        };
         if all {
             prune_all(&mut registry, true);
         } else {
@@ -33,8 +38,10 @@ pub fn run(all: bool, dry_run: bool) -> Result<()> {
     }
 
     let _lock = lock::acquire(&paths::lock_path()?, LOCK_TIMEOUT)?;
-    // Under the flock: safe to heal (rename aside) a corrupt ledger.
-    let mut registry = load_registry_or_abort(true)?;
+    let mut registry = match store::load_strict(&paths::registry_path()?)? {
+        Some(registry) => registry,
+        None => return Ok(()),
+    };
 
     let changed = if all {
         prune_all(&mut registry, false)
@@ -47,20 +54,6 @@ pub fn run(all: bool, dry_run: bool) -> Result<()> {
         store::save(&paths::registry_path()?, &registry)?;
     }
     Ok(())
-}
-
-/// Cross-task decision: a non-`NotFound` read failure must abort rather
-/// than proceed to (dry-run or real) reclamation against a placeholder
-/// empty registry, which for the real run would then overwrite a ledger
-/// that may still be intact on disk.
-fn load_registry_or_abort(heal: bool) -> Result<Registry> {
-    let load_result = store::load(&paths::registry_path()?, heal);
-    if load_result.read_error {
-        return Err(Error::General(
-            "failed to read the ledger; aborting without writing to avoid clobbering an intact ledger".to_string(),
-        ));
-    }
-    Ok(load_result.registry)
 }
 
 fn prune_current(registry: &mut Registry, ctx: &GitCtx, dry_run: bool) -> Result<bool> {

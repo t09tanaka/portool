@@ -5,6 +5,53 @@ All notable changes to portool are documented here. The format is based on
 [Semantic Versioning](https://semver.org/) (pre-1.0: a breaking change bumps
 the minor version).
 
+## [Unreleased]
+
+Fixes from the post-0.5.0 external review: the state-transition gaps between
+the ledger, `.env.portool`, and Git hooks.
+
+### Changed / Fixed
+
+- **A bad ledger is now truly fail-closed.** A corrupt, semantically
+  invalid, or unreadable `registry.json` makes `sync` / `reallocate` /
+  `release` / `prune` / `doctor` fail (exit 1) and leaves the file exactly
+  where it is — it is no longer silently moved aside and replaced with an
+  empty ledger (which reset all allocations and let stopped worktrees'
+  blocks be handed out again). A ledger written by a *newer* portool
+  (unsupported schema version) is reported distinctly, with "upgrade
+  portool" as the fix, and is likewise never touched.
+- **`portool doctor --repair`** is the new, single, explicit recovery path:
+  it moves the bad ledger aside to `registry.json.corrupt-<ts>` and rebuilds
+  the current project's entries from live worktrees' `.env.portool`.
+- **The config is validated before the sync fast path.** A `config.toml`
+  broken *after* a successful sync now fails the very next `sync`, instead
+  of being skipped on the lock-free fast path and only surfacing when some
+  unrelated change forced the slow path.
+- **A global/system-scope `core.hooksPath` shaped like Husky's `.husky/_` is
+  refused.** The shared-scope check now runs before Husky/custom
+  classification, so `init` can no longer write a hook into a shared
+  directory that would run on every repository's checkout. The check is also
+  fail-closed: an absolute `core.hooksPath` whose scope cannot be determined
+  (git < 2.26) is treated as shared.
+- **`reallocate` always moves.** The current block is kept in the occupied
+  set, so `portool reallocate` can never re-select the block it was asked to
+  leave (it errors with exit 3 if no other block fits), matching its
+  documented contract.
+- **`release` removes `.env.portool` before freeing the block.** A failed
+  env-file removal now keeps the ledger entry (block still reserved) and
+  exits 1, instead of freeing the block while the stale env file kept
+  handing out its ports to a second worktree.
+- **`doctor` validates before writing.** A nonsense block in a hand-edited
+  `.env.portool` header (port 0, reversed range) is reported and skipped,
+  and the rebuilt ledger is re-validated before it is saved — `doctor` can
+  no longer write a ledger the next command would reject as corrupt.
+- **A manifest too wide for a port is rejected.** A `.portool.toml` whose
+  required block size exceeds 65535 is a hard error instead of being clamped
+  (under which two declared offsets silently shared one port).
+- **Real flock errors are no longer reported as timeouts.** Only genuine
+  lock contention is retried; any other locking failure (unsupported
+  filesystem, I/O error) is returned immediately as itself.
+
 ## [0.5.0] - 2026-07-17
 
 A hardening release that makes portool's guarantees match its claims,
