@@ -586,7 +586,6 @@ mod tests {
         let config = Config {
             range: (3000, 3999),
             block_align: 5,
-            gc_days: 30,
         };
 
         let block = allocate_or_reuse_block(
@@ -615,7 +614,6 @@ mod tests {
         let config = Config {
             range: (3000, 3999),
             block_align: 5,
-            gc_days: 30,
         };
 
         let block = allocate_or_reuse_block(
@@ -649,7 +647,6 @@ mod tests {
         let config = Config {
             range: (3000, 3009),
             block_align: 5,
-            gc_days: 30,
         };
 
         let result = allocate_or_reuse_block(

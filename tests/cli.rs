@@ -2641,3 +2641,109 @@ fn recreated_worktree_on_same_branch_reclaims_its_block() {
         "same project+branch must return to the same block"
     );
 }
+
+// --- Task 9: reserve/unreserve, pin/unpin -----------------------------------
+
+/// Ranges 18000-18299 are used by Task 6 tests, and 18500-18599 by Task 8;
+/// this test's 10-wide pool lives just above the Task 8 range.
+#[test]
+fn reserve_blocks_allocation_and_unreserve_frees_it() {
+    let env = TestEnv::new();
+    env.write_config("range = [18600, 18609]\n");
+    let repo = env.path("app");
+    init_repo(&repo);
+
+    // Reserve the entire first half of the pool.
+    let out = env.run(&repo, &["reserve", "18600-18604", "--label", "postgres"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Sync must land on the second half.
+    assert!(env.run(&repo, &["sync"]).status.success());
+    let reg = env.registry();
+    let block = &reg["projects"]
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap()["worktrees"]
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap()["block"];
+    assert_eq!(
+        block[0].as_u64().unwrap(),
+        18605,
+        "allocation must avoid the reservation"
+    );
+
+    // Idempotent re-reserve succeeds; overlapping reserve fails.
+    assert!(env.run(&repo, &["reserve", "18600-18604"]).status.success());
+    assert!(!env.run(&repo, &["reserve", "18604-18606"]).status.success());
+
+    // Single-port unreserve removes the containing reservation.
+    assert!(env.run(&repo, &["unreserve", "18602"]).status.success());
+    assert!(env.registry()["reservations"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    // Unreserving again is an error.
+    assert!(!env.run(&repo, &["unreserve", "18602"]).status.success());
+}
+
+#[test]
+fn pin_protects_a_stale_entry_from_prune_and_unpin_releases_it() {
+    let env = TestEnv::new();
+    env.write_config("range = [18700, 18799]\n");
+    let repo = env.path("app");
+    init_repo(&repo);
+    git(&repo, &["branch", "feature-y"]);
+    let wt = env.path("wt");
+    git(
+        &repo,
+        &["worktree", "add", wt.to_str().unwrap(), "feature-y"],
+    );
+    assert!(env.run(&wt, &["sync"]).status.success());
+    assert!(env
+        .run(&wt, &["pin", "--label", "keep-me"])
+        .status
+        .success());
+
+    git(
+        &repo,
+        &["worktree", "remove", "--force", wt.to_str().unwrap()],
+    );
+    assert!(env.run(&repo, &["prune"]).status.success());
+    let reg = env.registry();
+    let worktrees = reg["projects"]
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap()["worktrees"]
+        .as_object()
+        .unwrap();
+    // Only `wt` ever synced (the main worktree never ran `sync`/`init` in
+    // this test), so the ledger has exactly one entry -- the pinned `wt` --
+    // which must survive an otherwise-eligible prune (gone directory, free
+    // ports).
+    assert_eq!(worktrees.len(), 1, "pinned entry must survive prune");
+    assert!(worktrees.values().next().unwrap()["pinned"]
+        .as_bool()
+        .unwrap());
+}
+
+#[test]
+fn pin_without_allocation_is_an_error() {
+    let env = TestEnv::new();
+    let repo = env.path("app");
+    init_repo(&repo);
+    let out = env.run(&repo, &["pin"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("sync"));
+}

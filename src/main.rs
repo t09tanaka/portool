@@ -100,6 +100,27 @@ enum Command {
         #[arg(long)]
         keep_allocations: bool,
     },
+    /// Reserve a port or port range so portool never allocates over it.
+    Reserve {
+        /// PORT or START-END (inclusive), e.g. 5432 or 6000-6009.
+        ports: String,
+        /// Optional label shown in ls (e.g. "postgres").
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Remove a reservation (single port matches its containing block).
+    Unreserve {
+        /// PORT or START-END (inclusive).
+        ports: String,
+    },
+    /// Protect the current worktree's allocation from GC.
+    Pin {
+        /// Optional label shown in ls.
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Remove the current worktree's GC protection.
+    Unpin,
 }
 
 fn main() {
@@ -144,6 +165,10 @@ fn main() {
         Command::Release => cmd::release::run(),
         Command::Unhook => cmd::init::unhook(),
         Command::Deinit { keep_allocations } => cmd::init::deinit(keep_allocations),
+        Command::Reserve { ports, label } => cmd::reserve::reserve(&ports, label),
+        Command::Unreserve { ports } => cmd::reserve::unreserve(&ports),
+        Command::Pin { label } => cmd::pin::pin(label),
+        Command::Unpin => cmd::pin::unpin(),
     };
 
     if let Err(err) = result {

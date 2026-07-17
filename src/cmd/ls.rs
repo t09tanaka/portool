@@ -4,7 +4,7 @@
 use crate::error::{Error, Result};
 use crate::gitctx::GitCtx;
 use crate::paths;
-use crate::registry::{ProjectEntry, Registry};
+use crate::registry::{ProjectEntry, Registry, Reservation};
 use crate::store;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -71,7 +71,7 @@ pub fn run(json: bool, all: bool) -> Result<()> {
     if json {
         print_json(&registry, filtered);
     } else {
-        print_table(&filtered);
+        print_table(&filtered, &registry.reservations);
     }
     Ok(())
 }
@@ -99,8 +99,9 @@ struct Row {
 
 /// Frozen decision 11: `PROJECT WORKTREE BRANCH BLOCK STATUS`, two spaces
 /// between columns, columns left-justified to the widest cell (header
-/// included).
-fn print_table(projects: &BTreeMap<String, ProjectEntry>) {
+/// included). Reservations are global, so they're printed (Task 9) after
+/// the table whenever any exist, regardless of the `--all` filter.
+fn print_table(projects: &BTreeMap<String, ProjectEntry>, reservations: &[Reservation]) {
     let home = std::env::var("HOME").ok().filter(|h| !h.is_empty());
 
     let mut rows: Vec<Row> = Vec::new();
@@ -140,6 +141,18 @@ fn print_table(projects: &BTreeMap<String, ProjectEntry>) {
     print_row(&header, w_project, w_worktree, w_branch, w_block);
     for row in &rows {
         print_row(row, w_project, w_worktree, w_branch, w_block);
+    }
+
+    if !reservations.is_empty() {
+        println!();
+        for r in reservations {
+            println!(
+                "reserved {}-{}  {}",
+                r.block.0,
+                r.block.1,
+                r.label.as_deref().unwrap_or("-")
+            );
+        }
     }
 }
 
