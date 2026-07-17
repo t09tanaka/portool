@@ -2,9 +2,12 @@
 
 A passive, global port ledger for `git worktree`-based development.
 
-`portool` hands every git worktree on your machine a stable, non-conflicting
-block of TCP ports — across *all* your repositories at once — without you
-ever having to think about port numbers again.
+`portool` keeps a cooperating ledger that hands every git worktree a stable
+block of TCP ports and prevents portool-managed blocks from overlapping —
+across all the repositories that share one ledger — so you rarely have to
+think about port numbers. (The ledger is per OS-user + XDG-state scope, and
+real port *availability* is verified where you actually use the ports; see
+[How it works](#how-it-works).)
 
 ## What & why
 
@@ -13,14 +16,20 @@ project) at a time, you've hit this: two dev servers both want `3000`, and
 whichever started first wins. `portool` fixes that with two rules it never
 breaks:
 
-- **Global ledger.** One JSON file (`~/.local/state/portool/registry.json`)
-  tracks every port block handed out to every project and every worktree on
-  the machine. No two active blocks ever overlap.
-- **Fully passive.** `portool` never wraps `git worktree add`, never
-  daemonizes, never manages your processes. It installs a `post-checkout`
-  git hook once (`portool init`); after that, plain `git worktree add`,
-  `git checkout`, or an agent creating worktrees on your behalf all just
-  work — the right ports show up on their own.
+- **Cooperating ledger.** One JSON file (`~/.local/state/portool/registry.json`)
+  tracks every port block handed out to every project and worktree that shares
+  it. No two portool-managed blocks overlap. The ledger's scope is one
+  OS-user + `XDG_STATE_HOME` — a different user, `sudo`, or a container with a
+  different `HOME`/`XDG_STATE_HOME` keeps a separate ledger, and portool does
+  not coordinate a machine-wide port space across those.
+- **Passive.** `portool` never wraps `git worktree add`, never daemonizes,
+  never manages your processes. It installs a `post-checkout` (and
+  `post-merge`) git hook once (`portool init`); after that, plain
+  `git worktree add`, `git checkout`, or an agent creating worktrees on your
+  behalf all just work — the right ports show up on their own. Because the
+  hook keeps `.env.portool` fresh without re-checking that the ports are
+  actually free right now, real availability is confirmed at the execution
+  boundary (`portool exec`) rather than on every checkout.
 
 The ledger itself stays passive: `portool` never daemonizes, proxies
 requests, or supervises processes. The one place it touches your command
@@ -345,10 +354,11 @@ entire project's `common_dir` — the whole repository clone — is gone.
 | Code | Meaning |
 |---|---|
 | 0 | Success (including a no-op sync). |
-| 1 | General error — outside a git repository, a malformed `.portool.toml` or `config.toml`, an I/O failure, etc. |
+| 1 | General error — outside a git repository, a malformed `.portool.toml` or `config.toml`, an unreadable or corrupt ledger, an I/O failure, etc. |
 | 2 | No subrange, however many are acquired, could ever fit one block (the manifest's block size exceeds `subrange_size`). |
 | 3 | The pool has no room left for a new subrange. |
 | 4 | Timed out (10s) waiting for the registry lock. |
+| 64 | CLI usage error (unknown subcommand or bad flags). Kept distinct from portool's semantic codes above. |
 
 `portool exec` is the exception: once the child command starts, its exit
 code is passed through unchanged (with `127` for command not found and
@@ -368,6 +378,13 @@ gc_days = 30              # reserved for future cross-project GC
 
 Changing this file only affects *new* allocations — existing blocks are
 left in place.
+
+The config is **fail-closed**: a malformed file (invalid TOML, an unknown
+field such as a misspelled `ragne`, a reversed `range`, …) is a hard error
+(exit 1), never a silent revert to defaults — so a typo can't quietly move
+your pool back to `3000..=9999`. Only an *absent* file means defaults. Note
+too that `XDG_STATE_HOME` / `XDG_CONFIG_HOME` are honored only when set to an
+absolute path (per the XDG Base Directory spec); a relative value is ignored.
 
 ## How it works
 

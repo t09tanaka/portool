@@ -1336,3 +1336,60 @@ fn sync_upgrades_an_old_format_env_file_then_second_sync_is_a_noop() {
         "the post-upgrade sync must not rewrite .env.portool"
     );
 }
+
+// --- Batch B: fail-closed & honesty ---------------------------------------
+
+/// `ls --json` must not disguise a corrupt ledger as an empty-but-valid one:
+/// it exits non-zero and emits an explicit error object on stdout (batch B
+/// #10).
+#[test]
+fn ls_json_reports_corrupt_ledger_and_exits_nonzero() {
+    let env = TestEnv::new();
+    let dir = env.registry_path().parent().unwrap().to_path_buf();
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(env.registry_path(), b"{ this is not valid json").unwrap();
+
+    let output = env.run(&env.root, &["ls", "--json", "--all"]);
+    assert!(
+        !output.status.success(),
+        "ls --json on a corrupt ledger must exit non-zero"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\"error\""),
+        "ls --json must emit an explicit error object, got stdout: {stdout}"
+    );
+}
+
+/// A clap usage error (unknown subcommand) exits with the dedicated usage
+/// code 64, not clap's default 2 (which used to collide with a real
+/// allocation error) (batch B #15).
+#[test]
+fn usage_error_exits_64() {
+    let env = TestEnv::new();
+    let output = env.run(&env.root, &["definitely-not-a-subcommand"]);
+    assert_eq!(
+        output.status.code(),
+        Some(64),
+        "a clap usage error must exit 64, got: {:?}",
+        output.status.code()
+    );
+}
+
+/// A malformed global config is fail-closed: portool exits with a general
+/// error (1) rather than silently reverting to defaults (batch B #8).
+#[test]
+fn malformed_config_is_fatal() {
+    let env = TestEnv::new();
+    let repo = env.path("repo");
+    init_repo(&repo);
+    env.write_config("range = [oops not a list\n");
+
+    let output = env.run(&repo, &["sync"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a malformed config.toml must be a hard error (exit 1), stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

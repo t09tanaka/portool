@@ -86,42 +86,54 @@ pub fn load(path: &Path, heal: bool) -> LoadResult {
         }
     };
 
+    // A ledger is corrupt if it fails to parse as JSON *or* parses but
+    // violates a semantic invariant (batch B #9): being valid JSON is
+    // necessary but not sufficient to trust it.
     match serde_json::from_str::<Registry>(&contents) {
-        Ok(registry) => LoadResult {
-            registry,
-            corrupt: false,
-            read_error: false,
-        },
-        Err(parse_err) => {
-            if !heal {
-                eprintln!(
-                    "portool: warning: {} is corrupt ({parse_err}); treating the ledger as empty",
-                    path.display()
-                );
-                return LoadResult {
-                    registry: Registry::empty(Config::default().range),
-                    corrupt: true,
-                    read_error: false,
-                };
-            }
-            let corrupt_path = corrupt_sibling_path(path);
-            match fs::rename(path, &corrupt_path) {
-                Ok(()) => eprintln!(
-                    "portool: warning: {} is corrupt ({parse_err}); moved aside to {}",
-                    path.display(),
-                    corrupt_path.display()
-                ),
-                Err(rename_err) => eprintln!(
-                    "portool: warning: {} is corrupt ({parse_err}); failed to move it aside: {rename_err}",
-                    path.display()
-                ),
-            }
-            LoadResult {
-                registry: Registry::empty(Config::default().range),
-                corrupt: true,
+        Ok(registry) => match registry.validate() {
+            Ok(()) => LoadResult {
+                registry,
+                corrupt: false,
                 read_error: false,
-            }
-        }
+            },
+            Err(validation_err) => handle_corrupt(path, heal, &validation_err.to_string()),
+        },
+        Err(parse_err) => handle_corrupt(path, heal, &parse_err.to_string()),
+    }
+}
+
+/// Handles a corrupt ledger (unparseable, or parseable-but-invalid). With
+/// `heal` (the caller holds the write lock), the file is renamed aside; a
+/// read-only caller leaves it in place. Either way an empty registry is
+/// returned with `corrupt = true`.
+fn handle_corrupt(path: &Path, heal: bool, reason: &str) -> LoadResult {
+    if !heal {
+        eprintln!(
+            "portool: warning: {} is corrupt ({reason}); treating the ledger as empty",
+            path.display()
+        );
+        return LoadResult {
+            registry: Registry::empty(Config::default().range),
+            corrupt: true,
+            read_error: false,
+        };
+    }
+    let corrupt_path = corrupt_sibling_path(path);
+    match fs::rename(path, &corrupt_path) {
+        Ok(()) => eprintln!(
+            "portool: warning: {} is corrupt ({reason}); moved aside to {}",
+            path.display(),
+            corrupt_path.display()
+        ),
+        Err(rename_err) => eprintln!(
+            "portool: warning: {} is corrupt ({reason}); failed to move it aside: {rename_err}",
+            path.display()
+        ),
+    }
+    LoadResult {
+        registry: Registry::empty(Config::default().range),
+        corrupt: true,
+        read_error: false,
     }
 }
 
@@ -288,6 +300,29 @@ mod tests {
             vec!["registry.json".to_string()],
             "no corrupt-<timestamp> sibling should be created"
         );
+    }
+
+    #[test]
+    fn load_semantically_invalid_ledger_is_corrupt() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("registry.json");
+        // Valid JSON that parses to a Registry, but an unrecognized schema
+        // version -> validation fails -> treated as corrupt.
+        fs::write(
+            &path,
+            br#"{"version":999,"range":[3000,9999],"projects":{},"reservations":[]}"#,
+        )
+        .unwrap();
+
+        let result = load(&path, false);
+
+        assert!(
+            result.corrupt,
+            "a parseable but semantically invalid ledger must be reported corrupt"
+        );
+        assert!(result.registry.projects.is_empty());
+        // heal = false: the file is left in place (no move-aside).
+        assert!(path.exists());
     }
 
     #[test]

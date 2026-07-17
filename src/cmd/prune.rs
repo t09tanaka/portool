@@ -32,7 +32,7 @@ pub fn run(all: bool, dry_run: bool) -> Result<()> {
         return Ok(());
     }
 
-    let _lock = lock::acquire(&paths::lock_path(), LOCK_TIMEOUT)?;
+    let _lock = lock::acquire(&paths::lock_path()?, LOCK_TIMEOUT)?;
     // Under the flock: safe to heal (rename aside) a corrupt ledger.
     let mut registry = load_registry_or_abort(true)?;
 
@@ -44,7 +44,7 @@ pub fn run(all: bool, dry_run: bool) -> Result<()> {
     };
 
     if changed {
-        store::save(&paths::registry_path(), &registry)?;
+        store::save(&paths::registry_path()?, &registry)?;
     }
     Ok(())
 }
@@ -54,7 +54,7 @@ pub fn run(all: bool, dry_run: bool) -> Result<()> {
 /// empty registry, which for the real run would then overwrite a ledger
 /// that may still be intact on disk.
 fn load_registry_or_abort(heal: bool) -> Result<Registry> {
-    let load_result = store::load(&paths::registry_path(), heal);
+    let load_result = store::load(&paths::registry_path()?, heal);
     if load_result.read_error {
         return Err(Error::General(
             "failed to read the ledger; aborting without writing to avoid clobbering an intact ledger".to_string(),
