@@ -1126,6 +1126,70 @@ fn prune_all_reclaims_a_fully_deleted_project_and_leaves_others_untouched() {
     );
 }
 
+/// P0-2 (external review): `prune --all` must NOT reclaim a project's
+/// entries when `git worktree list` fails for it (e.g. the common-dir
+/// path exists but is not a git repository). Enumeration failure is not
+/// "zero worktrees".
+#[test]
+fn prune_all_keeps_entries_when_worktree_enumeration_fails() {
+    let env = TestEnv::new();
+    env.write_config("range = [17300, 17399]\n");
+
+    // A fake project whose common_dir exists but is NOT a git repo, with
+    // a worktree path that no longer exists and a block whose ports are
+    // free -- the exact conditions under which the old fail-open code
+    // would have dropped the entry.
+    let fake_common = env.path("broken/.git");
+    fs::create_dir_all(&fake_common).unwrap();
+    let registry = serde_json::json!({
+        "version": 3,
+        "range": [17300, 17399],
+        "projects": {
+            fake_common.to_str().unwrap(): {
+                "name": "broken",
+                "worktrees": {
+                    "/no/such/worktree": {
+                        "block": [17300, 17304],
+                        "generation": 1,
+                        "pending_block": null,
+                        "branch": "main",
+                        "manifest_hash": null,
+                        "pinned": false,
+                        "label": null,
+                        "allocated_at": "2026-07-15T10:00:00+09:00",
+                        "last_seen_at": "2026-07-15T10:00:00+09:00"
+                    }
+                }
+            }
+        },
+        "reservations": []
+    });
+    fs::create_dir_all(env.registry_path().parent().unwrap()).unwrap();
+    fs::write(
+        env.registry_path(),
+        serde_json::to_string_pretty(&registry).unwrap(),
+    )
+    .unwrap();
+
+    // Run prune --all from a real repo (prune --all doesn't need one, but
+    // running from the scratch root is fine).
+    let out = env.run(&env.root, &["prune", "--all"]);
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("skipping project"),
+        "must report the skipped project, got: {stderr}"
+    );
+
+    // The entry must still be there.
+    let reg = env.registry();
+    assert!(
+        reg["projects"][fake_common.to_str().unwrap()]["worktrees"]["/no/such/worktree"]
+            .is_object(),
+        "enumeration failure must not reclaim the entry"
+    );
+}
+
 // --- 16. worktree identity: stable PROJECT_ID / WORKTREE_ID ----------------
 
 #[test]
