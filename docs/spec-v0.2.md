@@ -1,4 +1,11 @@
 # portool Worktree Identity Metadata 仕様書
+
+> **注意（2026-07-17 追記）**: identity（`PORTOOL_PROJECT_ID`/`WORKTREE_ID`）の仕様自体は
+> 現行でも有効。ただし台帳スキーマはハードニングリリースで v2 に更新され（`subranges` 廃止）、
+> 本書中の台帳 JSON 例は v1 形式である点に注意。現行の全体像は
+> [`README.md`](../README.md) と
+> [`docs/superpowers/specs/2026-07-17-portool-hardening-design.md`](superpowers/specs/2026-07-17-portool-hardening-design.md) を参照。
+
 ## 1. 目的
 各Git worktreeに対して、ポート割り当てとは独立した安定識別子を生成し、`.env.portool` へ出力する。
 主な用途は以下。
