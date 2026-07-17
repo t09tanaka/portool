@@ -342,19 +342,26 @@ fn allocate_or_reuse_block(
     }
 }
 
-/// Frozen decision 10: warns on stderr if the post-checkout hook isn't
-/// installed for this project, regardless of which sync path is taken.
+/// Frozen decision 10 (+ batch A #2): warns on stderr if the post-checkout
+/// hook isn't installed for this project, or hints to re-run `init` if the
+/// installed hook uses an unsafe old form that can fail `git checkout`.
 /// Checks the *effective* hook location (honoring `core.hooksPath` /
 /// Husky); an uninstallable location counts as missing -- `init` explains
 /// the details.
 fn warn_if_hook_missing(ctx: &GitCtx) {
-    let installed = crate::hooks::HooksLocation::resolve(ctx)
-        .post_checkout_file()
-        .and_then(|hook_path| std::fs::read_to_string(hook_path).ok())
-        .map(|content| content.contains(crate::hooks::HOOK_MARKER))
-        .unwrap_or(false);
-    if !installed {
-        eprintln!("hint: run 'portool init' to install the post-checkout hook");
+    let content = crate::hooks::HooksLocation::resolve(ctx)
+        .hook_file("post-checkout")
+        .and_then(|hook_path| std::fs::read_to_string(hook_path).ok());
+    match content {
+        Some(c) if c.contains(crate::hooks::HOOK_MARKER) => {
+            if crate::cmd::init::contains_unsafe_portool_form(&c) {
+                eprintln!(
+                    "portool: your post-checkout hook uses an old form that can fail \
+                     'git checkout'; run 'portool init' to update it"
+                );
+            }
+        }
+        _ => eprintln!("hint: run 'portool init' to install the post-checkout hook"),
     }
 }
 
