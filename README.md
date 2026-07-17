@@ -282,7 +282,21 @@ portool exec       [-e <PATH>]... [--strict] [--reallocate-on-conflict] -- <COMM
 portool reallocate [--quiet]
 portool ls         [--json] [--all]
 portool prune      [--all] [--dry-run]
+portool check
+portool doctor
+portool release
+portool deinit
 ```
+
+- **`check`** — validate the config and ledger; exits non-zero on any
+  problem (read-only, script-friendly).
+- **`doctor`** — diagnose and repair the current project: re-import ledger
+  entries from live worktrees' `.env.portool` (e.g. after a corruption
+  reset), and report blocks whose ports are currently in use.
+- **`release`** — free the current worktree's block from the ledger and
+  remove its `.env.portool`.
+- **`deinit`** — reverse `init`: remove portool's `post-checkout` /
+  `post-merge` hook lines and the `.gitignore` entry.
 
 ### `portool init`
 
@@ -535,7 +549,10 @@ source of truth if an agent needs to know which ports are already in use.
 ## Platform support
 
 `portool` targets **macOS and Linux only**. `portool` relies on `flock` and
-`realpath`-style path canonicalization; Windows is not supported.
+`realpath`-style path canonicalization; Windows is not supported. It uses
+`git worktree list --porcelain -z` (git ≥ 2.36) with a fallback to the
+newline parser on older git, and `git config --show-scope` (git ≥ 2.26) to
+detect shared hooks directories.
 
 ## License
 

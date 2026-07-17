@@ -72,6 +72,15 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Validate the config and ledger; exit non-zero on any problem.
+    Check,
+    /// Diagnose and repair the current project (rebuild lost entries, report
+    /// blocks whose ports are in use).
+    Doctor,
+    /// Free the current worktree's block and remove its `.env.portool`.
+    Release,
+    /// Remove portool's hooks and `.gitignore` entry (reverses `init`).
+    Deinit,
 }
 
 fn main() {
@@ -108,6 +117,10 @@ fn main() {
         } => cmd::exec::run(&env_file, &command, strict, reallocate_on_conflict),
         Command::Reallocate { quiet } => cmd::sync::reallocate_cmd(quiet),
         Command::Prune { all, dry_run } => cmd::prune::run(all, dry_run),
+        Command::Check => cmd::check::run(),
+        Command::Doctor => cmd::doctor::run(),
+        Command::Release => cmd::release::run(),
+        Command::Deinit => cmd::init::deinit(),
     };
 
     if let Err(err) = result {

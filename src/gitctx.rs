@@ -73,9 +73,37 @@ impl GitCtx {
 /// -- this is what lets [`crate::cmd::prune`] enumerate a project's
 /// worktrees without a live worktree root to run `git` from.
 pub fn worktree_list_at(dir: &Path) -> Result<Vec<PathBuf>> {
+    // Prefer `-z` (git >= 2.36): its NUL-separated records safely carry
+    // worktree paths that contain newlines, and preserve non-UTF-8 bytes.
+    // Fall back to the newline parser on older git rather than failing the
+    // whole slow path (batch D #12).
+    if let Some(bytes) = run_git_bytes(dir, &["worktree", "list", "--porcelain", "-z"]) {
+        return Ok(parse_worktree_list_z(&bytes));
+    }
     let output = run_git(dir, &["worktree", "list", "--porcelain"])
         .ok_or_else(|| Error::General("failed to run 'git worktree list'".to_string()))?;
+    Ok(parse_worktree_list_lines(&output))
+}
 
+/// Parses the NUL-separated records of `git worktree list --porcelain -z`,
+/// collecting each `worktree <path>` record's path (canonicalized when the
+/// directory still exists).
+fn parse_worktree_list_z(bytes: &[u8]) -> Vec<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut paths = Vec::new();
+    for record in bytes.split(|&b| b == 0) {
+        if let Some(raw) = record.strip_prefix(b"worktree ") {
+            let path = PathBuf::from(std::ffi::OsStr::from_bytes(raw));
+            paths.push(std::fs::canonicalize(&path).unwrap_or(path));
+        }
+    }
+    paths
+}
+
+/// Fallback line parser for git older than 2.36 (no `-z`). A worktree path
+/// containing a newline can't be represented faithfully here -- the reason
+/// `-z` is preferred.
+fn parse_worktree_list_lines(output: &str) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     for line in output.lines() {
         if let Some(raw) = line.strip_prefix("worktree ") {
@@ -83,7 +111,7 @@ pub fn worktree_list_at(dir: &Path) -> Result<Vec<PathBuf>> {
             paths.push(std::fs::canonicalize(&path).unwrap_or(path));
         }
     }
-    Ok(paths)
+    paths
 }
 
 /// Reads a path-valued git config key via `git config --type=path --get`
@@ -119,6 +147,22 @@ fn run_git(cwd: &Path, args: &[&str]) -> Option<String> {
         return None;
     }
     String::from_utf8(output.stdout).ok()
+}
+
+/// Like [`run_git`] but returns raw stdout bytes (for `-z` output that may
+/// contain non-UTF-8 paths), or `None` if the process failed to spawn or
+/// exited non-zero.
+fn run_git_bytes(cwd: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(output.stdout)
 }
 
 fn canonicalize(path: &Path) -> Result<PathBuf> {
@@ -331,6 +375,20 @@ mod tests {
         let list = ctx.worktree_list().unwrap();
 
         assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn parse_worktree_list_z_preserves_newline_in_path() {
+        // `-z` records are NUL-separated; a worktree path containing a
+        // newline must survive intact (the whole point of `-z`, batch D #12).
+        let bytes =
+            b"worktree /a/normal\0HEAD abc\0branch refs/heads/main\0\0worktree /b/new\nline\0HEAD def\0\0";
+        let paths = parse_worktree_list_z(bytes);
+        assert!(paths.iter().any(|p| p == Path::new("/a/normal")));
+        assert!(
+            paths.iter().any(|p| p == Path::new("/b/new\nline")),
+            "a newline-bearing path must be preserved, got: {paths:?}"
+        );
     }
 
     #[test]

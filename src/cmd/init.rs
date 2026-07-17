@@ -141,6 +141,80 @@ fn install_hook(ctx: &GitCtx) -> Result<()> {
     }
 }
 
+/// Runs `portool deinit` (batch D #5): reverses `init` by removing portool's
+/// lines from the effective `post-checkout`/`post-merge` hooks and removing
+/// `.env.portool` from `.gitignore`. Idempotent and symmetric with `init`.
+pub fn deinit() -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let ctx = GitCtx::discover(&cwd)?;
+    let loc = HooksLocation::resolve(&ctx);
+    for name in ["post-checkout", "post-merge"] {
+        if let Some(path) = loc.hook_file(name) {
+            deinit_hook(&path)?;
+        }
+    }
+    deinit_gitignore(&ctx.worktree_root)?;
+    println!("portool: removed portool's hooks and .gitignore entry");
+    Ok(())
+}
+
+/// Removes portool's content from one hook: deletes the file if it is
+/// portool's own standalone script, otherwise drops just portool's own lines
+/// from a foreign hook. Never follows a symlink.
+fn deinit_hook(hook_path: &Path) -> Result<()> {
+    if fs::symlink_metadata(hook_path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    let existing = match fs::read_to_string(hook_path) {
+        Ok(content) => content,
+        Err(_) => return Ok(()),
+    };
+
+    let trimmed = existing.trim_end_matches('\n');
+    if trimmed == HOOK_SCRIPT.trim_end_matches('\n') || OWNED_FULL_SCRIPTS.contains(&trimmed) {
+        fs::remove_file(hook_path)?;
+        return Ok(());
+    }
+
+    let safe_line = HOOK_APPEND_LINE.trim();
+    let kept: Vec<&str> = existing
+        .lines()
+        .filter(|line| {
+            let t = line.trim();
+            t != safe_line && !UNSAFE_PORTOOL_LINES.contains(&t)
+        })
+        .collect();
+    if kept.len() != existing.lines().count() {
+        let mut out = kept.join("\n");
+        if existing.ends_with('\n') && !out.is_empty() {
+            out.push('\n');
+        }
+        atomic_write(hook_path, out.as_bytes())?;
+    }
+    Ok(())
+}
+
+fn deinit_gitignore(worktree_root: &Path) -> Result<()> {
+    let path = worktree_root.join(".gitignore");
+    let existing = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(_) => return Ok(()),
+    };
+    if !existing.lines().any(|line| line == GITIGNORE_LINE) {
+        return Ok(());
+    }
+    let kept: Vec<&str> = existing.lines().filter(|l| *l != GITIGNORE_LINE).collect();
+    let mut out = kept.join("\n");
+    if existing.ends_with('\n') && !out.is_empty() {
+        out.push('\n');
+    }
+    fs::write(&path, out)?;
+    Ok(())
+}
+
 /// Installs (or migrates) portool's `post-checkout` and `post-merge` hooks at
 /// a location that is safe to auto-write (batch A #5: post-merge widens
 /// passive freshness to `git pull` / `git merge`).

@@ -73,6 +73,14 @@ impl Config {
                 range.0, range.1
             )));
         }
+        if range.0 == 0 {
+            // Port 0 is never a real allocation; bind(0) asks the OS for an
+            // ephemeral port, which portool would misread as "0 is free"
+            // (batch D #16).
+            return Err(Error::General(
+                "invalid config: range must not include port 0".into(),
+            ));
+        }
         if block_align == 0 {
             return Err(Error::General(
                 "invalid config: block_align must not be zero".into(),
@@ -191,6 +199,12 @@ mod tests {
     fn unknown_field_is_rejected() {
         // A typo like `ragne` must be a hard error, not silently ignored.
         let err = Config::from_toml_str("ragne = [4000, 5000]\n").unwrap_err();
+        assert_eq!(err.exit_code(), 1);
+    }
+
+    #[test]
+    fn range_including_port_zero_is_error() {
+        let err = Config::from_toml_str("range = [0, 9999]\n").unwrap_err();
         assert_eq!(err.exit_code(), 1);
     }
 }
