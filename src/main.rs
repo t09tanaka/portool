@@ -77,10 +77,15 @@ enum Command {
     /// Diagnose and repair the current project (rebuild lost entries, report
     /// blocks whose ports are in use).
     Doctor {
-        /// Move a corrupt (or unsupported-version) ledger aside and rebuild
-        /// this project's entries from live worktrees' `.env.portool`.
+        /// Repair a corrupt ledger: restore the whole ledger from its
+        /// backup, then rebuild this project's missing entries.
         #[arg(long)]
         repair: bool,
+        /// With --repair and no usable backup: discard the bad ledger and
+        /// rebuild only this project. Every other project's allocations are
+        /// dropped until doctor runs there. DESTRUCTIVE.
+        #[arg(long, requires = "repair")]
+        abandon_other_projects: bool,
     },
     /// Free the current worktree's block and remove its `.env.portool`.
     Release,
@@ -123,7 +128,10 @@ fn main() {
         Command::Reallocate { quiet } => cmd::sync::reallocate_cmd(quiet),
         Command::Prune { all, dry_run } => cmd::prune::run(all, dry_run),
         Command::Check => cmd::check::run(),
-        Command::Doctor { repair } => cmd::doctor::run(repair),
+        Command::Doctor {
+            repair,
+            abandon_other_projects,
+        } => cmd::doctor::run(repair, abandon_other_projects),
         Command::Release => cmd::release::run(),
         Command::Deinit => cmd::init::deinit(),
     };

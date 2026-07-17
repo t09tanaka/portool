@@ -1,22 +1,33 @@
-//! `portool doctor` (hardening batch D #5, C4): diagnose and repair the
-//! current project.
+//! `portool doctor` (hardening batch D #5, C4; restore-first repair added in
+//! v0.7.0, external review P0-1): diagnose and repair the current project.
 //!
-//! - **Repair** (`--repair`): the one and only place a corrupt (or
-//!   explicitly-abandoned unsupported-version) ledger is moved aside to
-//!   `registry.json.corrupt-<ts>` and rebuilt from scratch. Every other
-//!   command fails closed on such a ledger and points here.
+//! - **Repair** (`--repair`): the one and only place a bad ledger is moved
+//!   aside to `registry.json.corrupt-<ts>`. Every other command fails
+//!   closed on such a ledger and points here. Two distinct cases:
+//!   - *Corrupt*: restore-first. A valid `registry.json.bak` is restored in
+//!     place of the corrupt file, so every other project's allocations
+//!     survive -- restoring costs at most the one save since the last
+//!     backup refresh. Without a valid backup, plain `--repair` refuses and
+//!     points at `--abandon-other-projects`.
+//!   - *Unsupported version* (written by a newer portool): never
+//!     auto-restored from backup (that would silently roll back a newer
+//!     binary's ledger). `--repair` alone always errors toward upgrading.
+//!   - `--abandon-other-projects`: by explicit request only, either case
+//!     falls back to the old destructive move-aside-and-start-empty.
 //! - **Rebuild**: re-imports blocks recorded in live worktrees'
-//!   `.env.portool` that the ledger has lost (e.g. after `--repair` moved
-//!   the old ledger aside). Import is validity- and overlap-guarded, so a
-//!   nonsense block baked into an env file is reported and skipped rather
-//!   than written into the ledger.
+//!   `.env.portool` that the ledger has lost (e.g. after `--repair`
+//!   abandoned the old ledger, or for any project not yet reconciled after
+//!   a restore). Import is validity- and overlap-guarded, so a nonsense
+//!   block baked into an env file is reported and skipped rather than
+//!   written into the ledger.
 //! - **Report**: flags this project's blocks whose ports are currently in
 //!   use (on `127.0.0.1`).
 //!
 //! Rebuild is per-project: it only touches the project `doctor` runs in;
-//! other projects stay dropped until `doctor` runs in each. The moved-aside
+//! other projects stay dropped until `doctor` runs in each (unless a
+//! backup restore already brought them back). The moved-aside
 //! `registry.json.corrupt-<ts>` file is the authoritative artifact for
-//! reconciling projects `doctor` didn't rebuild.
+//! reconciling anything `doctor` didn't already restore or rebuild.
 
 use crate::config::Config;
 use crate::error::{Error, Result};
@@ -28,14 +39,19 @@ use crate::registry::{overlaps, ProjectEntry, Registry, WorktreeEntry};
 use crate::store;
 use chrono::{DateTime, FixedOffset, Local, SubsecRound};
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::time::Duration;
 
 const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Runs `portool doctor` for the current project. Without `repair`, a bad
-/// ledger is a hard error; with it, the bad file is moved aside and this
-/// project's entries are rebuilt from live worktrees' `.env.portool`.
-pub fn run(repair: bool) -> Result<()> {
+/// ledger is a hard error; with it, a corrupt ledger is restored from its
+/// backup (all projects kept) unless `abandon_other_projects` forces the
+/// destructive move-aside-and-start-empty path; an unsupported-version
+/// ledger is only ever discarded via `abandon_other_projects`, never
+/// auto-restored from backup. Either way this project's entries are then
+/// rebuilt from live worktrees' `.env.portool`.
+pub fn run(repair: bool, abandon_other_projects: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let ctx = GitCtx::discover(&cwd)?;
     let common_dir_key = ctx.common_dir.to_string_lossy().into_owned();
@@ -55,31 +71,32 @@ pub fn run(repair: bool) -> Result<()> {
                 registry_path.display()
             )));
         }
-        bad
-        @ (store::LedgerLoad::Corrupt { .. } | store::LedgerLoad::UnsupportedVersion { .. }) => {
-            let what = match &bad {
-                store::LedgerLoad::Corrupt { reason } => format!("is corrupt ({reason})"),
-                store::LedgerLoad::UnsupportedVersion { found, supported } => format!(
-                    "uses registry schema version {found}, which this build does not \
-                     understand (it understands version {supported}) -- prefer upgrading \
-                     portool over --repair, which abandons that ledger"
-                ),
-                _ => unreachable!(),
-            };
-            if !repair {
+        store::LedgerLoad::UnsupportedVersion { found, supported } => {
+            if !repair || !abandon_other_projects {
                 return Err(Error::General(format!(
-                    "{} {what}; re-run with 'portool doctor --repair' to move it aside and \
-                     rebuild this project's entries",
+                    "{} uses registry schema version {found}, but this build understands \
+                     version {supported}; upgrade portool instead. (If you really want to \
+                     discard that ledger, re-run with 'portool doctor --repair \
+                     --abandon-other-projects'.)",
                     registry_path.display()
                 )));
             }
             let moved_to = store::move_aside(&registry_path)?;
             eprintln!(
-                "portool: doctor: {} {what}; moved aside to {}",
-                registry_path.display(),
+                "portool: doctor: abandoned the version-{found} ledger (moved aside to {})",
                 moved_to.display()
             );
             Registry::empty(config.range)
+        }
+        store::LedgerLoad::Corrupt { reason } => {
+            if !repair {
+                return Err(Error::General(format!(
+                    "{} is corrupt ({reason}); re-run with 'portool doctor --repair' to \
+                     restore it from backup and rebuild this project's entries",
+                    registry_path.display()
+                )));
+            }
+            repair_corrupt(&registry_path, &reason, abandon_other_projects, &config)?
         }
     };
 
@@ -185,6 +202,48 @@ pub fn run(repair: bool) -> Result<()> {
         println!("portool: doctor: nothing to repair for this project");
     }
     Ok(())
+}
+
+/// The --repair path for a corrupt ledger. Restore-first: a valid
+/// `registry.json.bak` brings back *every* project (external review P0-1);
+/// only the explicit --abandon-other-projects flag falls back to the
+/// destructive start-from-empty rebuild.
+fn repair_corrupt(
+    registry_path: &Path,
+    reason: &str,
+    abandon_other_projects: bool,
+    config: &Config,
+) -> Result<Registry> {
+    if abandon_other_projects {
+        let moved_to = store::move_aside(registry_path)?;
+        eprintln!(
+            "portool: doctor: {} is corrupt ({reason}); moved aside to {} and starting \
+             empty (--abandon-other-projects)",
+            registry_path.display(),
+            moved_to.display()
+        );
+        return Ok(Registry::empty(config.range));
+    }
+
+    match store::load(&store::backup_path(registry_path)) {
+        store::LedgerLoad::Loaded(backup) => {
+            let moved_to = store::move_aside(registry_path)?;
+            store::save(registry_path, &backup)?;
+            eprintln!(
+                "portool: doctor: {} was corrupt ({reason}); moved aside to {} and \
+                 restored the last good backup (all projects kept)",
+                registry_path.display(),
+                moved_to.display()
+            );
+            Ok(backup)
+        }
+        _ => Err(Error::General(format!(
+            "{} is corrupt ({reason}) and no valid backup exists; a plain repair would \
+             abandon every other project's allocations. Re-run with 'portool doctor \
+             --repair --abandon-other-projects' if you accept that",
+            registry_path.display()
+        ))),
+    }
 }
 
 /// The same per-block invariants [`Registry::validate`] enforces, applied

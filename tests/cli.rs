@@ -1732,9 +1732,11 @@ fn future_schema_ledger_is_not_auto_reset() {
     );
 }
 
-/// The corrupt-ledger recovery path: `doctor` alone refuses, `doctor
-/// --repair` moves the file aside and rebuilds this project's entries from
-/// live worktrees' `.env.portool`.
+/// The corrupt-ledger recovery path with no usable backup: `doctor` alone
+/// refuses, `doctor --repair` alone also refuses (no valid backup to
+/// restore from), and only `doctor --repair --abandon-other-projects` moves
+/// the file aside and rebuilds this project's entries from live worktrees'
+/// `.env.portool`.
 #[test]
 fn doctor_repair_moves_corrupt_ledger_aside_and_rebuilds() {
     let env = TestEnv::new();
@@ -1749,6 +1751,10 @@ fn doctor_repair_moves_corrupt_ledger_aside_and_rebuilds() {
         .clone();
 
     fs::write(env.registry_path(), b"{ not json").unwrap();
+    // Remove the backup to simulate "nothing to restore", so this test
+    // exercises the destructive abandon path, not the restore-from-backup
+    // path (covered separately).
+    fs::remove_file(env.state.join("portool").join("registry.json.bak")).unwrap();
 
     // Without --repair: hard error, file untouched.
     let output = env.run(&repo, &["doctor"]);
@@ -1759,11 +1765,21 @@ fn doctor_repair_moves_corrupt_ledger_aside_and_rebuilds() {
     );
     assert_eq!(fs::read(env.registry_path()).unwrap(), b"{ not json");
 
-    // With --repair: file moved aside, entry rebuilt from .env.portool.
+    // With --repair alone: no valid backup to restore from, so it refuses.
     let output = env.run(&repo, &["doctor", "--repair"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "doctor --repair without a valid backup must refuse"
+    );
+    assert_eq!(fs::read(env.registry_path()).unwrap(), b"{ not json");
+
+    // With --repair --abandon-other-projects: file moved aside, entry
+    // rebuilt from .env.portool.
+    let output = env.run(&repo, &["doctor", "--repair", "--abandon-other-projects"]);
     assert!(
         output.status.success(),
-        "doctor --repair must succeed; stderr: {}",
+        "doctor --repair --abandon-other-projects must succeed; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let dir = env.registry_path().parent().unwrap().to_path_buf();
@@ -1780,7 +1796,76 @@ fn doctor_repair_moves_corrupt_ledger_aside_and_rebuilds() {
         .clone();
     assert_eq!(
         block_before, block_after,
-        "doctor --repair must re-import the block recorded in .env.portool"
+        "doctor --repair --abandon-other-projects must re-import the block recorded in \
+         .env.portool"
+    );
+}
+
+/// P0-1: doctor --repair restores the whole ledger from the backup, so a
+/// corrupt registry never silently drops *other* projects' allocations.
+#[test]
+fn doctor_repair_restores_other_projects_from_backup() {
+    let env = TestEnv::new();
+    env.write_config("range = [17500, 17599]\n");
+
+    // Project A syncs (this also writes registry.json.bak).
+    let repo_a = env.path("aaa");
+    init_repo(&repo_a);
+    assert!(env.run(&repo_a, &["sync"]).status.success());
+
+    // Project B syncs too; the backup now contains both.
+    let repo_b = env.path("bbb");
+    init_repo(&repo_b);
+    assert!(env.run(&repo_b, &["sync"]).status.success());
+
+    // Corrupt the live ledger.
+    fs::write(env.registry_path(), "{ not json").unwrap();
+
+    // Repair from project A.
+    let out = env.run(&repo_a, &["doctor", "--repair"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Both projects' entries survive.
+    let reg = env.registry();
+    let projects = reg["projects"].as_object().unwrap();
+    assert_eq!(
+        projects.len(),
+        2,
+        "backup restore must keep project B: {projects:?}"
+    );
+}
+
+/// Without a valid backup, plain --repair refuses; only the explicit
+/// destructive flag abandons other projects.
+#[test]
+fn doctor_repair_without_backup_requires_abandon_flag() {
+    let env = TestEnv::new();
+    env.write_config("range = [17600, 17699]\n");
+    let repo = env.path("app");
+    init_repo(&repo);
+    assert!(env.run(&repo, &["sync"]).status.success());
+
+    fs::write(env.registry_path(), "{ not json").unwrap();
+    // Remove the backup to simulate "nothing to restore".
+    fs::remove_file(env.state.join("portool").join("registry.json.bak")).unwrap();
+
+    let out = env.run(&repo, &["doctor", "--repair"]);
+    assert!(!out.status.success(), "must refuse without a backup");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--abandon-other-projects"), "got: {stderr}");
+    // The corrupt file was NOT moved aside by the refusal.
+    assert!(env.registry_path().exists());
+
+    // The explicit flag performs the old destructive rebuild.
+    let out = env.run(&repo, &["doctor", "--repair", "--abandon-other-projects"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
