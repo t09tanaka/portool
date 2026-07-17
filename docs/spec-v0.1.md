@@ -1,5 +1,12 @@
 # portool 仕様書 v0.1
 
+> **注意（2026-07-17 追記）**: この文書は v0.1 設計時のスナップショットであり、
+> **現行の実装とは一部乖離している**。ハードニングリリースで割当モデルが変更され、
+> プロジェクト単位の `subranges` は廃止（台帳 schema v2）、ブロックはプールから直接割当、
+> exit code 2 は廃止された。現行の挙動は [`README.md`](../README.md) と
+> [`docs/superpowers/specs/2026-07-17-portool-hardening-design.md`](superpowers/specs/2026-07-17-portool-hardening-design.md) を参照。
+
+
 > 名称 "portool" は仮。git worktree × ポート割り当ての台帳ツール。
 > 本書は実装着手可能なレベルで v0.1 の仕様を凍結する。
 

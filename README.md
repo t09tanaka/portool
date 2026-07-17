@@ -156,7 +156,7 @@ Runs a command with the current worktree's assignments injected as
 environment variables — no `source`, no per-worktree launcher scripts:
 
 ```sh
-portool exec [-e <PATH>]... -- <COMMAND> [ARGS...]
+portool exec [-e <PATH>]... [--strict] [--reallocate-on-conflict] -- <COMMAND> [ARGS...]
 ```
 
 In order, `exec` locates the current worktree, runs the equivalent of
@@ -192,6 +192,14 @@ Expansion rules:
 Env-file paths are resolved relative to the current working directory,
 and a missing file is an error — nothing (`.env`, `.env.test`, …) is ever
 read implicitly.
+
+**Execution-boundary check.** After syncing, `exec` bind-checks the
+allocated block on `127.0.0.1` — the one moment it's worth confirming the
+ports are actually free. Because that can't distinguish a foreign process
+from this worktree's *own* already-running server, the default is a neutral
+stderr advisory and the command still runs. Pass `--strict` to fail (exit 1)
+on a conflict, or `--reallocate-on-conflict` to move to a fresh block first
+(equivalent to running `portool reallocate`).
 
 The payoff of these rules is that one committed env file serves both
 worlds. Write a `.env.test` like:
@@ -374,8 +382,8 @@ Outside a git repository, `--all` is required; plain `ls` exits 1.
 ### `portool prune`
 
 Explicitly reclaims stale worktree entries (the same check `sync` runs
-implicitly, on demand). Reclaimed subranges are only released once an
-entire project's `common_dir` — the whole repository clone — is gone.
+implicitly, on demand). A whole project's entry is reclaimed only once its
+entire repository clone (`common_dir`) is gone.
 
 | Flag | Effect |
 |---|---|

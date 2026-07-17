@@ -1,5 +1,12 @@
 # portool v0.4 — `portool exec` 仕様
 
+> **注意（2026-07-17 追記）**: `exec` の環境合成・precedence・`${NAME}` 展開の仕様は現行でも有効。
+> ハードニングリリースで `exec` は実行境界でのポート bind 再確認（`--strict` /
+> `--reallocate-on-conflict`）が追加され、割当モデルもプール直接割当（schema v2）に変わった。
+> 現行の挙動は [`README.md`](../README.md) と
+> [`docs/superpowers/specs/2026-07-17-portool-hardening-design.md`](superpowers/specs/2026-07-17-portool-hardening-design.md) を参照。
+
+
 portool をアプリ固有の設定ツールにせず、「割当値を環境変数としてコマンドへ安全に注入する」
 ところまで担当させる。
 
