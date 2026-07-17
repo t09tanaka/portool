@@ -35,6 +35,18 @@ pub struct ProjectEntry {
 #[serde(deny_unknown_fields)]
 pub struct WorktreeEntry {
     pub block: (u16, u16),
+    /// Monotonic counter, bumped every time `block` changes (schema v3).
+    /// Mirrored into the `.env.portool` header, and re-checked by the sync
+    /// fast path's snapshot revalidation to detect a concurrent move.
+    pub generation: u64,
+    /// A target block reserved mid-move (schema v3, two-phase update): the
+    /// worktree still owns `block`, but `pending_block` is also excluded
+    /// from allocation until the move is finalized or rolled back -- so a
+    /// crash between the ledger write and the `.env.portool` write can
+    /// never leave either block up for grabs. A pending block may overlap
+    /// this entry's *own* `block` (a grow-in-place move), never anything
+    /// else.
+    pub pending_block: Option<(u16, u16)>,
     /// `None` for detached HEAD.
     pub branch: Option<String>,
     pub manifest_hash: Option<String>,
@@ -54,9 +66,10 @@ pub struct Reservation {
 
 impl Registry {
     /// The schema version this build reads and writes. v2 dropped the
-    /// per-project `subranges` field (hardening batch C); worktree blocks are
-    /// allocated directly from the pool.
-    pub const CURRENT_VERSION: u32 = 2;
+    /// per-project `subranges` field (hardening batch C); v3 added
+    /// per-worktree `generation` and `pending_block` for the two-phase
+    /// ledger/env update.
+    pub const CURRENT_VERSION: u32 = 3;
 
     /// A freshly created, empty ledger recording `range` for informational
     /// purposes.
@@ -70,12 +83,12 @@ impl Registry {
     }
 
     /// Parses a ledger from JSON, migrating older schema versions to the
-    /// current one **in memory** (hardening batch C). A v1 ledger (which
-    /// carried per-project `subranges`) is read and its `subranges` dropped,
-    /// preserving every worktree `block` verbatim -- blocks are absolute, so
-    /// no ports move on upgrade. Callers persist the migrated form only on a
-    /// locked write; a read-only caller sees v2 in memory and leaves the v1
-    /// file on disk.
+    /// current one **in memory** (hardening batch C). A v1 ledger drops its
+    /// per-project `subranges`; a v1/v2 ledger gains `generation = 1` and
+    /// no pending block. Every worktree `block` is preserved verbatim --
+    /// blocks are absolute, so no ports move on upgrade. Callers persist
+    /// the migrated form only on a locked write; a read-only caller sees
+    /// the current schema in memory and leaves the old file on disk.
     ///
     /// An unparseable body is a general error, which callers treat as
     /// corruption; an unrecognized version is the distinct
@@ -88,7 +101,8 @@ impl Registry {
         }
         let peek: VersionPeek = serde_json::from_str(s)?;
         match peek.version {
-            2 => Ok(serde_json::from_str::<Registry>(s)?),
+            3 => Ok(serde_json::from_str::<Registry>(s)?),
+            2 => Ok(serde_json::from_str::<v2::Registry>(s)?.into_current()),
             1 => Ok(serde_json::from_str::<v1::Registry>(s)?.into_current()),
             other => Err(Error::UnsupportedRegistryVersion {
                 found: other,
@@ -123,8 +137,11 @@ impl Registry {
             )));
         }
 
-        let mut blocks = self.all_blocks();
-        for &(start, end) in &blocks {
+        // Owner-grouped blocks: an entry's own `block` and `pending_block`
+        // belong to the same owner and are allowed to overlap each other (a
+        // grow-in-place move); every other pair must be disjoint.
+        let grouped = self.owner_grouped_blocks();
+        for &(_, (start, end)) in &grouped {
             if start > end {
                 return Err(Error::General(format!(
                     "invalid registry: block {start}-{end} is reversed"
@@ -136,29 +153,48 @@ impl Registry {
                 ));
             }
         }
-
-        blocks.sort_unstable();
-        for pair in blocks.windows(2) {
-            if overlaps(pair[0], pair[1]) {
-                return Err(Error::General(format!(
-                    "invalid registry: blocks {}-{} and {}-{} overlap",
-                    pair[0].0, pair[0].1, pair[1].0, pair[1].1
-                )));
+        for (i, &(owner_a, a)) in grouped.iter().enumerate() {
+            for &(owner_b, b) in &grouped[i + 1..] {
+                if owner_a != owner_b && overlaps(a, b) {
+                    return Err(Error::General(format!(
+                        "invalid registry: blocks {}-{} and {}-{} overlap",
+                        a.0, a.1, b.0, b.1
+                    )));
+                }
             }
         }
 
         Ok(())
     }
 
-    /// Every allocated block across all projects' worktrees plus all
-    /// reservations, in no particular order.
+    /// Every allocated block across all projects' worktrees (including any
+    /// pending move targets) plus all reservations, in no particular order.
     pub fn all_blocks(&self) -> Vec<(u16, u16)> {
-        let mut blocks: Vec<(u16, u16)> = self
-            .projects
-            .values()
-            .flat_map(|p| p.worktrees.values().map(|w| w.block))
-            .collect();
-        blocks.extend(self.reservations.iter().map(|r| r.block));
+        self.owner_grouped_blocks()
+            .into_iter()
+            .map(|(_, block)| block)
+            .collect()
+    }
+
+    /// [`Registry::all_blocks`], tagged with an owner id so callers can
+    /// tell which blocks belong to the same worktree entry (its `block` +
+    /// `pending_block` pair). Reservations each get their own owner.
+    fn owner_grouped_blocks(&self) -> Vec<(usize, (u16, u16))> {
+        let mut owner = 0usize;
+        let mut blocks = Vec::new();
+        for project in self.projects.values() {
+            for worktree in project.worktrees.values() {
+                blocks.push((owner, worktree.block));
+                if let Some(pending) = worktree.pending_block {
+                    blocks.push((owner, pending));
+                }
+                owner += 1;
+            }
+        }
+        for reservation in &self.reservations {
+            blocks.push((owner, reservation.block));
+            owner += 1;
+        }
         blocks
     }
 
@@ -178,12 +214,98 @@ pub fn overlaps(a: (u16, u16), b: (u16, u16)) -> bool {
     a.0 <= b.1 && b.0 <= a.1
 }
 
+/// The v2 ledger schema, read only for migration to the current version.
+/// It differs from v3 solely in that `WorktreeEntry` had no `generation` /
+/// `pending_block`; migration adds `generation = 1` and no pending block.
+mod v2 {
+    use super::Reservation;
+    use chrono::{DateTime, FixedOffset};
+    use serde::Deserialize;
+    use std::collections::BTreeMap;
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct Registry {
+        // Present so `deny_unknown_fields` accepts the `version` key; the
+        // value is already known from the version peek, so it is unread.
+        #[allow(dead_code)]
+        pub version: u32,
+        pub range: (u16, u16),
+        pub projects: BTreeMap<String, ProjectEntry>,
+        pub reservations: Vec<Reservation>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct ProjectEntry {
+        pub name: String,
+        pub worktrees: BTreeMap<String, WorktreeEntry>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct WorktreeEntry {
+        pub block: (u16, u16),
+        pub branch: Option<String>,
+        pub manifest_hash: Option<String>,
+        pub pinned: bool,
+        pub label: Option<String>,
+        pub allocated_at: DateTime<FixedOffset>,
+        pub last_seen_at: DateTime<FixedOffset>,
+    }
+
+    impl WorktreeEntry {
+        pub fn into_current(self) -> super::WorktreeEntry {
+            super::WorktreeEntry {
+                block: self.block,
+                generation: 1,
+                pending_block: None,
+                branch: self.branch,
+                manifest_hash: self.manifest_hash,
+                pinned: self.pinned,
+                label: self.label,
+                allocated_at: self.allocated_at,
+                last_seen_at: self.last_seen_at,
+            }
+        }
+    }
+
+    impl Registry {
+        /// Converts a parsed v2 ledger to the current (v3) schema, keeping
+        /// every worktree block verbatim.
+        pub fn into_current(self) -> super::Registry {
+            super::Registry {
+                version: super::Registry::CURRENT_VERSION,
+                range: self.range,
+                projects: self
+                    .projects
+                    .into_iter()
+                    .map(|(key, project)| {
+                        (
+                            key,
+                            super::ProjectEntry {
+                                name: project.name,
+                                worktrees: project
+                                    .worktrees
+                                    .into_iter()
+                                    .map(|(path, entry)| (path, entry.into_current()))
+                                    .collect(),
+                            },
+                        )
+                    })
+                    .collect(),
+                reservations: self.reservations,
+            }
+        }
+    }
+}
+
 /// The v1 ledger schema (pre-hardening), read only for migration to the
-/// current version. It differs from v2 solely in that `ProjectEntry` carried
-/// a `subranges` field; `WorktreeEntry` and `Reservation` are unchanged and
-/// reused from the current schema.
+/// current version. It differs from v2 solely in that `ProjectEntry`
+/// carried a `subranges` field; `WorktreeEntry` and `Reservation` are
+/// reused from v2.
 mod v1 {
-    use super::{Reservation, WorktreeEntry};
+    use super::{v2, Reservation};
     use serde::Deserialize;
     use std::collections::BTreeMap;
 
@@ -205,11 +327,11 @@ mod v1 {
         pub name: String,
         #[allow(dead_code)]
         pub subranges: Vec<(u16, u16)>,
-        pub worktrees: BTreeMap<String, WorktreeEntry>,
+        pub worktrees: BTreeMap<String, v2::WorktreeEntry>,
     }
 
     impl Registry {
-        /// Converts a parsed v1 ledger to the current (v2) schema, dropping
+        /// Converts a parsed v1 ledger to the current schema, dropping
         /// `subranges` and keeping every worktree block verbatim.
         pub fn into_current(self) -> super::Registry {
             super::Registry {
@@ -223,7 +345,11 @@ mod v1 {
                             key,
                             super::ProjectEntry {
                                 name: project.name,
-                                worktrees: project.worktrees,
+                                worktrees: project
+                                    .worktrees
+                                    .into_iter()
+                                    .map(|(path, entry)| (path, entry.into_current()))
+                                    .collect(),
                             },
                         )
                     })
@@ -239,6 +365,33 @@ mod tests {
     use super::*;
 
     const SPEC_EXAMPLE: &str = r#"
+    {
+      "version": 3,
+      "range": [3000, 9999],
+      "projects": {
+        "/home/user/dev/myapp/.git": {
+          "name": "myapp",
+          "worktrees": {
+            "/home/user/dev/myapp": {
+              "block": [3000, 3004],
+              "generation": 1,
+              "pending_block": null,
+              "branch": "main",
+              "manifest_hash": "a1b2c3d4e5f6",
+              "pinned": false,
+              "label": null,
+              "allocated_at": "2026-07-15T10:00:00+09:00",
+              "last_seen_at": "2026-07-15T12:00:00+09:00"
+            }
+          }
+        }
+      },
+      "reservations": []
+    }
+    "#;
+
+    /// A v2 ledger (pre-generation/pending) for migration coverage.
+    const SPEC_EXAMPLE_V2: &str = r#"
     {
       "version": 2,
       "range": [3000, 9999],
@@ -291,7 +444,7 @@ mod tests {
     #[test]
     fn empty_has_no_projects_or_reservations() {
         let reg = Registry::empty((3000, 9999));
-        assert_eq!(reg.version, 2);
+        assert_eq!(reg.version, 3);
         assert_eq!(reg.range, (3000, 9999));
         assert!(reg.projects.is_empty());
         assert!(reg.reservations.is_empty());
@@ -310,7 +463,7 @@ mod tests {
     fn spec_example_round_trips() {
         let reg = Registry::from_json(SPEC_EXAMPLE).unwrap();
 
-        assert_eq!(reg.version, 2);
+        assert_eq!(reg.version, 3);
         assert_eq!(reg.range, (3000, 9999));
         assert!(reg.reservations.is_empty());
 
@@ -341,11 +494,26 @@ mod tests {
         let project = reg.find_project("/home/user/dev/myapp/.git").unwrap();
         let worktree = project.worktrees.get("/home/user/dev/myapp").unwrap();
         assert_eq!(worktree.block, (3000, 3004));
+        assert_eq!(worktree.generation, 1);
+        assert_eq!(worktree.pending_block, None);
         // The migrated ledger is valid and re-serializes without subranges.
         assert!(reg.validate().is_ok());
         let serialized = serde_json::to_string(&reg).unwrap();
         assert!(!serialized.contains("subranges"));
-        assert!(serialized.contains("\"version\":2"));
+        assert!(serialized.contains("\"version\":3"));
+    }
+
+    #[test]
+    fn from_json_migrates_v2_adding_generation_and_no_pending() {
+        let reg = Registry::from_json(SPEC_EXAMPLE_V2).unwrap();
+
+        assert_eq!(reg.version, Registry::CURRENT_VERSION);
+        let project = reg.find_project("/home/user/dev/myapp/.git").unwrap();
+        let worktree = project.worktrees.get("/home/user/dev/myapp").unwrap();
+        assert_eq!(worktree.block, (3000, 3004));
+        assert_eq!(worktree.generation, 1);
+        assert_eq!(worktree.pending_block, None);
+        assert!(reg.validate().is_ok());
     }
 
     #[test]
@@ -426,6 +594,46 @@ mod tests {
             label: None,
             pinned: false,
         });
+        assert!(reg.validate().is_err());
+    }
+
+    #[test]
+    fn pending_block_is_occupied_and_may_overlap_only_its_own_block() {
+        let mut reg: Registry = serde_json::from_str(SPEC_EXAMPLE).unwrap();
+        let entry = reg
+            .find_project_mut("/home/user/dev/myapp/.git")
+            .unwrap()
+            .worktrees
+            .get_mut("/home/user/dev/myapp")
+            .unwrap();
+
+        // A grow-in-place move: pending (3000,3009) overlaps the entry's
+        // own block (3000,3004) -- valid, and both count as occupied.
+        entry.pending_block = Some((3000, 3009));
+        assert!(reg.validate().is_ok());
+        let mut blocks = reg.all_blocks();
+        blocks.sort();
+        assert_eq!(blocks, vec![(3000, 3004), (3000, 3009)]);
+
+        // But a pending block overlapping a *different* owner is corrupt.
+        reg.reservations.push(Reservation {
+            block: (3008, 3012),
+            label: None,
+            pinned: true,
+        });
+        assert!(reg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_invalid_pending_block() {
+        let mut reg: Registry = serde_json::from_str(SPEC_EXAMPLE).unwrap();
+        let entry = reg
+            .find_project_mut("/home/user/dev/myapp/.git")
+            .unwrap()
+            .worktrees
+            .get_mut("/home/user/dev/myapp")
+            .unwrap();
+        entry.pending_block = Some((4000, 3999));
         assert!(reg.validate().is_err());
     }
 

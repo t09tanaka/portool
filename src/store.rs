@@ -159,6 +159,8 @@ mod tests {
             "/home/user/dev/myapp".to_string(),
             WorktreeEntry {
                 block: (3000, 3004),
+                generation: 1,
+                pending_block: None,
                 branch: Some("main".to_string()),
                 manifest_hash: Some("a1b2c3d4e5f6".to_string()),
                 pinned: false,
