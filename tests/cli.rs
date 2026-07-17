@@ -471,12 +471,22 @@ fn init_installs_hook_and_gitignore_and_is_idempotent() {
     let expected_hook = "#!/bin/sh\n\
 # installed by portool\n\
 if command -v portool >/dev/null 2>&1; then\n\
-\x20\x20portool sync --quiet\n\
-fi\n";
+\x20\x20portool sync --quiet || echo 'portool: sync failed; Git was not blocked' >&2\n\
+fi\n\
+exit 0\n";
     let hook_content_1 = fs::read_to_string(&hook_path).unwrap();
     assert_eq!(hook_content_1, expected_hook);
     let mode = fs::metadata(&hook_path).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o755, "hook must be executable");
+
+    // Batch A #5: post-merge is installed alongside post-checkout.
+    let post_merge = repo.join(".git/hooks/post-merge");
+    assert_eq!(fs::read_to_string(&post_merge).unwrap(), expected_hook);
+    assert_eq!(
+        fs::metadata(&post_merge).unwrap().permissions().mode() & 0o777,
+        0o755,
+        "post-merge hook must be executable"
+    );
 
     let gitignore_1 = fs::read_to_string(repo.join(".gitignore")).unwrap();
     assert!(gitignore_1.lines().any(|l| l == ".env.portool"));
@@ -601,6 +611,92 @@ fn init_with_custom_hookspath_appends_to_existing_hook() {
         content.matches("portool sync").count(),
         1,
         "re-running init must not duplicate the line"
+    );
+}
+
+/// Batch A #4: an absolute `core.hooksPath` configured in *global* scope is a
+/// hooks dir shared across unrelated repos; `init` must refuse to auto-install
+/// there (it would run portool's hook on every repo's checkout) and print the
+/// manual line instead.
+#[test]
+fn init_refuses_global_scope_shared_hookspath() {
+    let env = TestEnv::new();
+    let repo = env.path("repo");
+    init_repo(&repo);
+
+    let shared = env.path("shared-hooks");
+    fs::create_dir_all(&shared).unwrap();
+    let global_config = env.path("gitconfig-global");
+    fs::write(
+        &global_config,
+        format!("[core]\n\thooksPath = {}\n", shared.display()),
+    )
+    .unwrap();
+
+    // Run with GIT_CONFIG_GLOBAL pointing at that file, so core.hooksPath
+    // resolves in `global` scope.
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_portool"));
+    cmd.env_clear();
+    if let Ok(path) = std::env::var("PATH") {
+        cmd.env("PATH", path);
+    }
+    cmd.env("HOME", &env.home)
+        .env("XDG_STATE_HOME", &env.state)
+        .env("XDG_CONFIG_HOME", &env.config)
+        .env("GIT_CONFIG_GLOBAL", &global_config)
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .current_dir(&repo)
+        .args(["init", "--hook-only"]);
+    let output = cmd.output().expect("failed to spawn portool");
+
+    assert!(
+        output.status.success(),
+        "init must not fail: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("shared hooks dir") && stderr.contains("global"),
+        "must warn about the global-scope shared hooksPath, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("portool sync --quiet || true"),
+        "must print the safe manual line, got: {stderr}"
+    );
+    assert!(
+        !shared.join("post-checkout").exists(),
+        "must not write into a shared global hooks dir"
+    );
+    assert!(
+        !repo.join(".git/hooks/post-checkout").exists(),
+        "must not fall back to the ignored default hooks dir"
+    );
+}
+
+/// Batch A #2: `sync` hints to re-run `init` when the installed post-checkout
+/// hook uses an old, unsafe form that can fail `git checkout`.
+#[test]
+fn sync_hints_when_hook_uses_unsafe_legacy_form() {
+    let env = TestEnv::new();
+    let repo = env.path("repo");
+    init_repo(&repo);
+    fs::write(repo.join(".portool.toml"), "[ports]\nweb = 0\n").unwrap();
+
+    // Plant a legacy unsafe hook (portool <= 0.2 shape) directly.
+    let hook_dir = repo.join(".git/hooks");
+    fs::create_dir_all(&hook_dir).unwrap();
+    fs::write(
+        hook_dir.join("post-checkout"),
+        "#!/bin/sh\n# installed by portool\ncommand -v portool >/dev/null 2>&1 && portool sync --quiet\n",
+    )
+    .unwrap();
+
+    let output = env.run(&repo, &["sync"]);
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("old form that can fail"),
+        "sync must hint about the unsafe hook, got: {stderr}"
     );
 }
 

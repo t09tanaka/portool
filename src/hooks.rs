@@ -32,25 +32,63 @@ pub enum HooksLocation {
         configured: String,
         resolved: PathBuf,
     },
+    /// `core.hooksPath` is an absolute directory configured in `global` or
+    /// `system` git scope -- a hooks dir shared across unrelated repos.
+    /// Auto-installing here would run portool's hook on every repo's
+    /// checkout, so it is refused; `init` prints the manual line instead.
+    SharedScope {
+        configured: String,
+        resolved: PathBuf,
+        scope: String,
+    },
 }
 
 impl HooksLocation {
     /// Resolves the effective hooks location for `ctx` by reading
     /// `core.hooksPath` (with `~` expanded) from the worktree.
+    ///
+    /// An absolute `core.hooksPath` set in `global`/`system` scope is a
+    /// hooks dir shared across unrelated repos; it is reported as
+    /// [`HooksLocation::SharedScope`] so `init` refuses to auto-install
+    /// there. A repo-relative value is inherently per-repo and is never
+    /// refused, whatever scope it came from.
     pub fn resolve(ctx: &GitCtx) -> HooksLocation {
         let configured = gitctx::config_path_value(&ctx.worktree_root, "core.hooksPath");
-        classify(configured, &ctx.worktree_root, &ctx.common_dir)
+        let loc = classify(configured.clone(), &ctx.worktree_root, &ctx.common_dir);
+
+        if let HooksLocation::Custom { hooks_dir } = &loc {
+            let is_absolute = configured
+                .as_deref()
+                .map(|c| Path::new(c).is_absolute())
+                .unwrap_or(false);
+            if is_absolute {
+                if let Some(scope) = gitctx::config_scope(&ctx.worktree_root, "core.hooksPath") {
+                    if scope == "global" || scope == "system" {
+                        return HooksLocation::SharedScope {
+                            configured: configured.unwrap_or_default(),
+                            resolved: hooks_dir.clone(),
+                            scope,
+                        };
+                    }
+                }
+            }
+        }
+
+        loc
     }
 
-    /// The `post-checkout` file portool installs into (and `sync` checks),
-    /// or `None` when no location is safe to auto-install into.
-    pub fn post_checkout_file(&self) -> Option<PathBuf> {
+    /// The file portool installs the named hook into (and `sync` checks),
+    /// or `None` when no location is safe to auto-install into. `name` is a
+    /// git hook name such as `"post-checkout"` or `"post-merge"`.
+    pub fn hook_file(&self, name: &str) -> Option<PathBuf> {
         match self {
             HooksLocation::GitDefault { hooks_dir } | HooksLocation::Custom { hooks_dir } => {
-                Some(hooks_dir.join("post-checkout"))
+                Some(hooks_dir.join(name))
             }
-            HooksLocation::Husky { hook_file } => Some(hook_file.clone()),
-            HooksLocation::Missing { .. } => None,
+            // The stored path is `<.husky>/post-checkout`; sibling hooks
+            // live next to it (`<.husky>/post-merge`, ...).
+            HooksLocation::Husky { hook_file } => hook_file.parent().map(|dir| dir.join(name)),
+            HooksLocation::Missing { .. } | HooksLocation::SharedScope { .. } => None,
         }
     }
 }
@@ -131,8 +169,12 @@ mod tests {
                 }
             );
             assert_eq!(
-                loc.post_checkout_file(),
+                loc.hook_file("post-checkout"),
                 Some(PathBuf::from("/work/repo/.git/hooks/post-checkout"))
+            );
+            assert_eq!(
+                loc.hook_file("post-merge"),
+                Some(PathBuf::from("/work/repo/.git/hooks/post-merge"))
             );
         }
     }
@@ -211,6 +253,30 @@ mod tests {
                 resolved: tmp.path().join("generated/hooks"),
             }
         );
-        assert_eq!(loc.post_checkout_file(), None);
+        assert_eq!(loc.hook_file("post-checkout"), None);
+    }
+
+    #[test]
+    fn husky_hook_file_derives_siblings() {
+        let loc = classify(Some(".husky/_".to_string()), &root(), &common());
+        assert_eq!(
+            loc.hook_file("post-checkout"),
+            Some(PathBuf::from("/work/repo/.husky/post-checkout"))
+        );
+        assert_eq!(
+            loc.hook_file("post-merge"),
+            Some(PathBuf::from("/work/repo/.husky/post-merge"))
+        );
+    }
+
+    #[test]
+    fn shared_scope_is_uninstallable() {
+        let loc = HooksLocation::SharedScope {
+            configured: "/home/u/.githooks".to_string(),
+            resolved: PathBuf::from("/home/u/.githooks"),
+            scope: "global".to_string(),
+        };
+        assert_eq!(loc.hook_file("post-checkout"), None);
+        assert_eq!(loc.hook_file("post-merge"), None);
     }
 }

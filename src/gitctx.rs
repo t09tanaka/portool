@@ -96,6 +96,15 @@ pub fn config_path_value(dir: &Path, key: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// The git config scope a key's effective value comes from -- the leading
+/// token of `git config --show-scope --get <key>` (`local`, `global`,
+/// `system`, or `worktree`). Returns `None` when the key is unset or git
+/// fails (e.g. `--show-scope` predates git 2.26).
+pub fn config_scope(dir: &Path, key: &str) -> Option<String> {
+    run_git(dir, &["config", "--show-scope", "--get", key])
+        .and_then(|s| s.split_whitespace().next().map(str::to_string))
+}
+
 /// Runs `git -C <cwd> <args>`, returning stdout as a `String` on success
 /// (exit code 0), or `None` if the process could not be spawned, exited
 /// non-zero, or produced non-UTF-8 output.
