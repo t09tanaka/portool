@@ -1,14 +1,16 @@
 //! `portool doctor` (hardening batch D #5, C4; restore-first repair added in
 //! v0.7.0, external review P0-1): diagnose and repair the current project.
 //!
-//! - **Repair** (`--repair`): the one and only place a bad ledger is moved
+//! - **Repair** (`--repair`): the one and only place a bad ledger is set
 //!   aside to `registry.json.corrupt-<ts>`. Every other command fails
 //!   closed on such a ledger and points here. Two distinct cases:
 //!   - *Corrupt*: restore-first. A valid `registry.json.bak` is restored in
 //!     place of the corrupt file, so every other project's allocations
 //!     survive -- restoring costs at most the one save since the last
-//!     backup refresh. Without a valid backup, plain `--repair` refuses and
-//!     points at `--abandon-other-projects`.
+//!     backup refresh. The corrupt file is *copied* (never renamed) aside,
+//!     so `registry.json` is never missing at any instant even if the
+//!     restore's save fails. Without a valid backup, plain `--repair`
+//!     refuses and points at `--abandon-other-projects`.
 //!   - *Unsupported version* (written by a newer portool): never
 //!     auto-restored from backup (that would silently roll back a newer
 //!     binary's ledger). `--repair` alone always errors toward upgrading.
@@ -25,7 +27,7 @@
 //!
 //! Rebuild is per-project: it only touches the project `doctor` runs in;
 //! other projects stay dropped until `doctor` runs in each (unless a
-//! backup restore already brought them back). The moved-aside
+//! backup restore already brought them back). The set-aside
 //! `registry.json.corrupt-<ts>` file is the authoritative artifact for
 //! reconciling anything `doctor` didn't already restore or rebuild.
 
@@ -227,13 +229,19 @@ fn repair_corrupt(
 
     match store::load(&store::backup_path(registry_path)) {
         store::LedgerLoad::Loaded(backup) => {
-            let moved_to = store::move_aside(registry_path)?;
+            // Copy (not rename) the corrupt file aside, then let save()'s
+            // atomic rename overwrite it in one step: registry.json is
+            // never missing at any instant. If the save fails here, the
+            // corrupt original is still in place, so no later command can
+            // mistake the state for a fresh install and refresh the backup
+            // with a near-empty ledger.
+            let copied_to = store::copy_aside(registry_path)?;
             store::save(registry_path, &backup)?;
             eprintln!(
-                "portool: doctor: {} was corrupt ({reason}); moved aside to {} and \
+                "portool: doctor: {} was corrupt ({reason}); copied aside to {} and \
                  restored the last good backup (all projects kept)",
                 registry_path.display(),
-                moved_to.display()
+                copied_to.display()
             );
             Ok(backup)
         }

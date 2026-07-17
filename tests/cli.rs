@@ -1869,6 +1869,63 @@ fn doctor_repair_without_backup_requires_abandon_flag() {
     );
 }
 
+/// An UnsupportedVersion (newer-schema) ledger is never repaired by plain
+/// `--repair` -- the fix is upgrading portool -- and is never auto-restored
+/// from backup (that would silently roll back a newer binary's ledger).
+/// Only the explicit `--abandon-other-projects` flag may discard it.
+#[test]
+fn doctor_repair_on_future_schema_requires_abandon_flag() {
+    let env = TestEnv::new();
+    env.write_config("range = [17700, 17799]\n");
+    let repo = env.path("app");
+    init_repo(&repo);
+    // A prior successful sync leaves a valid registry.json.bak behind, so
+    // this test also proves the backup is NOT used to "restore over" a
+    // newer-schema ledger.
+    assert!(env.run(&repo, &["sync"]).status.success());
+    assert!(env.state.join("portool").join("registry.json.bak").exists());
+
+    let future = br#"{"version":999,"range":[17700,17799],"projects":{},"reservations":[]}"#;
+    fs::write(env.registry_path(), future).unwrap();
+
+    // (a) Plain --repair fails, steers toward upgrading, leaves the file.
+    let out = env.run(&repo, &["doctor", "--repair"]);
+    assert!(
+        !out.status.success(),
+        "--repair alone must refuse a future-schema ledger"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("upgrade portool"),
+        "the error must steer toward upgrading, got: {stderr}"
+    );
+    assert_eq!(
+        fs::read(env.registry_path()).unwrap(),
+        future.to_vec(),
+        "the newer-schema ledger must be left byte-identical in place"
+    );
+
+    // (b) Only the explicit destructive flag discards it, moving it aside.
+    let out = env.run(&repo, &["doctor", "--repair", "--abandon-other-projects"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let dir = env.registry_path().parent().unwrap().to_path_buf();
+    let moved: Vec<String> = fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.starts_with("registry.json.corrupt-"))
+        .collect();
+    assert_eq!(
+        moved.len(),
+        1,
+        "the abandoned ledger must be moved aside: {moved:?}"
+    );
+}
+
 /// `doctor` must not import a nonsense block (port 0, reversed) from a
 /// hand-edited `.env.portool` header into the ledger (external review P2 #7).
 #[test]

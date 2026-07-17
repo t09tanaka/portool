@@ -110,6 +110,24 @@ pub fn move_aside(path: &Path) -> Result<PathBuf> {
     Ok(corrupt_path)
 }
 
+/// Copies the (bad) ledger to a `.corrupt-<unix seconds>` sibling without
+/// removing the original, and returns the sibling's path. The restore path
+/// of `doctor --repair` uses this instead of [`move_aside`]: if the
+/// subsequent save of the restored backup fails, `registry.json` still
+/// holds the (corrupt) original -- it is never missing, so a later command
+/// can never mistake the state for a fresh install and clobber the backup.
+pub fn copy_aside(path: &Path) -> Result<PathBuf> {
+    let corrupt_path = corrupt_sibling_path(path);
+    fs::copy(path, &corrupt_path).map_err(|err| {
+        Error::General(format!(
+            "failed to copy {} aside to {}: {err}",
+            path.display(),
+            corrupt_path.display()
+        ))
+    })?;
+    Ok(corrupt_path)
+}
+
 /// Saves `registry` to `path` atomically: writes pretty-printed JSON to a
 /// temp file in the same directory, then renames it into place. The parent
 /// directory is created if necessary. On success, also refreshes `<path>.bak`
@@ -366,6 +384,37 @@ mod tests {
         save(&path, &sample_registry()).unwrap();
 
         assert_eq!(load_strict(&path).unwrap(), Some(sample_registry()));
+    }
+
+    #[test]
+    fn copy_aside_keeps_the_original_and_creates_a_corrupt_sibling() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("registry.json");
+        let contents = b"{ this is not valid json".to_vec();
+        fs::write(&path, &contents).unwrap();
+
+        let copied_to = copy_aside(&path).unwrap();
+
+        assert!(
+            path.exists(),
+            "the original must never go missing during a copy-aside"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            contents,
+            "the original must be byte-identical"
+        );
+        assert!(copied_to.exists());
+        assert_eq!(
+            fs::read(&copied_to).unwrap(),
+            contents,
+            "the sibling must be a byte-exact copy"
+        );
+        assert!(copied_to
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("registry.json.corrupt-"));
     }
 
     #[test]
