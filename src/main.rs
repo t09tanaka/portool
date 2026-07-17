@@ -63,7 +63,23 @@ enum Command {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    // Keep clap's usage errors off portool's semantic exit codes (batch B
+    // #15): a usage error exits 64 (EX_USAGE) rather than clap's default 2,
+    // which used to collide with a real allocation error. `--help` /
+    // `--version` still print to stdout and exit 0.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => {
+            let _ = err.print();
+            let code = match err.kind() {
+                clap::error::ErrorKind::DisplayHelp
+                | clap::error::ErrorKind::DisplayVersion
+                | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => 0,
+                _ => 64,
+            };
+            exit(code);
+        }
+    };
 
     let result = match cli.command {
         Command::Init {

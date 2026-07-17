@@ -890,7 +890,8 @@ fn exec_missing_env_file_exits_1() {
 // --- 25. missing command is a usage error ------------------------------------------------------------------------
 
 /// Spec §4: `--` is mandatory and a command must follow it; both omissions
-/// are clap usage errors (exit code 2 with the usage text).
+/// are clap usage errors. Batch B #15 moved clap usage errors off exit code
+/// 2 (which collided with a semantic error) onto the dedicated code 64.
 #[test]
 fn exec_without_command_is_a_usage_error() {
     let env = TestEnv::new();
@@ -901,8 +902,8 @@ fn exec_without_command_is_a_usage_error() {
         let output = env.run(&repo, args);
         assert_eq!(
             output.status.code(),
-            Some(2),
-            "`portool {}` must be a usage error",
+            Some(64),
+            "`portool {}` must be a usage error (exit 64)",
             args.join(" ")
         );
         let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();

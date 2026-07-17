@@ -85,7 +85,7 @@ fn load_manifest_state(worktree_root: &Path) -> Result<ManifestState> {
 /// all already match -- in which case sync is a complete no-op.
 fn try_fast_path(ctx: &GitCtx) -> Result<Option<SyncOutcome>> {
     // Read-only, lock-free: never heal a corrupt ledger here (finding 3).
-    let load_result = store::load(&paths::registry_path(), false);
+    let load_result = store::load(&paths::registry_path()?, false);
     if load_result.corrupt || load_result.read_error {
         return Ok(None);
     }
@@ -128,9 +128,9 @@ fn try_fast_path(ctx: &GitCtx) -> Result<Option<SyncOutcome>> {
 
 /// Spec §7 steps 4-10: locked read-modify-write.
 fn slow_path(ctx: &GitCtx, quiet: bool) -> Result<SyncOutcome> {
-    let _lock = lock::acquire(&paths::lock_path(), LOCK_TIMEOUT)?;
+    let _lock = lock::acquire(&paths::lock_path()?, LOCK_TIMEOUT)?;
 
-    let registry_path = paths::registry_path();
+    let registry_path = paths::registry_path()?;
     let existed_before = registry_path.exists();
     // Under the flock: safe to heal (rename aside) a corrupt ledger.
     let load_result = store::load(&registry_path, true);
@@ -142,7 +142,7 @@ fn slow_path(ctx: &GitCtx, quiet: bool) -> Result<SyncOutcome> {
     }
     let mut registry = load_result.registry;
 
-    let config = Config::load();
+    let config = Config::load()?;
     if !existed_before || load_result.corrupt {
         // Frozen decision 14: a freshly created ledger records the live
         // pool at creation time; it is never updated after that.

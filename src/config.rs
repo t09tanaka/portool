@@ -31,8 +31,11 @@ impl Default for Config {
 }
 
 /// Mirrors the TOML schema of `config.toml`; every field is optional so
-/// that partial configuration files are accepted.
+/// that partial configuration files are accepted. `deny_unknown_fields`
+/// makes a typo (`ragne = …`) a hard error rather than a silently-ignored
+/// field.
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawConfig {
     range: Option<(u16, u16)>,
     subrange_size: Option<u16>,
@@ -83,36 +86,29 @@ impl Config {
 
     /// Loads the global config from [`crate::paths::config_path`].
     ///
-    /// If the file doesn't exist, returns [`Config::default`] silently. If
-    /// it cannot be read for any other reason, or exists but fails to
-    /// parse, a warning is printed to stderr and [`Config::default`] is
-    /// returned so a problematic config file never blocks the tool.
-    pub fn load() -> Config {
-        let path = crate::paths::config_path();
+    /// A missing file means [`Config::default`] (that is intentional, not a
+    /// failure). Every other outcome is **fail-closed**: a read error, a
+    /// parse error, an unknown field, or an invalid value is a hard error
+    /// (exit 1). A malformed config must never silently fall back to
+    /// defaults -- e.g. a broken `range = …` line reverting to `3000..=9999`
+    /// under the user's feet is exactly the surprise this guards against.
+    pub fn load() -> Result<Config> {
+        let path = crate::paths::config_path()?;
         let contents = match std::fs::read_to_string(&path) {
             Ok(contents) => contents,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Config::default();
+                return Ok(Config::default());
             }
             Err(err) => {
-                eprintln!(
-                    "portool: warning: failed to read {}: {err}; using defaults",
+                return Err(Error::General(format!(
+                    "failed to read {}: {err}",
                     path.display()
-                );
-                return Config::default();
+                )));
             }
         };
 
-        match Config::from_toml_str(&contents) {
-            Ok(cfg) => cfg,
-            Err(err) => {
-                eprintln!(
-                    "portool: warning: failed to parse {}: {err}; using defaults",
-                    path.display()
-                );
-                Config::default()
-            }
-        }
+        Config::from_toml_str(&contents)
+            .map_err(|err| Error::General(format!("failed to parse {}: {err}", path.display())))
     }
 }
 
@@ -188,6 +184,13 @@ mod tests {
     #[test]
     fn malformed_toml_is_error() {
         let err = Config::from_toml_str("this is not valid toml =====").unwrap_err();
+        assert_eq!(err.exit_code(), 1);
+    }
+
+    #[test]
+    fn unknown_field_is_rejected() {
+        // A typo like `ragne` must be a hard error, not silently ignored.
+        let err = Config::from_toml_str("ragne = [4000, 5000]\n").unwrap_err();
         assert_eq!(err.exit_code(), 1);
     }
 }

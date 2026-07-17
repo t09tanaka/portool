@@ -36,23 +36,29 @@ fn xdg_and_home_resolution_and_config_load() {
         std::env::set_var("HOME", home.path());
     }
 
-    assert_eq!(paths::state_dir(), home.path().join(".local/state/portool"));
     assert_eq!(
-        paths::registry_path(),
+        paths::state_dir().unwrap(),
+        home.path().join(".local/state/portool")
+    );
+    assert_eq!(
+        paths::registry_path().unwrap(),
         home.path().join(".local/state/portool/registry.json")
     );
     assert_eq!(
-        paths::lock_path(),
+        paths::lock_path().unwrap(),
         home.path().join(".local/state/portool/registry.json.lock")
     );
-    assert_eq!(paths::config_dir(), home.path().join(".config/portool"));
     assert_eq!(
-        paths::config_path(),
+        paths::config_dir().unwrap(),
+        home.path().join(".config/portool")
+    );
+    assert_eq!(
+        paths::config_path().unwrap(),
         home.path().join(".config/portool/config.toml")
     );
 
-    // No config.toml present yet -> Config::load falls back to defaults.
-    assert_eq!(Config::load(), Config::default());
+    // No config.toml present yet -> Config::load returns defaults.
+    assert_eq!(Config::load().unwrap(), Config::default());
 
     // --- XDG_* override HOME when set ---------------------------------
     let xdg_state = TempDir::new().unwrap();
@@ -63,39 +69,73 @@ fn xdg_and_home_resolution_and_config_load() {
         std::env::set_var("XDG_CONFIG_HOME", xdg_config.path());
     }
 
-    assert_eq!(paths::state_dir(), xdg_state.path().join("portool"));
-    assert_eq!(paths::config_dir(), xdg_config.path().join("portool"));
     assert_eq!(
-        paths::registry_path(),
+        paths::state_dir().unwrap(),
+        xdg_state.path().join("portool")
+    );
+    assert_eq!(
+        paths::config_dir().unwrap(),
+        xdg_config.path().join("portool")
+    );
+    assert_eq!(
+        paths::registry_path().unwrap(),
         xdg_state.path().join("portool/registry.json")
     );
 
     // --- Config::load parses a present, valid config file -------------
-    std::fs::create_dir_all(paths::config_dir()).unwrap();
-    std::fs::write(paths::config_path(), "block_align = 10\n").unwrap();
+    std::fs::create_dir_all(paths::config_dir().unwrap()).unwrap();
+    std::fs::write(paths::config_path().unwrap(), "block_align = 10\n").unwrap();
 
-    let cfg = Config::load();
+    let cfg = Config::load().unwrap();
     assert_eq!(cfg.block_align, 10);
     assert_eq!(cfg.range, Config::default().range);
 
-    // --- Config::load falls back to defaults on malformed TOML --------
-    std::fs::write(paths::config_path(), "this is not valid toml =====").unwrap();
-    assert_eq!(Config::load(), Config::default());
+    // --- Config::load is fail-closed on malformed TOML (batch B #8) ----
+    std::fs::write(
+        paths::config_path().unwrap(),
+        "this is not valid toml =====",
+    )
+    .unwrap();
+    assert!(
+        Config::load().is_err(),
+        "a malformed config must be a hard error, never a silent revert to defaults"
+    );
 
-    // --- Config::load falls back to defaults on a non-NotFound read
-    // --- error (config.toml is a directory), leaving it in place ------
-    std::fs::remove_file(paths::config_path()).unwrap();
-    std::fs::create_dir(paths::config_path()).unwrap();
-    assert_eq!(Config::load(), Config::default());
-    assert!(paths::config_path().is_dir());
-    std::fs::remove_dir(paths::config_path()).unwrap();
+    // --- Config::load rejects an unknown field (typo) ------------------
+    std::fs::write(paths::config_path().unwrap(), "ragne = [4000, 5000]\n").unwrap();
+    assert!(
+        Config::load().is_err(),
+        "an unknown field (typo) must be rejected, not silently ignored"
+    );
+
+    // --- Config::load is fail-closed on a non-NotFound read error
+    // --- (config.toml is a directory), leaving it in place -------------
+    std::fs::remove_file(paths::config_path().unwrap()).unwrap();
+    std::fs::create_dir(paths::config_path().unwrap()).unwrap();
+    assert!(Config::load().is_err());
+    assert!(paths::config_path().unwrap().is_dir());
+    std::fs::remove_dir(paths::config_path().unwrap()).unwrap();
 
     // --- empty XDG_STATE_HOME is treated as unset ----------------------
     // SAFETY: see above.
     unsafe {
         std::env::set_var("XDG_STATE_HOME", "");
     }
-    assert_eq!(paths::state_dir(), home.path().join(".local/state/portool"));
+    assert_eq!(
+        paths::state_dir().unwrap(),
+        home.path().join(".local/state/portool")
+    );
+
+    // --- a non-absolute XDG_STATE_HOME is ignored (batch B #6) ---------
+    // SAFETY: see above.
+    unsafe {
+        std::env::set_var("XDG_STATE_HOME", "relative/state");
+    }
+    assert_eq!(
+        paths::state_dir().unwrap(),
+        home.path().join(".local/state/portool"),
+        "a relative XDG value must be ignored per the XDG spec, not used verbatim"
+    );
 
     // Restore the original environment for hygiene.
     // SAFETY: see above.

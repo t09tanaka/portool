@@ -1,7 +1,7 @@
 //! `portool ls` (spec §9.3, frozen decisions 11, 12): a human-readable
 //! table by default, or the ledger's own JSON shape with `--json`.
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::gitctx::GitCtx;
 use crate::paths;
 use crate::registry::{ProjectEntry, Registry};
@@ -25,7 +25,26 @@ pub fn run(json: bool, all: bool) -> Result<()> {
     }
 
     // Read-only command: never heal (rename aside) a corrupt ledger here.
-    let registry = store::load(&paths::registry_path(), false).registry;
+    // But do not lie about it either (batch B #10): a corrupt/unreadable
+    // ledger must exit non-zero and, in JSON mode, emit an explicit error
+    // object -- never an empty-but-valid-looking ledger that a machine
+    // consumer would read as "no allocations".
+    let load = store::load(&paths::registry_path()?, false);
+    if load.corrupt || load.read_error {
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "error": "registry is unreadable or corrupt"
+                }))
+                .expect("error object always serializes")
+            );
+        }
+        return Err(Error::General(
+            "registry is unreadable or corrupt".to_string(),
+        ));
+    }
+    let registry = load.registry;
 
     let filtered: BTreeMap<String, ProjectEntry> = if all {
         registry.projects.clone()
