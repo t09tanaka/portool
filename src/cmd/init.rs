@@ -358,13 +358,60 @@ fn hook_boundary(loc: &HooksLocation, ctx: &GitCtx) -> Option<PathBuf> {
 }
 
 /// Runs `portool unhook`: removes portool's content from the effective
-/// post-checkout/post-merge hooks and nothing else.
+/// post-checkout/post-merge hooks and nothing else. Transactional (external
+/// review v0.10 P0-3): after removing, it verifies each hook is actually
+/// neutralized and reports a machine-readable `partial_unhook` (and a non-zero
+/// exit) if any hook still invokes portool.
 pub fn unhook() -> Result<()> {
     let cwd = std::env::current_dir()?;
     let ctx = GitCtx::discover(&cwd)?;
+    let loc = HooksLocation::resolve(&ctx);
     let results = remove_hooks(&ctx)?;
     report_hook_removal(&results);
-    Ok(())
+
+    let residue = unneutralized_hooks(&loc);
+    if residue.is_empty() {
+        Ok(())
+    } else {
+        println!(
+            "{{\"partial_unhook\":{{\"residue\":{}}}}}",
+            serde_json::to_string(&residue).expect("residue serializes")
+        );
+        Err(Error::General(
+            "unhook did not fully complete; see partial_unhook above".into(),
+        ))
+    }
+}
+
+/// The managed hook names that still invoke portool (or can't be verified
+/// because they're a symlink / unreadable / malformed) at `loc`. Empty means
+/// git will no longer run portool for this repository.
+fn unneutralized_hooks(loc: &HooksLocation) -> Vec<String> {
+    let mut residue = Vec::new();
+    for name in ["post-checkout", "post-merge"] {
+        if !hook_is_neutralized(loc, name) {
+            residue.push(format!("hook:{name}"));
+        }
+    }
+    residue
+}
+
+/// True when git will no longer run portool for `name` at `loc`: the hook is
+/// absent, or present but contains no portool invocation. A symlink, an
+/// unreadable file, or a hook that still invokes portool counts as *not*
+/// neutralized -> residue.
+fn hook_is_neutralized(loc: &HooksLocation, name: &str) -> bool {
+    match loc.hook_file(name) {
+        None => true,
+        Some(path) => match fs::symlink_metadata(&path) {
+            Err(_) => true, // absent
+            Ok(m) if m.file_type().is_symlink() => false,
+            Ok(_) => match fs::read_to_string(&path) {
+                Ok(c) => !crate::hooks::contains_portool_invocation(&c),
+                Err(_) => false, // unreadable -> can't confirm, assume invocable
+            },
+        },
+    }
 }
 
 /// Removes portool's content from the effective `post-checkout`/`post-merge`
@@ -430,17 +477,32 @@ pub fn deinit(keep_allocations: bool) -> Result<()> {
 
     let cwd = std::env::current_dir()?;
     let ctx = GitCtx::discover(&cwd)?;
+    let loc = HooksLocation::resolve(&ctx);
     let common_dir_key = ctx.common_dir.to_string_lossy().into_owned();
+
+    // Every step records residue instead of returning early, so a single
+    // failed step can't leave the repo in a state that reports success while
+    // portool can still re-hook or the env files linger (external review
+    // v0.10 P0-3). The final exit is success only when nothing is left behind.
+    let mut residue: Vec<String> = Vec::new();
+
+    // 1. Stop/remove the hooks first: a concurrent checkout must not be able
+    //    to re-create the env files we are about to delete.
+    let hook_results = remove_hooks(&ctx)?;
+    report_hook_removal(&hook_results);
+
+    // 2. Verify each hook is actually neutralized before touching allocations.
+    let hooks_neutralized = unneutralized_hooks(&loc);
+    residue.extend(hooks_neutralized.iter().cloned());
 
     if !keep_allocations {
         let _lock = lock::acquire(&paths::lock_path()?, Duration::from_secs(10))?;
         let registry_path = paths::registry_path()?;
         let mut registry_opt = store::load_strict(&registry_path)?;
 
-        // Union of the ledger's recorded paths and the live worktrees git
-        // reports: the env files exist on disk regardless of ledger state,
-        // so a lost ledger must not leave them behind (README: full deinit
-        // removes every worktree's .env.portool).
+        // 3. Remove env files (union of ledger paths + live worktrees): they
+        //    exist on disk regardless of ledger state, so a lost ledger must
+        //    not leave them behind.
         let mut env_dirs: std::collections::BTreeSet<PathBuf> =
             ctx.worktree_list()?.into_iter().collect();
         if let Some(registry) = &registry_opt {
@@ -453,31 +515,38 @@ pub fn deinit(keep_allocations: bool) -> Result<()> {
             match fs::remove_file(&env_path) {
                 Ok(()) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => {
-                    return Err(Error::General(format!(
-                        "failed to remove {}: {err}; no allocations were released",
-                        env_path.display()
-                    )))
-                }
+                Err(err) => residue.push(format!("env:{}:{err}", env_path.display())),
             }
         }
-        if let Some(registry) = &mut registry_opt {
-            if registry.projects.remove(&common_dir_key).is_some() {
-                store::save(&registry_path, registry)?;
-                println!("portool: released all of this project's allocations");
+
+        // 4. Remove ledger allocations -- but only once the hooks are proven
+        //    neutralized. If a hook still invokes portool, a later checkout
+        //    would re-allocate, so keep the allocations and say so rather than
+        //    dropping a block a live env still points at.
+        if hooks_neutralized.is_empty() {
+            if let Some(registry) = &mut registry_opt {
+                if registry.projects.remove(&common_dir_key).is_some() {
+                    store::save(&registry_path, registry)?;
+                    println!("portool: released all of this project's allocations");
+                }
             }
+        } else {
+            residue.push("allocations-kept:hooks-not-neutralized".into());
         }
     }
 
-    let hook_results = remove_hooks(&ctx)?;
-    report_hook_removal(&hook_results);
-    deinit_exclude(&ctx.common_dir)?;
+    // 5. Remove the info/exclude entry.
+    if let Err(err) = deinit_exclude(&ctx.common_dir) {
+        residue.push(format!("exclude:{err}"));
+    }
 
     let gitignore = ctx.worktree_root.join(".gitignore");
     if fs::read_to_string(&gitignore)
         .map(|c| c.lines().any(|l| l == IGNORE_LINE))
         .unwrap_or(false)
     {
+        // Informational only: portool never edits tracked files, so a bare
+        // line here is the user's to remove and is NOT deinit residue.
         println!(
             "portool: note: {} still lists '.env.portool' (added by an older portool \
              or by hand); remove it yourself if unwanted -- portool no longer edits \
@@ -485,8 +554,20 @@ pub fn deinit(keep_allocations: bool) -> Result<()> {
             crate::display::path(&gitignore)
         );
     }
-    println!("portool: deinitialized this project");
-    Ok(())
+
+    // 6. Final state: success only when nothing was left behind.
+    if residue.is_empty() {
+        println!("portool: deinitialized this project");
+        Ok(())
+    } else {
+        println!(
+            "{{\"partial_deinit\":{{\"residue\":{}}}}}",
+            serde_json::to_string(&residue).expect("residue serializes")
+        );
+        Err(Error::General(
+            "deinit did not fully complete; see partial_deinit above".into(),
+        ))
+    }
 }
 
 /// Removes portool's content from one hook. Shared by `unhook` and `deinit`
