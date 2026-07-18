@@ -130,25 +130,37 @@ pub fn run(repair: bool, abandon_other_projects: bool) -> Result<()> {
             Some(block) => block,
             None => continue,
         };
-        // An env file with no ID lines (e.g. written before IDs existed, or
-        // hand-edited) bypasses this cross-check by design: there is
-        // nothing to verify, and the accidental-copy threat model this
-        // check defends against is specifically one where IDs *are*
-        // present but wrong. It falls through to normal block validation
-        // below instead.
-        if let Some((env_project_id, env_worktree_id)) = crate::envfile::read_identity_from_env(wt)
-        {
-            let expect_p = crate::identity::project_id(&ctx.common_dir);
-            let expect_w = crate::identity::worktree_id(&ctx.common_dir, wt);
-            if env_project_id != expect_p || env_worktree_id != expect_w {
+        // Three-valued identity check (external review v0.10 P0-5):
+        // - `Absent` (no ID lines) bypasses the cross-check by design -- a
+        //   pre-identity or hand-edited file has nothing to verify, and the
+        //   accidental-copy threat model is specifically about *present but
+        //   wrong* IDs. It falls through to normal block validation.
+        // - `Partial` (exactly one ID line) is corruption, never conflated
+        //   with `Absent`: refuse to import and ask for manual repair.
+        match crate::envfile::read_identity_from_env(wt) {
+            crate::envfile::EnvIdentity::Complete(env_project_id, env_worktree_id) => {
+                let expect_p = crate::identity::project_id(&ctx.common_dir);
+                let expect_w = crate::identity::worktree_id(&ctx.common_dir, wt);
+                if env_project_id != expect_p || env_worktree_id != expect_w {
+                    println!(
+                        "doctor: warning: {}/.env.portool identifies a different \
+                         project/worktree (copied from elsewhere, or written by portool \
+                         < 0.9?); not importing its block",
+                        crate::display::text(&wt_key)
+                    );
+                    continue;
+                }
+            }
+            crate::envfile::EnvIdentity::Partial => {
                 println!(
-                    "doctor: warning: {}/.env.portool identifies a different project/worktree \
-                     (copied from elsewhere, or written by portool < 0.9?); not importing its \
-                     block",
+                    "doctor: warning: {}/.env.portool has only one of \
+                     PORTOOL_PROJECT_ID/PORTOOL_WORKTREE_ID (corrupt or half-written); \
+                     not importing -- repair or remove its .env.portool by hand",
                     crate::display::text(&wt_key)
                 );
                 continue;
             }
+            crate::envfile::EnvIdentity::Absent => { /* pre-identity file: fall through */ }
         }
         if let Err(reason) = validate_block(block) {
             eprintln!(
