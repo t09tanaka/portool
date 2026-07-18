@@ -2,6 +2,7 @@
 name = "portool"
 version = "0.8.0"
 edition = "2021"
+rust-version = "1.85"
 description = "Passive global port ledger for git worktrees"
 license = "MIT"
 repository = "https://github.com/t09tanaka/portool"
