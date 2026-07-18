@@ -17,6 +17,14 @@ pub struct Registry {
     /// allocation always consults the current `Config`, and a block outside
     /// this recorded range is a `doctor` advisory, never a corruption).
     pub range: (u16, u16),
+    /// A single monotonic counter for the whole ledger, incremented by every
+    /// [`crate::store::save`] (schema v4, external review v0.10 P0-2). Mirrored
+    /// into each `.env.portool` header, it lets a restore-from-stale-backup be
+    /// detected: a live worktree whose env records a *higher* sequence than the
+    /// ledger proves the ledger was rolled back, so allocation is quarantined
+    /// until `doctor --repair` reconciles.
+    #[serde(default)]
+    pub sequence: u64,
     /// Keyed by `realpath(git rev-parse --git-common-dir)`.
     pub projects: BTreeMap<String, ProjectEntry>,
     pub reservations: Vec<Reservation>,
@@ -68,8 +76,9 @@ impl Registry {
     /// The schema version this build reads and writes. v2 dropped the
     /// per-project `subranges` field (hardening batch C); v3 added
     /// per-worktree `generation` and `pending_block` for the two-phase
-    /// ledger/env update.
-    pub const CURRENT_VERSION: u32 = 3;
+    /// ledger/env update; v4 added the top-level monotonic `sequence`
+    /// (external review v0.10 P0-2).
+    pub const CURRENT_VERSION: u32 = 4;
 
     /// A freshly created, empty ledger recording `range` for informational
     /// purposes.
@@ -77,6 +86,7 @@ impl Registry {
         Registry {
             version: Self::CURRENT_VERSION,
             range,
+            sequence: 0,
             projects: BTreeMap::new(),
             reservations: Vec::new(),
         }
@@ -101,7 +111,15 @@ impl Registry {
         }
         let peek: VersionPeek = serde_json::from_str(s)?;
         match peek.version {
-            3 => Ok(serde_json::from_str::<Registry>(s)?),
+            4 => Ok(serde_json::from_str::<Registry>(s)?),
+            3 => {
+                // v3 is byte-compatible with v4 minus `sequence` (which
+                // `#[serde(default)]` supplies as 0); just stamp the version.
+                let mut registry = serde_json::from_str::<Registry>(s)?;
+                registry.version = Self::CURRENT_VERSION;
+                registry.sequence = 0;
+                Ok(registry)
+            }
             2 => Ok(serde_json::from_str::<v2::Registry>(s)?.into_current()),
             1 => Ok(serde_json::from_str::<v1::Registry>(s)?.into_current()),
             other => Err(Error::UnsupportedRegistryVersion {
@@ -291,6 +309,7 @@ mod v2 {
             super::Registry {
                 version: super::Registry::CURRENT_VERSION,
                 range: self.range,
+                sequence: 0,
                 projects: self
                     .projects
                     .into_iter()
@@ -351,6 +370,7 @@ mod v1 {
             super::Registry {
                 version: super::Registry::CURRENT_VERSION,
                 range: self.range,
+                sequence: 0,
                 projects: self
                     .projects
                     .into_iter()
@@ -380,6 +400,34 @@ mod tests {
 
     const SPEC_EXAMPLE: &str = r#"
     {
+      "version": 4,
+      "range": [3000, 9999],
+      "sequence": 7,
+      "projects": {
+        "/home/user/dev/myapp/.git": {
+          "name": "myapp",
+          "worktrees": {
+            "/home/user/dev/myapp": {
+              "block": [3000, 3004],
+              "generation": 1,
+              "pending_block": null,
+              "branch": "main",
+              "manifest_hash": "a1b2c3d4e5f6",
+              "pinned": false,
+              "label": null,
+              "allocated_at": "2026-07-15T10:00:00+09:00",
+              "last_seen_at": "2026-07-15T12:00:00+09:00"
+            }
+          }
+        }
+      },
+      "reservations": []
+    }
+    "#;
+
+    /// A v3 ledger (pre-sequence) for migration coverage.
+    const SPEC_EXAMPLE_V3: &str = r#"
+    {
       "version": 3,
       "range": [3000, 9999],
       "projects": {
@@ -388,7 +436,7 @@ mod tests {
           "worktrees": {
             "/home/user/dev/myapp": {
               "block": [3000, 3004],
-              "generation": 1,
+              "generation": 2,
               "pending_block": null,
               "branch": "main",
               "manifest_hash": "a1b2c3d4e5f6",
@@ -458,7 +506,7 @@ mod tests {
     #[test]
     fn empty_has_no_projects_or_reservations() {
         let reg = Registry::empty((3000, 9999));
-        assert_eq!(reg.version, 3);
+        assert_eq!(reg.version, 4);
         assert_eq!(reg.range, (3000, 9999));
         assert!(reg.projects.is_empty());
         assert!(reg.reservations.is_empty());
@@ -477,7 +525,8 @@ mod tests {
     fn spec_example_round_trips() {
         let reg = Registry::from_json(SPEC_EXAMPLE).unwrap();
 
-        assert_eq!(reg.version, 3);
+        assert_eq!(reg.version, 4);
+        assert_eq!(reg.sequence, 7);
         assert_eq!(reg.range, (3000, 9999));
         assert!(reg.reservations.is_empty());
 
@@ -514,7 +563,7 @@ mod tests {
         assert!(reg.validate().is_ok());
         let serialized = serde_json::to_string(&reg).unwrap();
         assert!(!serialized.contains("subranges"));
-        assert!(serialized.contains("\"version\":3"));
+        assert!(serialized.contains("\"version\":4"));
     }
 
     #[test]
@@ -528,6 +577,22 @@ mod tests {
         assert_eq!(worktree.generation, 1);
         assert_eq!(worktree.pending_block, None);
         assert!(reg.validate().is_ok());
+    }
+
+    #[test]
+    fn from_json_migrates_v3_adding_sequence_zero() {
+        let reg = Registry::from_json(SPEC_EXAMPLE_V3).unwrap();
+        assert_eq!(reg.version, Registry::CURRENT_VERSION);
+        assert_eq!(reg.sequence, 0);
+        let project = reg.find_project("/home/user/dev/myapp/.git").unwrap();
+        let worktree = project.worktrees.get("/home/user/dev/myapp").unwrap();
+        // Every block and generation preserved verbatim on upgrade.
+        assert_eq!(worktree.block, (3000, 3004));
+        assert_eq!(worktree.generation, 2);
+        assert!(reg.validate().is_ok());
+        let serialized = serde_json::to_string(&reg).unwrap();
+        assert!(serialized.contains("\"version\":4"));
+        assert!(serialized.contains("\"sequence\":0"));
     }
 
     #[test]

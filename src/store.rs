@@ -96,7 +96,10 @@ fn repo_relative_components(
         }
     }
     let leaf = components.pop().ok_or_else(|| {
-        Error::General(format!("refusing to write {}: empty path", target.display()))
+        Error::General(format!(
+            "refusing to write {}: empty path",
+            target.display()
+        ))
     })?;
     Ok((components, leaf))
 }
@@ -265,9 +268,11 @@ pub fn chmod_within(boundary: &Path, target: &Path, mode: u32) -> Result<()> {
         return Ok(());
     }
     let err = std::io::Error::last_os_error();
-    let enotsup = err.raw_os_error() == Some(libc::ENOTSUP) || err.raw_os_error() == Some(libc::EOPNOTSUPP);
+    let enotsup =
+        err.raw_os_error() == Some(libc::ENOTSUP) || err.raw_os_error() == Some(libc::EOPNOTSUPP);
     if enotsup {
-        let rc = unsafe { libc::fchmodat(dir.as_raw_fd(), leaf_c.as_ptr(), mode as libc::mode_t, 0) };
+        let rc =
+            unsafe { libc::fchmodat(dir.as_raw_fd(), leaf_c.as_ptr(), mode as libc::mode_t, 0) };
         if rc == 0 {
             return Ok(());
         }
@@ -388,7 +393,12 @@ pub fn copy_aside(path: &Path) -> Result<PathBuf> {
 /// warning on stderr, never a command failure. The backup is written via
 /// temp-file + rename too (external review 3rd round P1-3) -- a crash mid-
 /// backup can no longer leave a partially overwritten `.bak`.
-pub fn save(path: &Path, registry: &Registry) -> Result<()> {
+pub fn save(path: &Path, registry: &mut Registry) -> Result<()> {
+    // Bump the monotonic ledger sequence on every save (external review v0.10
+    // P0-2). `save` is always called under the ledger lock, so this is the
+    // single serialization point for the counter. `saturating_add` keeps a
+    // (practically unreachable) overflow from wrapping the counter back.
+    registry.sequence = registry.sequence.saturating_add(1);
     let json = serde_json::to_string_pretty(registry)?;
     write_atomic_impl(path, json.as_bytes(), None)?;
     fault::point("after_registry_write");
@@ -457,19 +467,43 @@ pub fn backup_path(path: &Path) -> PathBuf {
     path.with_file_name(format!("{file_name}.bak"))
 }
 
-/// True when the ledger exists but its `.bak` sibling is missing or does
-/// not match byte-for-byte -- i.e. the last backup refresh failed and a
-/// `doctor --repair` would restore stale state. Heals on the next save.
-pub fn backup_is_stale(path: &Path) -> std::io::Result<bool> {
-    let main = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(e),
+/// The recovery health of the ledger's `.bak` sibling, compared by parsed
+/// `sequence` (external review v0.10 P0-2). `Behind` means restoring the
+/// backup would roll the ledger *back* -- a degraded state `check` surfaces
+/// as a non-zero exit, because a `doctor --repair` would currently lose
+/// allocations newer than the backup.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BackupStatus {
+    /// The backup is at least as new as the ledger (or there is no ledger yet).
+    Fresh,
+    /// The ledger exists but has no `.bak` sibling.
+    Missing,
+    /// The backup's sequence is older than the ledger's.
+    Behind { main_seq: u64, bak_seq: u64 },
+    /// The ledger or its backup is unreadable/corrupt; recovery is unsafe.
+    Corrupt,
+}
+
+/// Compares the ledger and its `.bak` by parsed `sequence`.
+pub fn backup_status(path: &Path) -> BackupStatus {
+    let main = match load(path) {
+        LedgerLoad::Loaded(registry) => registry,
+        LedgerLoad::Missing => return BackupStatus::Fresh, // nothing to back up yet
+        _ => return BackupStatus::Corrupt,
     };
-    match std::fs::read(backup_path(path)) {
-        Ok(bak) => Ok(bak != main),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
-        Err(e) => Err(e),
+    match load(&backup_path(path)) {
+        LedgerLoad::Loaded(bak) => {
+            if bak.sequence < main.sequence {
+                BackupStatus::Behind {
+                    main_seq: main.sequence,
+                    bak_seq: bak.sequence,
+                }
+            } else {
+                BackupStatus::Fresh
+            }
+        }
+        LedgerLoad::Missing => BackupStatus::Missing,
+        _ => BackupStatus::Corrupt,
     }
 }
 
@@ -682,11 +716,26 @@ mod tests {
     fn save_then_load_round_trips() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("registry.json");
-        let registry = sample_registry();
+        let mut registry = sample_registry();
 
-        save(&path, &registry).unwrap();
+        save(&path, &mut registry).unwrap();
 
+        // save bumps the in-memory registry's sequence too, so the reloaded
+        // ledger matches it exactly.
+        assert_eq!(registry.sequence, 1);
         assert_eq!(load_strict(&path).unwrap(), Some(registry));
+    }
+
+    #[test]
+    fn save_increments_sequence_each_time() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("registry.json");
+        let mut registry = Registry::empty((3000, 9999));
+        save(&path, &mut registry).unwrap();
+        assert_eq!(registry.sequence, 1);
+        save(&path, &mut registry).unwrap();
+        assert_eq!(registry.sequence, 2);
+        assert_eq!(load_strict(&path).unwrap().unwrap().sequence, 2);
     }
 
     #[test]
@@ -694,7 +743,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("nested").join("dir").join("registry.json");
 
-        save(&path, &Registry::empty((3000, 9999))).unwrap();
+        save(&path, &mut Registry::empty((3000, 9999))).unwrap();
 
         assert!(path.exists());
     }
@@ -704,7 +753,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("registry.json");
 
-        save(&path, &Registry::empty((3000, 9999))).unwrap();
+        save(&path, &mut Registry::empty((3000, 9999))).unwrap();
 
         let mut entries = dir_entries(tmp.path());
         entries.sort();
@@ -719,10 +768,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("registry.json");
 
-        save(&path, &Registry::empty((3000, 9999))).unwrap();
-        save(&path, &sample_registry()).unwrap();
+        save(&path, &mut Registry::empty((3000, 9999))).unwrap();
+        let mut sample = sample_registry();
+        save(&path, &mut sample).unwrap();
 
-        assert_eq!(load_strict(&path).unwrap(), Some(sample_registry()));
+        assert_eq!(load_strict(&path).unwrap(), Some(sample));
     }
 
     #[test]
@@ -760,7 +810,7 @@ mod tests {
     fn save_writes_a_backup_sibling() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("registry.json");
-        save(&path, &sample_registry()).unwrap();
+        save(&path, &mut sample_registry()).unwrap();
 
         let bak = backup_path(&path);
         assert!(bak.exists());
@@ -775,14 +825,12 @@ mod tests {
     fn backup_lags_one_save_behind_on_the_next_write() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("registry.json");
-        save(&path, &Registry::empty((3000, 9999))).unwrap();
-        save(&path, &sample_registry()).unwrap();
-        // After the second save the backup equals the *second* saved state
-        // (copy happens after persist), and load_strict on it succeeds.
-        assert_eq!(
-            load_strict(&backup_path(&path)).unwrap(),
-            Some(sample_registry())
-        );
+        save(&path, &mut Registry::empty((3000, 9999))).unwrap();
+        let mut sample = sample_registry();
+        save(&path, &mut sample).unwrap(); // bumps sample.sequence
+                                           // After the second save the backup equals the *second* saved state
+                                           // (copy happens after persist), sequence and all.
+        assert_eq!(load_strict(&backup_path(&path)).unwrap(), Some(sample));
     }
 
     #[test]
@@ -801,34 +849,62 @@ mod tests {
     }
 
     #[test]
-    fn backup_is_stale_false_when_main_ledger_is_missing() {
+    fn backup_status_fresh_when_main_ledger_is_missing() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("registry.json");
-
-        assert!(!backup_is_stale(&path).unwrap());
+        assert_eq!(backup_status(&path), BackupStatus::Fresh);
     }
 
     #[test]
-    fn backup_is_stale_true_when_bak_is_missing() {
+    fn backup_status_missing_when_bak_absent() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("registry.json");
-        fs::write(&path, b"{}").unwrap();
-
-        assert!(backup_is_stale(&path).unwrap());
+        // A valid ledger with no .bak sibling.
+        write_atomic(
+            &path,
+            serde_json::to_string(&Registry::empty((3000, 9999)))
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(backup_status(&path), BackupStatus::Missing);
     }
 
     #[test]
-    fn backup_is_stale_true_when_bak_differs_and_false_once_fresh() {
+    fn backup_status_fresh_after_save_and_behind_when_bak_sequence_is_older() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("registry.json");
-        save(&path, &sample_registry()).unwrap();
-        assert!(
-            !backup_is_stale(&path).unwrap(),
-            "a freshly saved backup must not be stale"
-        );
+        let mut reg = sample_registry();
+        save(&path, &mut reg).unwrap(); // ledger seq 1, bak seq 1
+        assert_eq!(backup_status(&path), BackupStatus::Fresh);
 
-        fs::write(backup_path(&path), b"stale contents").unwrap();
-        assert!(backup_is_stale(&path).unwrap());
+        // Advance the ledger without refreshing the backup (simulating a
+        // failed backup write): the backup's sequence now lags behind.
+        save(&path, &mut reg).unwrap(); // ledger seq 2
+                                        // Roll the backup back to a stale (seq 1) copy by hand.
+        let mut stale = sample_registry();
+        stale.sequence = 1;
+        write_atomic(
+            &backup_path(&path),
+            serde_json::to_string(&stale).unwrap().as_bytes(),
+        )
+        .unwrap();
+        match backup_status(&path) {
+            BackupStatus::Behind { main_seq, bak_seq } => {
+                assert_eq!(main_seq, 2);
+                assert_eq!(bak_seq, 1);
+            }
+            other => panic!("expected Behind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn backup_status_corrupt_when_bak_unparseable() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("registry.json");
+        save(&path, &mut sample_registry()).unwrap();
+        fs::write(backup_path(&path), b"{ not json").unwrap();
+        assert_eq!(backup_status(&path), BackupStatus::Corrupt);
     }
 
     #[test]
@@ -839,7 +915,10 @@ mod tests {
         let written = atomic_write_within(tmp.path(), &target, b"hi", 0o755).unwrap();
         assert_eq!(fs::read(&written).unwrap(), b"hi");
         use std::os::unix::fs::PermissionsExt;
-        assert_eq!(fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o755);
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
     }
 
     #[test]
@@ -900,7 +979,7 @@ mod tests {
         // exactly registry.json + registry.json.bak (no .bak.tmp residue).
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("registry.json");
-        save(&path, &sample_registry()).unwrap();
+        save(&path, &mut sample_registry()).unwrap();
 
         let mut entries = dir_entries(tmp.path());
         entries.sort();

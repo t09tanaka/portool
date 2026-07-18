@@ -41,6 +41,19 @@ struct JsonAllocation {
     path: String,
     branch: Option<String>,
     block: (u16, u16),
+    /// A target block reserved mid-move (an interrupted two-phase update),
+    /// or `null`. Exposed so a machine consumer is never told a clean state
+    /// while a move is pending (external review v0.10 P0-4).
+    pending_block: Option<(u16, u16)>,
+    /// The block this worktree's `.env.portool` actually hands out, or `null`
+    /// when the dir/env is gone. Disagreement with `block` (and no pending)
+    /// means recovery is required.
+    env_block: Option<(u16, u16)>,
+    /// Derived: `ok` | `pending_move` | `recovery_required` | `env_missing`
+    /// | `stale`.
+    state: String,
+    /// `true` whenever `state != "ok"` -- a `portool sync` is needed.
+    sync_required: bool,
     generation: u64,
     pinned: bool,
     label: Option<String>,
@@ -184,12 +197,28 @@ fn build_allocations(filtered: &BTreeMap<String, ProjectEntry>) -> Vec<JsonAlloc
     let mut out = Vec::new();
     for (project_key, project) in filtered {
         for (path, w) in &project.worktrees {
+            let dir_exists = Path::new(path).exists();
             let status = if w.pinned {
                 "pinned"
-            } else if Path::new(path).exists() {
+            } else if dir_exists {
                 "active"
             } else {
                 "stale?"
+            };
+            // Derive the machine-readable sync state (P0-4): never report a
+            // clean state while a move is pending or the env disagrees with
+            // the ledger.
+            let env_block = crate::envfile::read_block_from_env(Path::new(path));
+            let state = if w.pending_block.is_some() {
+                "pending_move"
+            } else if !dir_exists {
+                "stale"
+            } else if env_block.is_none() {
+                "env_missing"
+            } else if env_block != Some(w.block) {
+                "recovery_required"
+            } else {
+                "ok"
             };
             out.push(JsonAllocation {
                 project: project.name.clone(),
@@ -199,6 +228,10 @@ fn build_allocations(filtered: &BTreeMap<String, ProjectEntry>) -> Vec<JsonAlloc
                 path: path.clone(),
                 branch: w.branch.clone(),
                 block: w.block,
+                pending_block: w.pending_block,
+                env_block,
+                state: state.to_string(),
+                sync_required: state != "ok",
                 generation: w.generation,
                 pinned: w.pinned,
                 label: w.label.clone(),

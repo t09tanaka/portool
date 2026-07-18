@@ -54,7 +54,7 @@ pub fn run() -> Result<()> {
             .expect("has_entry checked above")
             .worktrees
             .remove(&worktree_key);
-        store::save(&registry_path, &registry)?;
+        store::save(&registry_path, &mut registry)?;
         println!(
             "portool: released {}",
             crate::display::path(&ctx.worktree_root)

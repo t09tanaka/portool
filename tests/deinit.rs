@@ -89,7 +89,11 @@ fn deinit_clean_repo_fully_removes_everything() {
     assert!(env.portool(&r, &["init"]).status.success());
 
     let out = env.portool(&r, &["deinit"]);
-    assert!(out.status.success(), "clean deinit must succeed: {}", stdout(&out));
+    assert!(
+        out.status.success(),
+        "clean deinit must succeed: {}",
+        stdout(&out)
+    );
     assert!(!stdout(&out).contains("partial_deinit"));
     assert!(!r.join(".git/hooks/post-checkout").exists());
     assert!(!r.join(".git/hooks/post-merge").exists());
@@ -116,9 +120,20 @@ fn deinit_with_a_symlink_hook_is_partial_and_keeps_allocations() {
 
     let out = env.portool(&r, &["deinit"]);
     assert!(!out.status.success(), "deinit must fail closed on residue");
-    assert!(stdout(&out).contains("partial_deinit"), "must report partial: {}", stdout(&out));
-    assert!(stdout(&out).contains("allocations-kept"), "must keep allocations: {}", stdout(&out));
-    assert!(std::fs::symlink_metadata(&hook).unwrap().file_type().is_symlink());
+    assert!(
+        stdout(&out).contains("partial_deinit"),
+        "must report partial: {}",
+        stdout(&out)
+    );
+    assert!(
+        stdout(&out).contains("allocations-kept"),
+        "must keep allocations: {}",
+        stdout(&out)
+    );
+    assert!(std::fs::symlink_metadata(&hook)
+        .unwrap()
+        .file_type()
+        .is_symlink());
     // Allocation retained.
     let ls = env.portool(&r, &["ls", "--all", "--json"]);
     let v: serde_json::Value = serde_json::from_slice(&ls.stdout).unwrap();
@@ -137,15 +152,24 @@ fn deinit_with_a_malformed_managed_block_is_partial() {
         "#!/bin/sh\n# >>> portool >>>\nportool sync --quiet || true\nuser-code\n",
     )
     .unwrap();
-    assert!(env.portool(&r, &["init", "--gitignore-only"]).status.success());
+    assert!(env
+        .portool(&r, &["init", "--gitignore-only"])
+        .status
+        .success());
     // Register an allocation so there is something to (not) release.
     assert!(env.portool(&r, &["sync"]).status.success());
 
     let out = env.portool(&r, &["deinit"]);
     assert!(!out.status.success());
-    assert!(stdout(&out).contains("partial_deinit"), "got: {}", stdout(&out));
+    assert!(
+        stdout(&out).contains("partial_deinit"),
+        "got: {}",
+        stdout(&out)
+    );
     // The malformed hook is left byte-identical.
-    assert!(std::fs::read_to_string(&hook).unwrap().contains("user-code"));
+    assert!(std::fs::read_to_string(&hook)
+        .unwrap()
+        .contains("user-code"));
 }
 
 #[test]
@@ -164,9 +188,15 @@ fn deinit_with_a_non_shell_hook_reports_partial_if_it_invokes_portool() {
     let out = env.portool(&r, &["deinit"]);
     // A python hook mentioning portool is not neutralized -> partial.
     assert!(!out.status.success());
-    assert!(stdout(&out).contains("partial_deinit"), "got: {}", stdout(&out));
+    assert!(
+        stdout(&out).contains("partial_deinit"),
+        "got: {}",
+        stdout(&out)
+    );
     // Untouched.
-    assert!(std::fs::read_to_string(&hook).unwrap().contains("print('hi')"));
+    assert!(std::fs::read_to_string(&hook)
+        .unwrap()
+        .contains("print('hi')"));
 }
 
 #[test]
@@ -201,5 +231,9 @@ fn unhook_reports_partial_on_a_symlink_hook() {
 
     let out = env.portool(&r, &["unhook"]);
     assert!(!out.status.success());
-    assert!(stdout(&out).contains("partial_unhook"), "got: {}", stdout(&out));
+    assert!(
+        stdout(&out).contains("partial_unhook"),
+        "got: {}",
+        stdout(&out)
+    );
 }

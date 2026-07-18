@@ -763,7 +763,12 @@ fn install_into(
             if is_owned_standalone(&existing) {
                 return if existing != script {
                     let original_mode = fs::metadata(hook_path)?.permissions().mode();
-                    atomic_write(boundary, hook_path, script.as_bytes(), original_mode | 0o100)?;
+                    atomic_write(
+                        boundary,
+                        hook_path,
+                        script.as_bytes(),
+                        original_mode | 0o100,
+                    )?;
                     Ok(HookOutcome::Installed)
                 } else {
                     ensure_executable(boundary, hook_path)?;
@@ -795,7 +800,12 @@ fn install_into(
                     return if let Some(rewritten) =
                         replace_managed_block(&existing, begin, end, block)
                     {
-                        atomic_write(boundary, hook_path, rewritten.as_bytes(), original_mode | 0o100)?;
+                        atomic_write(
+                            boundary,
+                            hook_path,
+                            rewritten.as_bytes(),
+                            original_mode | 0o100,
+                        )?;
                         Ok(HookOutcome::Installed)
                     } else {
                         ensure_executable(boundary, hook_path)?;
@@ -807,7 +817,12 @@ fn install_into(
 
             // 3. Legacy appended lines (safe or unsafe): migrate to the block.
             if let Some(rewritten) = migrate_legacy_lines(&existing, block) {
-                atomic_write(boundary, hook_path, rewritten.as_bytes(), original_mode | 0o100)?;
+                atomic_write(
+                    boundary,
+                    hook_path,
+                    rewritten.as_bytes(),
+                    original_mode | 0o100,
+                )?;
                 return Ok(HookOutcome::Installed);
             }
 
@@ -816,7 +831,12 @@ fn install_into(
             match classify_shebang(&existing) {
                 Shebang::None | Shebang::PosixShell => {
                     let content = insert_block_after_shebang(&existing, block);
-                    atomic_write(boundary, hook_path, content.as_bytes(), original_mode | 0o100)?;
+                    atomic_write(
+                        boundary,
+                        hook_path,
+                        content.as_bytes(),
+                        original_mode | 0o100,
+                    )?;
                     Ok(HookOutcome::Installed)
                 }
                 Shebang::Other | Shebang::Unparseable => {
@@ -1106,9 +1126,15 @@ mod tests {
     fn classify_shebang_tokenizes_strictly() {
         use Shebang::*;
         assert!(matches!(classify_shebang(""), Unparseable)); // empty file
-        assert!(matches!(classify_shebang("\u{feff}#!/bin/sh\n"), Unparseable)); // BOM
+        assert!(matches!(
+            classify_shebang("\u{feff}#!/bin/sh\n"),
+            Unparseable
+        )); // BOM
         assert!(matches!(classify_shebang("#!/bin/sh\n"), PosixShell));
-        assert!(matches!(classify_shebang("#!/usr/bin/env bash\n"), PosixShell));
+        assert!(matches!(
+            classify_shebang("#!/usr/bin/env bash\n"),
+            PosixShell
+        ));
         assert!(matches!(
             classify_shebang("#!/usr/bin/env -S bash -e\n"),
             PosixShell
@@ -1116,14 +1142,17 @@ mod tests {
         assert!(matches!(classify_shebang("#!/bin/bash\r\n"), PosixShell)); // CRLF tolerated
         assert!(matches!(classify_shebang("#!/bin/dash\n"), PosixShell));
         assert!(matches!(classify_shebang("echo hi\n"), None)); // no shebang -> sh
-        assert!(matches!(classify_shebang("#!/usr/bin/env python3\n"), Other));
+        assert!(matches!(
+            classify_shebang("#!/usr/bin/env python3\n"),
+            Other
+        ));
         assert!(matches!(classify_shebang("#!/usr/bin/perl\n"), Other));
         // A basename that merely contains "sh" is not a shell.
         assert!(matches!(classify_shebang("#!/usr/bin/flash\n"), Other));
         // zsh is not in the POSIX-sh allowlist.
         assert!(matches!(classify_shebang("#!/usr/local/bin/zsh\n"), Other));
         assert!(matches!(classify_shebang("#!/usr/bin/env\n"), Unparseable)); // env, no command
-        // Oversized shebang -> unparseable.
+                                                                              // Oversized shebang -> unparseable.
         let long = format!("#!/bin/{}\n", "x".repeat(2000));
         assert!(matches!(classify_shebang(&long), Unparseable));
     }
@@ -1170,7 +1199,8 @@ mod tests {
         fs::write(&hook_path, "#!/bin/sh\necho hi\n").unwrap();
         let block = hook_append_block(Some("/p"));
 
-        let outcome = install_into(tmp.path(), &hook_path, &hook_script(Some("/p")), &block).unwrap();
+        let outcome =
+            install_into(tmp.path(), &hook_path, &hook_script(Some("/p")), &block).unwrap();
 
         assert_eq!(outcome, HookOutcome::Installed);
         let content = fs::read_to_string(&hook_path).unwrap();

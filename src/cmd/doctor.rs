@@ -61,6 +61,7 @@ pub fn run(repair: bool, abandon_other_projects: bool) -> Result<()> {
     let config = Config::load()?;
     let _lock = lock::acquire(&paths::lock_path()?, LOCK_TIMEOUT)?;
     let registry_path = paths::registry_path()?;
+    let mut restored_from_backup = false;
     let mut registry = match store::load(&registry_path) {
         store::LedgerLoad::Loaded(registry) => registry,
         store::LedgerLoad::Missing => Registry::empty(config.range),
@@ -98,7 +99,10 @@ pub fn run(repair: bool, abandon_other_projects: bool) -> Result<()> {
                     registry_path.display()
                 )));
             }
-            repair_corrupt(&registry_path, &reason, abandon_other_projects, &config)?
+            let (registry, restored) =
+                repair_corrupt(&registry_path, &reason, abandon_other_projects, &config)?;
+            restored_from_backup = restored;
+            registry
         }
     };
 
@@ -223,7 +227,7 @@ pub fn run(repair: bool, abandon_other_projects: bool) -> Result<()> {
                 "doctor produced an invalid ledger ({err}); nothing was saved"
             ))
         })?;
-        store::save(&registry_path, &registry)?;
+        store::save(&registry_path, &mut registry)?;
     }
 
     // 2. Report this project's blocks whose ports are currently in use.
@@ -247,7 +251,20 @@ pub fn run(repair: bool, abandon_other_projects: bool) -> Result<()> {
     //    "will actually run".
     let hook_findings = report_hook_health(&ctx);
 
-    if imported == 0 && in_use == 0 && hook_findings == 0 {
+    // 4. P0-2: after a restore-from-backup, this project has been reconciled
+    //    from its live worktrees' env blocks, but other projects have NOT --
+    //    doctor is per-project. Report this machine-readably so automation can
+    //    tell that a recovery-loss window may exist until `doctor --repair`
+    //    runs in each other project too.
+    if restored_from_backup {
+        println!(
+            "{{\"portool_recovery\":{{\"restored_from_backup\":true,\"restored_sequence\":{},\"reconciled_project\":{},\"other_projects_may_need_repair\":true}}}}",
+            registry.sequence,
+            serde_json::to_string(&common_dir_key).expect("string serializes")
+        );
+    }
+
+    if imported == 0 && in_use == 0 && hook_findings == 0 && !restored_from_backup {
         println!("portool: doctor: nothing to repair for this project");
     }
     Ok(())
@@ -364,12 +381,16 @@ fn embedded_bin_path(content: &str) -> Option<String> {
 /// `registry.json.bak` brings back *every* project (external review P0-1);
 /// only the explicit --abandon-other-projects flag falls back to the
 /// destructive start-from-empty rebuild.
+///
+/// Returns `(registry, restored_from_backup)`: the second field is `true`
+/// only on the restore-from-backup path, so `run` can emit the P0-2 recovery
+/// advisory afterward.
 fn repair_corrupt(
     registry_path: &Path,
     reason: &str,
     abandon_other_projects: bool,
     config: &Config,
-) -> Result<Registry> {
+) -> Result<(Registry, bool)> {
     if abandon_other_projects {
         let moved_to = store::move_aside(registry_path)?;
         eprintln!(
@@ -378,11 +399,11 @@ fn repair_corrupt(
             crate::display::path(registry_path),
             crate::display::path(&moved_to)
         );
-        return Ok(Registry::empty(config.range));
+        return Ok((Registry::empty(config.range), false));
     }
 
     match store::load(&store::backup_path(registry_path)) {
-        store::LedgerLoad::Loaded(backup) => {
+        store::LedgerLoad::Loaded(mut backup) => {
             // Copy (not rename) the corrupt file aside, then let save()'s
             // atomic rename overwrite it in one step: registry.json is
             // never missing at any instant. If the save fails here, the
@@ -390,14 +411,14 @@ fn repair_corrupt(
             // mistake the state for a fresh install and refresh the backup
             // with a near-empty ledger.
             let copied_to = store::copy_aside(registry_path)?;
-            store::save(registry_path, &backup)?;
+            store::save(registry_path, &mut backup)?;
             eprintln!(
                 "portool: doctor: {} was corrupt ({reason}); copied aside to {} and \
                  restored the last good backup (all projects kept)",
                 crate::display::path(registry_path),
                 crate::display::path(&copied_to)
             );
-            Ok(backup)
+            Ok((backup, true))
         }
         _ => Err(Error::General(format!(
             "{} is corrupt ({reason}) and no valid backup exists; a plain repair would \

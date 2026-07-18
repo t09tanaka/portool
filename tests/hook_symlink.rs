@@ -48,7 +48,10 @@ fn husky_dir_symlink_escaping_the_repo_writes_nothing_outside() {
         .output()
         .unwrap();
 
-    assert!(is_empty(&outside), "portool wrote outside the repo (.husky symlink)");
+    assert!(
+        is_empty(&outside),
+        "portool wrote outside the repo (.husky symlink)"
+    );
     assert!(!out.status.success(), "init must fail closed, not exit 0");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
