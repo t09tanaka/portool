@@ -11,6 +11,7 @@ use crate::fault;
 use crate::registry::Registry;
 use std::fs;
 use std::io::Write;
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -35,6 +36,259 @@ pub enum LedgerLoad {
     /// found" (permissions, EIO, path is a directory, ...). The ledger may
     /// well still be intact on disk, so callers must never overwrite it.
     ReadError { reason: String },
+}
+
+// --- symlink-safe, fd-relative writes under a repository boundary (P0-1) ---
+//
+// Every hook write goes through these instead of `fs::create_dir_all` +
+// `NamedTempFile`, so a symlink planted anywhere along the path (a `.husky`
+// symlink, a symlinked hooks dir, or the hook file itself) can never redirect
+// a write outside the repository. The directory walk is fd-relative
+// (`openat` with `O_NOFOLLOW | O_DIRECTORY`), which closes the TOCTOU window a
+// canonicalize-then-write check would leave open: the same descriptor that was
+// verified is the one written through.
+
+/// `openat(dirfd, name, O_RDONLY|O_NOFOLLOW|O_DIRECTORY)` -- or, when `dirfd`
+/// is `None`, `open(name, ...)` for the boundary itself. Fails on a symlink
+/// component (`ELOOP`) or a non-directory.
+fn open_dir_nofollow(name: &Path, dirfd: Option<RawFd>) -> std::io::Result<fs::File> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let c = CString::new(name.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    let fd = match dirfd {
+        Some(d) => unsafe { libc::openat(d, c.as_ptr(), flags) },
+        None => unsafe { libc::open(c.as_ptr(), flags) },
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fd is a freshly opened, owned descriptor.
+    Ok(unsafe { fs::File::from_raw_fd(fd) })
+}
+
+/// The `Normal` path components of `target` relative to `boundary`, with the
+/// leaf split off. Errors if `target` is not under `boundary` or any relative
+/// component is `..`/`.`/root (an escape attempt).
+fn repo_relative_components(
+    boundary: &Path,
+    target: &Path,
+) -> Result<(Vec<std::ffi::OsString>, std::ffi::OsString)> {
+    let rel = target.strip_prefix(boundary).map_err(|_| {
+        Error::General(format!(
+            "refusing to write {}: it is not under {}",
+            target.display(),
+            boundary.display()
+        ))
+    })?;
+    let mut components: Vec<std::ffi::OsString> = Vec::new();
+    for c in rel.components() {
+        match c {
+            std::path::Component::Normal(name) => components.push(name.to_os_string()),
+            _ => {
+                return Err(Error::General(format!(
+                    "refusing to write {}: a path component escapes {}",
+                    target.display(),
+                    boundary.display()
+                )))
+            }
+        }
+    }
+    let leaf = components.pop().ok_or_else(|| {
+        Error::General(format!("refusing to write {}: empty path", target.display()))
+    })?;
+    Ok((components, leaf))
+}
+
+/// Opens the parent directory of `target` as a verified fd, plus the leaf
+/// name, walking every component below `boundary` with `O_NOFOLLOW` so no
+/// symlink is ever followed. Fails if a parent is missing (create it first
+/// with [`create_dirs_repo_relative`]) or is a symlink/non-directory.
+fn open_parent_dir_fd(boundary: &Path, target: &Path) -> Result<(fs::File, std::ffi::OsString)> {
+    let (components, leaf) = repo_relative_components(boundary, target)?;
+    let mut dir = open_dir_nofollow(boundary, None).map_err(|e| {
+        Error::General(format!(
+            "refusing to write under {}: boundary is not a real directory ({e})",
+            boundary.display()
+        ))
+    })?;
+    for name in components {
+        dir = open_dir_nofollow(Path::new(&name), Some(dir.as_raw_fd())).map_err(|e| {
+            Error::General(format!(
+                "refusing to write under {}: intermediate '{}' is not a real directory ({e})",
+                boundary.display(),
+                Path::new(&name).display()
+            ))
+        })?;
+    }
+    Ok((dir, leaf))
+}
+
+/// Ensures every intermediate directory of `target` exists under `boundary`,
+/// creating missing ones with `mkdirat` (mode 0755). Refuses to descend
+/// through a symlink or non-directory.
+pub fn create_dirs_repo_relative(boundary: &Path, target: &Path) -> Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let (names, _leaf) = repo_relative_components(boundary, target)?;
+    let mut dir = open_dir_nofollow(boundary, None).map_err(|e| {
+        Error::General(format!(
+            "refusing to create dirs under {}: boundary is not a real directory ({e})",
+            boundary.display()
+        ))
+    })?;
+    for name in names {
+        let c = CString::new(name.as_bytes())
+            .map_err(|_| Error::General("directory name contains NUL".into()))?;
+        match open_dir_nofollow(Path::new(&name), Some(dir.as_raw_fd())) {
+            Ok(next) => dir = next,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let rc = unsafe { libc::mkdirat(dir.as_raw_fd(), c.as_ptr(), 0o755) };
+                if rc < 0 {
+                    return Err(Error::from(std::io::Error::last_os_error()));
+                }
+                dir = open_dir_nofollow(Path::new(&name), Some(dir.as_raw_fd())).map_err(|e| {
+                    Error::General(format!(
+                        "refusing to create dirs under {}: '{}' is not a real directory ({e})",
+                        boundary.display(),
+                        Path::new(&name).display()
+                    ))
+                })?;
+            }
+            Err(e) => {
+                return Err(Error::General(format!(
+                    "refusing to create dirs under {}: '{}' is not a real directory ({e})",
+                    boundary.display(),
+                    Path::new(&name).display()
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Atomically writes `contents` to `target` with permission `mode`, refusing
+/// if any component below `boundary` is a symlink or escapes it. Temp file +
+/// `renameat`, both relative to the verified parent-directory fd, so the
+/// verified directory is exactly the one written into (TOCTOU-safe). Returns
+/// the final path written.
+pub fn atomic_write_within(
+    boundary: &Path,
+    target: &Path,
+    contents: &[u8],
+    mode: u32,
+) -> Result<PathBuf> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let (dir, leaf) = open_parent_dir_fd(boundary, target)?;
+    let dirfd = dir.as_raw_fd();
+
+    let tmp_name = format!(
+        ".portool-tmp-{}-{}",
+        std::process::id(),
+        leaf.to_string_lossy()
+    );
+    let tmp_c = CString::new(tmp_name.as_bytes())
+        .map_err(|_| Error::General("temp name contains NUL".into()))?;
+    // O_EXCL: a pre-existing temp of this exact name is an anomaly, not
+    // something to silently truncate. O_NOFOLLOW: never write through a
+    // symlink even at the leaf temp.
+    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let fd = unsafe { libc::openat(dirfd, tmp_c.as_ptr(), flags, mode as libc::c_uint) };
+    if fd < 0 {
+        return Err(Error::from(std::io::Error::last_os_error()));
+    }
+    // SAFETY: fd is a freshly opened, owned descriptor.
+    let mut tmp = unsafe { fs::File::from_raw_fd(fd) };
+    let write_result = (|| -> std::io::Result<()> {
+        tmp.write_all(contents)?;
+        tmp.sync_all()?;
+        Ok(())
+    })();
+    drop(tmp);
+    if let Err(e) = write_result {
+        unsafe { libc::unlinkat(dirfd, tmp_c.as_ptr(), 0) };
+        return Err(Error::from(e));
+    }
+    // openat with O_CREAT|O_EXCL honors `mode` only subject to umask; force
+    // the exact bits so a restrictive umask can't drop the execute bit a hook
+    // needs.
+    let rc = unsafe { libc::fchmodat(dirfd, tmp_c.as_ptr(), mode as libc::mode_t, 0) };
+    if rc < 0 {
+        let e = std::io::Error::last_os_error();
+        unsafe { libc::unlinkat(dirfd, tmp_c.as_ptr(), 0) };
+        return Err(Error::from(e));
+    }
+    let leaf_c = CString::new(leaf.as_bytes())
+        .map_err(|_| Error::General("leaf name contains NUL".into()))?;
+    let rc = unsafe { libc::renameat(dirfd, tmp_c.as_ptr(), dirfd, leaf_c.as_ptr()) };
+    if rc < 0 {
+        let e = std::io::Error::last_os_error();
+        unsafe { libc::unlinkat(dirfd, tmp_c.as_ptr(), 0) };
+        return Err(Error::from(e));
+    }
+    // Best-effort durability of the rename.
+    let _ = dir.sync_all();
+    Ok(boundary.join(
+        target
+            .strip_prefix(boundary)
+            .expect("checked in repo_relative_components"),
+    ))
+}
+
+/// Sets `target`'s permission bits to `mode`, refusing if any component below
+/// `boundary` is a symlink or escapes it. Uses `fchmodat` relative to the
+/// verified parent-directory fd, so it can never chmod a file outside the
+/// repository even if a component was swapped for a symlink.
+pub fn chmod_within(boundary: &Path, target: &Path, mode: u32) -> Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let (dir, leaf) = open_parent_dir_fd(boundary, target)?;
+    let leaf_c = CString::new(leaf.as_bytes())
+        .map_err(|_| Error::General("leaf name contains NUL".into()))?;
+    // AT_SYMLINK_NOFOLLOW so a leaf that became a symlink is never chmod'd
+    // through; portool's caller has already rejected symlink leaves, this is
+    // belt-and-suspenders. (Linux may reject NOFOLLOW-on-non-symlink with
+    // ENOTSUP; fall back to a plain fchmodat, still fd-relative so it stays
+    // inside the verified directory.)
+    let rc = unsafe {
+        libc::fchmodat(
+            dir.as_raw_fd(),
+            leaf_c.as_ptr(),
+            mode as libc::mode_t,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    let enotsup = err.raw_os_error() == Some(libc::ENOTSUP) || err.raw_os_error() == Some(libc::EOPNOTSUPP);
+    if enotsup {
+        let rc = unsafe { libc::fchmodat(dir.as_raw_fd(), leaf_c.as_ptr(), mode as libc::mode_t, 0) };
+        if rc == 0 {
+            return Ok(());
+        }
+        return Err(Error::from(std::io::Error::last_os_error()));
+    }
+    Err(Error::from(err))
+}
+
+/// Removes `target`, refusing if any component below `boundary` is a symlink
+/// or escapes it. `unlinkat` relative to the verified parent-directory fd.
+pub fn unlink_within(boundary: &Path, target: &Path) -> Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let (dir, leaf) = open_parent_dir_fd(boundary, target)?;
+    let leaf_c = CString::new(leaf.as_bytes())
+        .map_err(|_| Error::General("leaf name contains NUL".into()))?;
+    let rc = unsafe { libc::unlinkat(dir.as_raw_fd(), leaf_c.as_ptr(), 0) };
+    if rc < 0 {
+        return Err(Error::from(std::io::Error::last_os_error()));
+    }
+    Ok(())
 }
 
 /// Loads the registry at `path` without ever touching the file.
@@ -575,6 +829,69 @@ mod tests {
 
         fs::write(backup_path(&path), b"stale contents").unwrap();
         assert!(backup_is_stale(&path).unwrap());
+    }
+
+    #[test]
+    fn atomic_write_within_writes_and_sets_mode() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("sub/dir/file");
+        create_dirs_repo_relative(tmp.path(), &target).unwrap();
+        let written = atomic_write_within(tmp.path(), &target, b"hi", 0o755).unwrap();
+        assert_eq!(fs::read(&written).unwrap(), b"hi");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o755);
+    }
+
+    #[test]
+    fn atomic_write_within_refuses_a_symlinked_intermediate() {
+        let tmp = TempDir::new().unwrap();
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        // repo/hooks -> ../outside (escape)
+        std::os::unix::fs::symlink(&outside, repo.join("hooks")).unwrap();
+        let target = repo.join("hooks/post-checkout");
+
+        let err = atomic_write_within(&repo, &target, b"x", 0o755).unwrap_err();
+        assert!(
+            err.to_string().contains("not a real directory")
+                || err.to_string().contains("refusing"),
+            "unexpected: {err}"
+        );
+        // Nothing leaked into the escape target.
+        assert!(fs::read_dir(&outside).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn atomic_write_within_refuses_a_target_outside_boundary() {
+        let tmp = TempDir::new().unwrap();
+        let boundary = tmp.path().join("repo");
+        fs::create_dir_all(&boundary).unwrap();
+        let target = tmp.path().join("elsewhere/file");
+        assert!(atomic_write_within(&boundary, &target, b"x", 0o644).is_err());
+    }
+
+    #[test]
+    fn create_dirs_repo_relative_refuses_symlinked_component() {
+        let tmp = TempDir::new().unwrap();
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        std::os::unix::fs::symlink(&outside, repo.join("link")).unwrap();
+        let target = repo.join("link/sub/file");
+        assert!(create_dirs_repo_relative(&repo, &target).is_err());
+        assert!(fs::read_dir(&outside).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn unlink_within_removes_only_inside_boundary() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("f");
+        fs::write(&target, b"x").unwrap();
+        unlink_within(tmp.path(), &target).unwrap();
+        assert!(!target.exists());
     }
 
     #[test]

@@ -255,10 +255,24 @@ fn install_hook(ctx: &GitCtx) -> Result<HookOutcome> {
     let loc = HooksLocation::resolve(ctx);
     match &loc {
         HooksLocation::GitDefault { .. } | HooksLocation::Custom { .. } => {
-            install_managed_hooks(&loc)
+            let boundary = hook_boundary(&loc, ctx).ok_or_else(|| {
+                Error::General(
+                    "the effective hooks directory is not inside this repository; \
+                     refusing to auto-install (install the hook by hand)"
+                        .to_string(),
+                )
+            })?;
+            install_managed_hooks(&loc, &boundary)
         }
         HooksLocation::Husky { .. } => {
-            let outcome = install_managed_hooks(&loc)?;
+            let boundary = hook_boundary(&loc, ctx).ok_or_else(|| {
+                Error::General(
+                    "the .husky directory is not inside this repository; refusing to \
+                     auto-install (install the hook by hand)"
+                        .to_string(),
+                )
+            })?;
+            let outcome = install_managed_hooks(&loc, &boundary)?;
             let hook_file = loc
                 .hook_file("post-checkout")
                 .expect("husky location yields a hook file");
@@ -320,6 +334,29 @@ fn install_hook(ctx: &GitCtx) -> Result<HookOutcome> {
     }
 }
 
+/// The repository boundary a hooks location's files must stay within: the
+/// worktree root for Husky (`.husky/...`), the common dir (or worktree, for a
+/// relative custom path) for git's default/custom hooks dir. Both roots are
+/// already canonical (`GitCtx` realpaths them), so a hook path that resolves
+/// outside the returned boundary is a symlink escape and `store`'s fd-relative
+/// writers refuse it (external review v0.10 P0-1). `None` for locations that
+/// are never auto-installed.
+fn hook_boundary(loc: &HooksLocation, ctx: &GitCtx) -> Option<PathBuf> {
+    match loc {
+        HooksLocation::Husky { .. } => Some(ctx.worktree_root.clone()),
+        HooksLocation::GitDefault { hooks_dir } | HooksLocation::Custom { hooks_dir } => {
+            if hooks_dir.starts_with(&ctx.common_dir) {
+                Some(ctx.common_dir.clone())
+            } else if hooks_dir.starts_with(&ctx.worktree_root) {
+                Some(ctx.worktree_root.clone())
+            } else {
+                None
+            }
+        }
+        HooksLocation::Missing { .. } | HooksLocation::SharedScope { .. } => None,
+    }
+}
+
 /// Runs `portool unhook`: removes portool's content from the effective
 /// post-checkout/post-merge hooks and nothing else.
 pub fn unhook() -> Result<()> {
@@ -337,10 +374,16 @@ pub fn unhook() -> Result<()> {
 /// `unhook`/`deinit` exit non-zero via `?` instead of silently doing nothing.
 fn remove_hooks(ctx: &GitCtx) -> Result<Vec<(&'static str, HookOutcome)>> {
     let loc = HooksLocation::resolve(ctx);
+    let boundary = hook_boundary(&loc, ctx);
     let mut results = Vec::new();
     for name in ["post-checkout", "post-merge"] {
         if let Some(path) = loc.hook_file(name) {
-            results.push((name, deinit_hook(&path)?));
+            // Without a boundary the location is never one portool installs
+            // into, so there is nothing of portool's to remove there.
+            let Some(boundary) = boundary.as_deref() else {
+                continue;
+            };
+            results.push((name, deinit_hook(boundary, &path)?));
         }
     }
     Ok(results)
@@ -463,7 +506,7 @@ pub fn deinit(keep_allocations: bool) -> Result<()> {
 /// "file doesn't exist" (`NotFound`) propagates as `Err` -- previously it
 /// was swallowed into a silent `Ok(())`, so `unhook`/`deinit` looked
 /// successful while never touching the hook.
-fn deinit_hook(hook_path: &Path) -> Result<HookOutcome> {
+fn deinit_hook(boundary: &Path, hook_path: &Path) -> Result<HookOutcome> {
     if fs::symlink_metadata(hook_path)
         .map(|m| m.file_type().is_symlink())
         .unwrap_or(false)
@@ -477,7 +520,7 @@ fn deinit_hook(hook_path: &Path) -> Result<HookOutcome> {
     };
 
     if is_owned_standalone(&existing) {
-        fs::remove_file(hook_path)?;
+        remove_file_within(boundary, hook_path)?;
         return Ok(HookOutcome::Removed);
     }
 
@@ -498,7 +541,8 @@ fn deinit_hook(hook_path: &Path) -> Result<HookOutcome> {
         }
         ManagedBlockState::Valid { begin, end } => {
             if let Some(stripped) = replace_managed_block(&existing, begin, end, "") {
-                atomic_write(hook_path, stripped.as_bytes())?;
+                let mode = fs::metadata(hook_path)?.permissions().mode();
+                atomic_write(boundary, hook_path, stripped.as_bytes(), mode)?;
             }
             return Ok(HookOutcome::Removed);
         }
@@ -518,7 +562,8 @@ fn deinit_hook(hook_path: &Path) -> Result<HookOutcome> {
         if existing.ends_with('\n') && !out.is_empty() {
             out.push('\n');
         }
-        atomic_write(hook_path, out.as_bytes())?;
+        let mode = fs::metadata(hook_path)?.permissions().mode();
+        atomic_write(boundary, hook_path, out.as_bytes(), mode)?;
         Ok(HookOutcome::Removed)
     } else {
         Ok(HookOutcome::NotFound)
@@ -550,7 +595,7 @@ fn deinit_exclude(common_dir: &Path) -> Result<()> {
         if existing.ends_with('\n') && !content.is_empty() {
             content.push('\n');
         }
-        atomic_write(&path, content.as_bytes())?;
+        atomic_write(common_dir, &path, content.as_bytes(), 0o644)?;
     }
     Ok(())
 }
@@ -562,14 +607,14 @@ fn deinit_exclude(common_dir: &Path) -> Result<()> {
 /// hooks embed the same content. Returns **post-checkout's** outcome --
 /// that's the hook `run`/`init --hook-only` gate their exit status on, since
 /// it's the one every `git checkout`/`worktree add` actually fires.
-fn install_managed_hooks(loc: &HooksLocation) -> Result<HookOutcome> {
+fn install_managed_hooks(loc: &HooksLocation, boundary: &Path) -> Result<HookOutcome> {
     let bin = portool_bin_path();
     let script = hook_script(bin.as_deref());
     let block = hook_append_block(bin.as_deref());
     let mut post_checkout_outcome = None;
     for name in ["post-checkout", "post-merge"] {
         if let Some(path) = loc.hook_file(name) {
-            let outcome = install_into(&path, &script, &block)?;
+            let outcome = install_into(boundary, &path, &script, &block)?;
             if name == "post-checkout" {
                 post_checkout_outcome = Some(outcome);
             }
@@ -610,7 +655,12 @@ fn install_managed_hooks(loc: &HooksLocation) -> Result<HookOutcome> {
 ///
 /// Rewrites go through a temp-file + rename, and preserve the hook's original
 /// permission bits (only ever *adding* the owner-execute bit).
-fn install_into(hook_path: &Path, script: &str, block: &str) -> Result<HookOutcome> {
+fn install_into(
+    boundary: &Path,
+    hook_path: &Path,
+    script: &str,
+    block: &str,
+) -> Result<HookOutcome> {
     if let Ok(meta) = fs::symlink_metadata(hook_path) {
         if meta.file_type().is_symlink() {
             eprintln!(
@@ -621,10 +671,9 @@ fn install_into(hook_path: &Path, script: &str, block: &str) -> Result<HookOutco
         }
     }
 
-    let hooks_dir = hook_path.parent().ok_or_else(|| {
-        Error::General(format!("{} has no parent directory", hook_path.display()))
-    })?;
-    fs::create_dir_all(hooks_dir)?;
+    // Create the hooks dir tree symlink-safely: refuses to `mkdir` through a
+    // symlinked component (external review v0.10 P0-1).
+    crate::store::create_dirs_repo_relative(boundary, hook_path)?;
 
     match fs::read_to_string(hook_path) {
         Ok(existing) => {
@@ -633,11 +682,10 @@ fn install_into(hook_path: &Path, script: &str, block: &str) -> Result<HookOutco
             if is_owned_standalone(&existing) {
                 return if existing != script {
                     let original_mode = fs::metadata(hook_path)?.permissions().mode();
-                    atomic_write(hook_path, script.as_bytes())?;
-                    set_mode(hook_path, original_mode | 0o100)?;
+                    atomic_write(boundary, hook_path, script.as_bytes(), original_mode | 0o100)?;
                     Ok(HookOutcome::Installed)
                 } else {
-                    ensure_executable(hook_path)?;
+                    ensure_executable(boundary, hook_path)?;
                     Ok(HookOutcome::AlreadyCurrent)
                 };
             }
@@ -666,11 +714,10 @@ fn install_into(hook_path: &Path, script: &str, block: &str) -> Result<HookOutco
                     return if let Some(rewritten) =
                         replace_managed_block(&existing, begin, end, block)
                     {
-                        atomic_write(hook_path, rewritten.as_bytes())?;
-                        set_mode(hook_path, original_mode | 0o100)?;
+                        atomic_write(boundary, hook_path, rewritten.as_bytes(), original_mode | 0o100)?;
                         Ok(HookOutcome::Installed)
                     } else {
-                        ensure_executable(hook_path)?;
+                        ensure_executable(boundary, hook_path)?;
                         Ok(HookOutcome::AlreadyCurrent)
                     };
                 }
@@ -679,35 +726,39 @@ fn install_into(hook_path: &Path, script: &str, block: &str) -> Result<HookOutco
 
             // 3. Legacy appended lines (safe or unsafe): migrate to the block.
             if let Some(rewritten) = migrate_legacy_lines(&existing, block) {
-                atomic_write(hook_path, rewritten.as_bytes())?;
-                set_mode(hook_path, original_mode | 0o100)?;
+                atomic_write(boundary, hook_path, rewritten.as_bytes(), original_mode | 0o100)?;
                 return Ok(HookOutcome::Installed);
             }
 
             // 4. Foreign hook, no portool content: insert right after the
             //    shebang (never append at EOF -- see `insert_block_after_shebang`).
-            if shebang_is_posix_shell(&existing) {
-                let content = insert_block_after_shebang(&existing, block);
-                atomic_write(hook_path, content.as_bytes())?;
-                set_mode(hook_path, original_mode | 0o100)?;
-                Ok(HookOutcome::Installed)
-            } else {
-                eprintln!(
-                    "warning: {} has a non-shell interpreter; not appending portool's shell block",
-                    crate::display::path(hook_path)
-                );
-                eprintln!(
-                    "hint: add this line to the hook your interpreter runs, if you want portool:"
-                );
-                eprintln!("hint:   {}", HOOK_APPEND_LINE.trim_end());
-                Ok(HookOutcome::ManualRequired {
-                    reason: format!("{} has a non-shell interpreter", hook_path.display()),
-                })
+            match classify_shebang(&existing) {
+                Shebang::None | Shebang::PosixShell => {
+                    let content = insert_block_after_shebang(&existing, block);
+                    atomic_write(boundary, hook_path, content.as_bytes(), original_mode | 0o100)?;
+                    Ok(HookOutcome::Installed)
+                }
+                Shebang::Other | Shebang::Unparseable => {
+                    eprintln!(
+                        "warning: {} has an interpreter portool can't safely extend; not \
+                         modifying it",
+                        crate::display::path(hook_path)
+                    );
+                    eprintln!(
+                        "hint: add this line to the hook your interpreter runs, if you want portool:"
+                    );
+                    eprintln!("hint:   {}", HOOK_APPEND_LINE.trim_end());
+                    Ok(HookOutcome::ManualRequired {
+                        reason: format!(
+                            "{} has an interpreter portool can't safely extend",
+                            hook_path.display()
+                        ),
+                    })
+                }
             }
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            atomic_write(hook_path, script.as_bytes())?;
-            set_mode(hook_path, 0o755)?;
+            atomic_write(boundary, hook_path, script.as_bytes(), 0o755)?;
             Ok(HookOutcome::Installed)
         }
         // Exists but not readable (non-UTF-8, permissions, ...): leave it
@@ -824,31 +875,99 @@ pub(crate) fn contains_unsafe_portool_form(content: &str) -> bool {
             .any(|line| UNSAFE_PORTOOL_LINES.contains(&line.trim()))
 }
 
-/// Whether it is safe to append a POSIX `sh` line to an existing hook: true
-/// when it has no shebang (git runs such hooks via `sh`) or a shell shebang,
-/// false for any other interpreter.
-fn shebang_is_posix_shell(existing: &str) -> bool {
-    match existing.lines().next() {
-        None => true,
-        Some(first) if first.starts_with("#!") => {
-            ["/sh", "/bash", "/dash", "env sh", "env bash", "env dash"]
-                .iter()
-                .any(|marker| first.contains(marker))
+/// The interpreter classification of a hook file's first line, from a real
+/// tokenization of the shebang rather than a substring test (external review
+/// v0.10 P0-6). Only `None`/`PosixShell` are safe to inject a `sh` block into.
+#[derive(Debug, PartialEq, Eq)]
+enum Shebang {
+    /// No shebang at all: git executes such a hook with `sh`, so a shell
+    /// block is safe.
+    None,
+    /// `sh`/`bash`/`dash`, whether direct or via `/usr/bin/env [ -S ]`.
+    PosixShell,
+    /// A non-shell interpreter (python, perl, zsh, ...): never inject `sh`.
+    Other,
+    /// Empty file, BOM before `#!`, an oversized shebang, or `env` with no
+    /// command -- anything portool cannot reason about. Fail closed.
+    Unparseable,
+}
+
+/// The POSIX-shell interpreter basenames portool is willing to extend. `zsh`
+/// is deliberately excluded: it is not a POSIX `sh` and portool's block uses
+/// `command -v`/`||` semantics validated only against sh/bash/dash.
+const SHELL_BASENAMES: &[&str] = &["sh", "bash", "dash"];
+
+/// Classifies a hook's first line by tokenizing the shebang: splits the
+/// interpreter path, resolves `/usr/bin/env [ -S ] <cmd>` to its real command,
+/// and matches the interpreter *basename* exactly against [`SHELL_BASENAMES`]
+/// (so `flash`/`zsh` are never mistaken for a shell). CRLF on the shebang line
+/// is tolerated; a leading BOM, an empty file, or an absurdly long shebang is
+/// `Unparseable` (fail closed).
+fn classify_shebang(content: &str) -> Shebang {
+    if content.is_empty() {
+        return Shebang::Unparseable;
+    }
+    // A leading UTF-8 BOM pushes "#!" off byte 0; the kernel won't treat it
+    // as a shebang, so portool can't reason about it -> fail closed.
+    if content.starts_with('\u{feff}') {
+        return Shebang::Unparseable;
+    }
+    let first = content.split('\n').next().unwrap_or("");
+    let first = first.strip_suffix('\r').unwrap_or(first);
+    if !first.starts_with("#!") {
+        // No shebang: git executes the hook with `sh`.
+        return Shebang::None;
+    }
+    // Kernels cap the shebang line (~127-256 bytes); an absurdly long one is
+    // never a real interpreter path.
+    if first.len() > 256 {
+        return Shebang::Unparseable;
+    }
+    let rest = first[2..].trim();
+    if rest.is_empty() {
+        return Shebang::Unparseable;
+    }
+    let mut tokens = rest.split_whitespace();
+    let interp = tokens.next().unwrap();
+    if shebang_basename(interp) == "env" {
+        // `/usr/bin/env [ -S ] <cmd> ...`: the real interpreter is the first
+        // token that is not `env` itself and not an option (`-S`, `-i`, ...).
+        for tok in tokens {
+            if tok.starts_with('-') {
+                continue;
+            }
+            return if SHELL_BASENAMES.contains(&shebang_basename(tok)) {
+                Shebang::PosixShell
+            } else {
+                Shebang::Other
+            };
         }
-        Some(_) => true,
+        return Shebang::Unparseable; // `env` with no command
+    }
+    if SHELL_BASENAMES.contains(&shebang_basename(interp)) {
+        Shebang::PosixShell
+    } else {
+        Shebang::Other
     }
 }
 
+/// The final path component of an interpreter token (its basename).
+fn shebang_basename(token: &str) -> &str {
+    token.rsplit('/').next().unwrap_or(token)
+}
+
 /// Adds the owner-execute bit if missing, preserving every other permission
-/// bit (never downgrades e.g. a `0700` hook to `0755`).
-fn ensure_executable(path: &Path) -> Result<()> {
+/// bit (never downgrades e.g. a `0700` hook to `0755`). Symlink-safe: the
+/// chmod is fd-relative under `boundary` (external review v0.10 P0-1).
+fn ensure_executable(boundary: &Path, path: &Path) -> Result<()> {
     let mode = fs::metadata(path)?.permissions().mode();
     if mode & 0o100 == 0 {
-        set_mode(path, mode | 0o100)?;
+        crate::store::chmod_within(boundary, path, mode | 0o100)?;
     }
     Ok(())
 }
 
+#[cfg(test)]
 fn set_mode(path: &Path, mode: u32) -> Result<()> {
     let mut perms = fs::metadata(path)?.permissions();
     perms.set_mode(mode);
@@ -856,18 +975,19 @@ fn set_mode(path: &Path, mode: u32) -> Result<()> {
     Ok(())
 }
 
-/// Writes `contents` to `path` atomically (temp file + rename in the same
-/// directory).
-fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
-    use std::io::Write;
-    let dir = path
-        .parent()
-        .ok_or_else(|| Error::General(format!("{} has no parent directory", path.display())))?;
-    fs::create_dir_all(dir)?;
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
-    tmp.write_all(contents)?;
-    tmp.persist(path).map_err(|e| Error::from(e.error))?;
+/// Writes `contents` to `path` atomically and symlink-safely, setting its
+/// permission bits to `mode`. The write is refused if any component of `path`
+/// below `boundary` is a symlink or escapes it (external review v0.10 P0-1).
+fn atomic_write(boundary: &Path, path: &Path, contents: &[u8], mode: u32) -> Result<()> {
+    crate::store::create_dirs_repo_relative(boundary, path)?;
+    crate::store::atomic_write_within(boundary, path, contents, mode)?;
     Ok(())
+}
+
+/// Removes `path`, refusing to unlink through a symlinked component below
+/// `boundary`.
+fn remove_file_within(boundary: &Path, path: &Path) -> Result<()> {
+    crate::store::unlink_within(boundary, path)
 }
 
 /// Adds the managed `.env.portool` pair to `$GIT_COMMON_DIR/info/exclude`
@@ -893,13 +1013,39 @@ fn update_exclude(common_dir: &Path) -> Result<()> {
     content.push('\n');
     content.push_str(IGNORE_LINE);
     content.push('\n');
-    atomic_write(&path, content.as_bytes())
+    atomic_write(common_dir, &path, content.as_bytes(), 0o644)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn classify_shebang_tokenizes_strictly() {
+        use Shebang::*;
+        assert!(matches!(classify_shebang(""), Unparseable)); // empty file
+        assert!(matches!(classify_shebang("\u{feff}#!/bin/sh\n"), Unparseable)); // BOM
+        assert!(matches!(classify_shebang("#!/bin/sh\n"), PosixShell));
+        assert!(matches!(classify_shebang("#!/usr/bin/env bash\n"), PosixShell));
+        assert!(matches!(
+            classify_shebang("#!/usr/bin/env -S bash -e\n"),
+            PosixShell
+        ));
+        assert!(matches!(classify_shebang("#!/bin/bash\r\n"), PosixShell)); // CRLF tolerated
+        assert!(matches!(classify_shebang("#!/bin/dash\n"), PosixShell));
+        assert!(matches!(classify_shebang("echo hi\n"), None)); // no shebang -> sh
+        assert!(matches!(classify_shebang("#!/usr/bin/env python3\n"), Other));
+        assert!(matches!(classify_shebang("#!/usr/bin/perl\n"), Other));
+        // A basename that merely contains "sh" is not a shell.
+        assert!(matches!(classify_shebang("#!/usr/bin/flash\n"), Other));
+        // zsh is not in the POSIX-sh allowlist.
+        assert!(matches!(classify_shebang("#!/usr/local/bin/zsh\n"), Other));
+        assert!(matches!(classify_shebang("#!/usr/bin/env\n"), Unparseable)); // env, no command
+        // Oversized shebang -> unparseable.
+        let long = format!("#!/bin/{}\n", "x".repeat(2000));
+        assert!(matches!(classify_shebang(&long), Unparseable));
+    }
 
     #[test]
     fn hook_script_embeds_an_absolute_path_with_fallback() {
@@ -922,6 +1068,7 @@ mod tests {
         fs::write(&hook_path, hook_script(Some("/stale/old/portool"))).unwrap();
 
         install_into(
+            tmp.path(),
             &hook_path,
             &hook_script(Some("/new/portool")),
             &hook_append_block(Some("/new/portool")),
@@ -942,7 +1089,7 @@ mod tests {
         fs::write(&hook_path, "#!/bin/sh\necho hi\n").unwrap();
         let block = hook_append_block(Some("/p"));
 
-        let outcome = install_into(&hook_path, &hook_script(Some("/p")), &block).unwrap();
+        let outcome = install_into(tmp.path(), &hook_path, &hook_script(Some("/p")), &block).unwrap();
 
         assert_eq!(outcome, HookOutcome::Installed);
         let content = fs::read_to_string(&hook_path).unwrap();
@@ -969,6 +1116,7 @@ mod tests {
         .unwrap();
 
         install_into(
+            tmp.path(),
             &hook_path,
             &hook_script(Some("/p")),
             &hook_append_block(Some("/p")),
@@ -1018,7 +1166,7 @@ mod tests {
         .unwrap();
         let block = hook_append_block(Some("/p"));
 
-        install_into(&hook_path, &hook_script(Some("/p")), &block).unwrap();
+        install_into(tmp.path(), &hook_path, &hook_script(Some("/p")), &block).unwrap();
 
         let content = fs::read_to_string(&hook_path).unwrap();
         assert!(
@@ -1066,10 +1214,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let hook = tmp.path().join("post-checkout");
         fs::write(&hook, content).unwrap();
-        let out = install_into(&hook, "SCRIPT", "BLOCK\n").unwrap();
+        let out = install_into(tmp.path(), &hook, "SCRIPT", "BLOCK\n").unwrap();
         assert!(matches!(out, HookOutcome::ManualRequired { .. }));
         assert_eq!(fs::read_to_string(&hook).unwrap(), content);
-        let out = deinit_hook(&hook).unwrap();
+        let out = deinit_hook(tmp.path(), &hook).unwrap();
         assert!(matches!(out, HookOutcome::ManualRequired { .. }));
         assert_eq!(fs::read_to_string(&hook).unwrap(), content);
     }
@@ -1096,7 +1244,7 @@ mod tests {
         fs::write(&hook, existing).unwrap();
         let block = "# >>> portool >>>\nB\n# <<< portool <<<\n";
         assert_eq!(
-            install_into(&hook, "S", block).unwrap(),
+            install_into(tmp.path(), &hook, "S", block).unwrap(),
             HookOutcome::Installed
         );
         let written = fs::read_to_string(&hook).unwrap();
@@ -1112,7 +1260,7 @@ mod tests {
         let hook = tmp.path().join("post-checkout");
         fs::write(&hook, "do_something\n").unwrap();
         let block = "# >>> portool >>>\nB\n# <<< portool <<<\n";
-        install_into(&hook, "S", block).unwrap();
+        install_into(tmp.path(), &hook, "S", block).unwrap();
         assert_eq!(
             fs::read_to_string(&hook).unwrap(),
             "# >>> portool >>>\nB\n# <<< portool <<<\ndo_something\n"
@@ -1125,13 +1273,13 @@ mod tests {
         let hook = tmp.path().join("post-checkout");
         std::os::unix::fs::symlink("/nonexistent", &hook).unwrap();
         assert_eq!(
-            install_into(&hook, "S", "B\n").unwrap(),
+            install_into(tmp.path(), &hook, "S", "B\n").unwrap(),
             HookOutcome::SkippedSymlink
         );
         let py = tmp.path().join("post-merge");
         fs::write(&py, "#!/usr/bin/env python3\nprint('hi')\n").unwrap();
         assert!(matches!(
-            install_into(&py, "S", "B\n").unwrap(),
+            install_into(tmp.path(), &py, "S", "B\n").unwrap(),
             HookOutcome::ManualRequired { .. }
         ));
     }
@@ -1141,7 +1289,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let hook = tmp.path().join("post-checkout");
         fs::write(&hook, [0xFF, 0xFE]).unwrap(); // non-UTF-8 -> read_to_string error
-        assert!(deinit_hook(&hook).is_err());
+        assert!(deinit_hook(tmp.path(), &hook).is_err());
     }
 
     #[test]
@@ -1165,14 +1313,14 @@ mod tests {
         // Owned standalone.
         let owned = hooks_dir.join("owned");
         fs::write(&owned, hook_script(Some("/p"))).unwrap();
-        deinit_hook(&owned).unwrap();
+        deinit_hook(tmp.path(), &owned).unwrap();
         assert!(!owned.exists());
 
         // Managed block in a foreign hook.
         let managed = hooks_dir.join("managed");
         let block = hook_append_block(Some("/p"));
         fs::write(&managed, format!("#!/bin/sh\necho hi\n{block}")).unwrap();
-        deinit_hook(&managed).unwrap();
+        deinit_hook(tmp.path(), &managed).unwrap();
         assert_eq!(
             fs::read_to_string(&managed).unwrap(),
             "#!/bin/sh\necho hi\n"
@@ -1185,7 +1333,7 @@ mod tests {
             "#!/bin/sh\necho hi\nif command -v portool >/dev/null 2>&1; then portool sync --quiet || true; fi\n",
         )
         .unwrap();
-        deinit_hook(&legacy).unwrap();
+        deinit_hook(tmp.path(), &legacy).unwrap();
         assert_eq!(fs::read_to_string(&legacy).unwrap(), "#!/bin/sh\necho hi\n");
     }
 
@@ -1196,7 +1344,7 @@ mod tests {
         let script = hook_script(Some("/p"));
         let block = hook_append_block(Some("/p"));
 
-        install_into(&hook_path, &script, &block).unwrap();
+        install_into(tmp.path(), &hook_path, &script, &block).unwrap();
 
         let content = fs::read_to_string(&hook_path).unwrap();
         assert_eq!(content, script);
@@ -1211,7 +1359,7 @@ mod tests {
         let script = hook_script(None);
         let block = hook_append_block(None);
 
-        install_into(&hook_path, &script, &block).unwrap();
+        install_into(tmp.path(), &hook_path, &script, &block).unwrap();
 
         let content = fs::read_to_string(&hook_path).unwrap();
         assert!(
@@ -1232,8 +1380,8 @@ mod tests {
         let script = hook_script(Some("/p"));
         let block = hook_append_block(Some("/p"));
 
-        install_into(&hook_path, &script, &block).unwrap();
-        install_into(&hook_path, &script, &block).unwrap();
+        install_into(tmp.path(), &hook_path, &script, &block).unwrap();
+        install_into(tmp.path(), &hook_path, &script, &block).unwrap();
 
         let content = fs::read_to_string(&hook_path).unwrap();
         assert_eq!(content, script);
@@ -1249,7 +1397,7 @@ mod tests {
         let script = hook_script(Some("/p"));
         let block = hook_append_block(Some("/p"));
 
-        install_into(&hook_path, &script, &block).unwrap();
+        install_into(tmp.path(), &hook_path, &script, &block).unwrap();
 
         let content = fs::read_to_string(&hook_path).unwrap();
         assert!(content.starts_with("#!/bin/sh\n# >>> portool >>>\n"));
@@ -1272,7 +1420,7 @@ mod tests {
         let script = hook_script(Some("/p"));
         let block = hook_append_block(Some("/p"));
 
-        install_into(&hook_path, &script, &block).unwrap();
+        install_into(tmp.path(), &hook_path, &script, &block).unwrap();
 
         // Left byte-identical: portool never injects sh into a python hook.
         assert_eq!(fs::read_to_string(&hook_path).unwrap(), original);
@@ -1290,7 +1438,7 @@ mod tests {
         let script = hook_script(Some("/p"));
         let block = hook_append_block(Some("/p"));
 
-        install_into(&hook_path, &script, &block).unwrap();
+        install_into(tmp.path(), &hook_path, &script, &block).unwrap();
 
         // Left byte-identical: portool can't reason about non-UTF-8 content.
         assert_eq!(fs::read(&hook_path).unwrap(), original);
@@ -1308,7 +1456,7 @@ mod tests {
         let script = hook_script(Some("/p"));
         let block = hook_append_block(Some("/p"));
 
-        install_into(&hook_path, &script, &block).unwrap();
+        install_into(tmp.path(), &hook_path, &script, &block).unwrap();
 
         // The symlink and its target are untouched.
         assert!(fs::symlink_metadata(&hook_path)
@@ -1329,7 +1477,7 @@ mod tests {
         let script = hook_script(Some("/p"));
         let block = hook_append_block(Some("/p"));
 
-        install_into(&hook_path, &script, &block).unwrap();
+        install_into(tmp.path(), &hook_path, &script, &block).unwrap();
 
         // Appended-to, but 0700 is preserved (not widened to 0755).
         assert!(crate::hooks::contains_portool_invocation(
@@ -1352,7 +1500,7 @@ mod tests {
         let script = hook_script(Some("/p"));
         let block = hook_append_block(Some("/p"));
 
-        install_into(&hook_path, &script, &block).unwrap();
+        install_into(tmp.path(), &hook_path, &script, &block).unwrap();
 
         // The unsafe legacy script is now the current safe script.
         assert_eq!(fs::read_to_string(&hook_path).unwrap(), script);
@@ -1369,7 +1517,7 @@ mod tests {
         let script = hook_script(Some("/p"));
         let block = hook_append_block(Some("/p"));
 
-        install_into(&hook_path, &script, &block).unwrap();
+        install_into(tmp.path(), &hook_path, &script, &block).unwrap();
 
         let content = fs::read_to_string(&hook_path).unwrap();
         assert!(
@@ -1395,7 +1543,7 @@ mod tests {
         let script = hook_script(Some("/p"));
         let block = hook_append_block(Some("/p"));
 
-        install_into(&hook_path, &script, &block).unwrap();
+        install_into(tmp.path(), &hook_path, &script, &block).unwrap();
 
         let content = fs::read_to_string(&hook_path).unwrap();
         assert!(content.contains("# remember to run portool sync manually"));
@@ -1411,7 +1559,7 @@ mod tests {
             hooks_dir: hooks_dir.clone(),
         };
 
-        install_managed_hooks(&loc).unwrap();
+        install_managed_hooks(&loc, tmp.path()).unwrap();
 
         let expected = hook_script(portool_bin_path().as_deref());
         assert_eq!(
