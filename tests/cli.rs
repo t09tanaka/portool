@@ -5,13 +5,83 @@
 //! [`Command::env`] (never via `std::env::set_var`, which would leak into
 //! this process and every other test). The real `~/.local/state` is never
 //! touched.
+//!
+//! As of v0.9.0 `portool` is a binary-only crate (no library target), so
+//! every expected value this file checks is computed independently, from
+//! the spec, using local helpers below -- never by importing `portool::…`
+//! and reusing the implementation under test.
 
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;
 use tempfile::TempDir;
+
+/// Marks the start of the managed block `init` appends to a foreign hook
+/// (mirrors `src/hooks.rs::HOOK_BLOCK_BEGIN`, computed independently).
+const HOOK_BLOCK_BEGIN: &str = "# >>> portool >>>";
+/// Marks the end of the managed block `init` appends to a foreign hook
+/// (mirrors `src/hooks.rs::HOOK_BLOCK_END`).
+const HOOK_BLOCK_END: &str = "# <<< portool <<<";
+/// The comment on the second line of portool's owned standalone hook script
+/// (mirrors `src/hooks.rs::HOOK_OWNED_COMMENT`).
+const HOOK_OWNED_COMMENT: &str = "# installed by portool";
+
+/// True when `content` carries any portool hook form (mirrors
+/// `src/hooks.rs::contains_portool_invocation`).
+fn contains_portool_invocation(content: &str) -> bool {
+    content.contains(HOOK_OWNED_COMMENT)
+        || content.contains(HOOK_BLOCK_BEGIN)
+        || content.contains("portool sync")
+}
+
+/// Whether inclusive ranges `a` and `b` share at least one point (mirrors
+/// `src/registry.rs::overlaps`).
+fn overlaps(a: (u16, u16), b: (u16, u16)) -> bool {
+    a.0 <= b.1 && b.0 <= a.1
+}
+
+/// The raw bytes of a path (mirrors `src/identity.rs::path_bytes`).
+fn path_bytes(path: &Path) -> &[u8] {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes()
+}
+
+/// The first 32 lowercase-hex characters of a SHA-256 digest (mirrors
+/// `src/identity.rs::truncated_hex`).
+fn truncated32(digest: &[u8]) -> String {
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex.truncate(32);
+    hex
+}
+
+/// The stable project identifier, computed independently from spec-v0.2 §5
+/// (mirrors `src/identity.rs::project_id`): the first 32 lowercase-hex
+/// characters of `SHA-256("portool-project-id-v1\0" + raw_bytes(common_dir))`.
+fn expected_project_id(common_dir: &Path) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"portool-project-id-v1\0");
+    hasher.update(path_bytes(common_dir));
+    truncated32(&hasher.finalize())
+}
+
+/// The stable worktree identifier, computed independently from spec-v0.2 §5
+/// (mirrors `src/identity.rs::worktree_id`): the first 32 lowercase-hex
+/// characters of `SHA-256("portool-worktree-id-v1\0" + raw_bytes(common_dir)
+/// + "\0" + raw_bytes(worktree_root))`.
+fn expected_worktree_id(common_dir: &Path, worktree_root: &Path) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"portool-worktree-id-v1\0");
+    hasher.update(path_bytes(common_dir));
+    hasher.update(b"\0");
+    hasher.update(path_bytes(worktree_root));
+    truncated32(&hasher.finalize())
+}
 
 /// An isolated `HOME` / `XDG_STATE_HOME` / `XDG_CONFIG_HOME` for one test,
 /// plus a scratch area (`root`) for throwaway git repositories.
@@ -342,8 +412,8 @@ fn sync_without_manifest_allocates_default_block() {
              PORTOOL_WORKTREE_ID={}\n\
              PORT={start}\n",
             worktree_key(&repo),
-            portool::identity::project_id(&common_dir),
-            portool::identity::worktree_id(&common_dir, &worktree_root),
+            expected_project_id(&common_dir),
+            expected_worktree_id(&common_dir, &worktree_root),
         )
     );
 }
@@ -482,7 +552,7 @@ fn linked_worktree_gets_a_different_block() {
     }
     assert_ne!(main_block, wt_block);
     assert!(
-        !portool::registry::overlaps(main_block, wt_block),
+        !overlaps(main_block, wt_block),
         "the two worktrees' blocks must not overlap"
     );
 }
@@ -602,7 +672,7 @@ fn init_installs_hook_and_exclude_and_is_idempotent() {
     let hook_path = repo.join(".git/hooks/post-checkout");
     let hook_content_1 = fs::read_to_string(&hook_path).unwrap();
     assert!(hook_content_1.starts_with("#!/bin/sh\n# installed by portool\n"));
-    assert!(portool::hooks::contains_portool_invocation(&hook_content_1));
+    assert!(contains_portool_invocation(&hook_content_1));
     assert!(
         hook_content_1.contains("|| echo 'portool: sync failed; Git was not blocked' >&2"),
         "must report sync failure without propagating it"
@@ -718,7 +788,7 @@ fn init_with_custom_hookspath_installs_there_not_git_hooks() {
 
     let hook_path = repo.join("ci-hooks/post-checkout");
     let content_1 = fs::read_to_string(&hook_path).unwrap();
-    assert!(portool::hooks::contains_portool_invocation(&content_1));
+    assert!(contains_portool_invocation(&content_1));
     let mode = fs::metadata(&hook_path).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o755, "hook must be executable");
     assert!(
@@ -764,9 +834,9 @@ fn init_with_custom_hookspath_appends_to_existing_hook() {
         content.ends_with("echo existing\n"),
         "the pre-existing hook body must be preserved, got: {content}"
     );
-    assert!(portool::hooks::contains_portool_invocation(&content));
+    assert!(contains_portool_invocation(&content));
     assert_eq!(
-        content.matches(portool::hooks::HOOK_BLOCK_BEGIN).count(),
+        content.matches(HOOK_BLOCK_BEGIN).count(),
         1,
         "re-running init must not duplicate the managed block"
     );
@@ -789,7 +859,7 @@ fn existing_hook_exit_before_managed_block_regression() {
 
     let content = fs::read_to_string(hooks_dir.join("post-checkout")).unwrap();
     let block_pos = content
-        .find(portool::hooks::HOOK_BLOCK_BEGIN)
+        .find(HOOK_BLOCK_BEGIN)
         .expect("managed block must be present");
     let exit_pos = content
         .find("exit 0")
@@ -1062,7 +1132,7 @@ fn init_with_husky_hookspath_installs_user_managed_hook_and_chains() {
     );
 
     let user_hook = fs::read_to_string(repo.join(".husky/post-checkout")).unwrap();
-    assert!(portool::hooks::contains_portool_invocation(&user_hook));
+    assert!(contains_portool_invocation(&user_hook));
     assert_eq!(
         fs::read_to_string(repo.join(".husky/_/post-checkout")).unwrap(),
         husky_shim,
@@ -2813,8 +2883,8 @@ fn existing_hook_exit_before_managed_block_is_not_reported_healthy() {
     fs::create_dir_all(&hooks).unwrap();
     let legacy_layout = format!(
         "#!/bin/sh\nexit 0\n{}\nPORTOOL_BIN=portool\nif command -v \"$PORTOOL_BIN\" >/dev/null 2>&1; then \"$PORTOOL_BIN\" sync --quiet || true; fi\n{}\n",
-        portool::hooks::HOOK_BLOCK_BEGIN,
-        portool::hooks::HOOK_BLOCK_END,
+        HOOK_BLOCK_BEGIN,
+        HOOK_BLOCK_END,
     );
     for name in ["post-checkout", "post-merge"] {
         fs::write(hooks.join(name), &legacy_layout).unwrap();
@@ -2847,10 +2917,7 @@ fn doctor_reports_a_malformed_managed_block() {
     fs::create_dir_all(&hooks).unwrap();
     let malformed = format!(
         "#!/bin/sh\n{}\nportool sync --quiet || true\n{}\n{}\nother\n{}\n",
-        portool::hooks::HOOK_BLOCK_BEGIN,
-        portool::hooks::HOOK_BLOCK_END,
-        portool::hooks::HOOK_BLOCK_BEGIN,
-        portool::hooks::HOOK_BLOCK_END,
+        HOOK_BLOCK_BEGIN, HOOK_BLOCK_END, HOOK_BLOCK_BEGIN, HOOK_BLOCK_END,
     );
     fs::write(hooks.join("post-checkout"), &malformed).unwrap();
     fs::set_permissions(
