@@ -2100,6 +2100,44 @@ fn check_reports_health_and_corruption() {
     );
 }
 
+/// 指摘13: a backup refresh failure only warns (`store::save`), so
+/// `registry.json.bak` can silently go stale while `registry.json` itself
+/// stays healthy. `check` must surface that with a stderr warning -- but
+/// staleness heals on the next save, so exit code stays 0 (non-zero exits
+/// are reserved for real corruption).
+#[test]
+fn check_warns_when_backup_is_stale() {
+    let env = TestEnv::new();
+    let repo = env.path("repo");
+    init_repo(&repo);
+    assert!(env.run(&repo, &["sync"]).status.success());
+
+    let bak_path = env.state.join("portool").join("registry.json.bak");
+    let original_bak = fs::read(&bak_path).unwrap();
+    fs::write(&bak_path, b"stale backup contents").unwrap();
+
+    let out = env.run(&repo, &["check"]);
+    assert!(
+        out.status.success(),
+        "stale backup must still be exit 0 -- it heals on the next save"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("backup"),
+        "stderr must warn about the stale backup: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Restore the backup to match; the warning must disappear.
+    fs::write(&bak_path, &original_bak).unwrap();
+    let out = env.run(&repo, &["check"]);
+    assert!(out.status.success());
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("backup"),
+        "no warning once the backup matches again: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// `portool release` removes the worktree's entry and `.env.portool`.
 #[test]
 fn release_frees_the_block_and_removes_env_file() {

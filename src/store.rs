@@ -203,6 +203,22 @@ pub fn backup_path(path: &Path) -> PathBuf {
     path.with_file_name(format!("{file_name}.bak"))
 }
 
+/// True when the ledger exists but its `.bak` sibling is missing or does
+/// not match byte-for-byte -- i.e. the last backup refresh failed and a
+/// `doctor --repair` would restore stale state. Heals on the next save.
+pub fn backup_is_stale(path: &Path) -> std::io::Result<bool> {
+    let main = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    match std::fs::read(backup_path(path)) {
+        Ok(bak) => Ok(bak != main),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(e) => Err(e),
+    }
+}
+
 fn corrupt_sibling_path(path: &Path) -> PathBuf {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -491,6 +507,37 @@ mod tests {
             vec!["file.txt".to_string()],
             "no temp residue"
         );
+    }
+
+    #[test]
+    fn backup_is_stale_false_when_main_ledger_is_missing() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("registry.json");
+
+        assert!(!backup_is_stale(&path).unwrap());
+    }
+
+    #[test]
+    fn backup_is_stale_true_when_bak_is_missing() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("registry.json");
+        fs::write(&path, b"{}").unwrap();
+
+        assert!(backup_is_stale(&path).unwrap());
+    }
+
+    #[test]
+    fn backup_is_stale_true_when_bak_differs_and_false_once_fresh() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("registry.json");
+        save(&path, &sample_registry()).unwrap();
+        assert!(
+            !backup_is_stale(&path).unwrap(),
+            "a freshly saved backup must not be stale"
+        );
+
+        fs::write(backup_path(&path), b"stale contents").unwrap();
+        assert!(backup_is_stale(&path).unwrap());
     }
 
     #[test]
