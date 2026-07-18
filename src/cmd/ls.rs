@@ -59,7 +59,31 @@ struct JsonReservation {
 
 /// Runs `portool ls`. Outside a git repository, `--all` is required (spec
 /// frozen decision 12); without it, this is a general error (exit 1).
+///
+/// `--json` is a machine interface: stdout must be JSON on every path,
+/// success or failure (external review P2 #14) -- so this wraps
+/// [`run_inner`] and, on any `Err` when `json` is set, emits the versioned
+/// error envelope before propagating the error (the exit code still signals
+/// failure).
 pub fn run(json: bool, all: bool) -> Result<()> {
+    let result = run_inner(json, all);
+    if json {
+        if let Err(err) = &result {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "format_version": FORMAT_VERSION,
+                    "ok": false,
+                    "error": err.to_string(),
+                }))
+                .expect("error envelope always serializes")
+            );
+        }
+    }
+    result
+}
+
+fn run_inner(json: bool, all: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let ctx_result = GitCtx::discover(&cwd);
 
@@ -100,17 +124,6 @@ pub fn run(json: bool, all: bool) -> Result<()> {
                 }
                 store::LedgerLoad::Missing | store::LedgerLoad::Loaded(_) => unreachable!(),
             };
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "format_version": FORMAT_VERSION,
-                        "ok": false,
-                        "error": message,
-                    }))
-                    .expect("error envelope always serializes")
-                );
-            }
             return Err(Error::General(message));
         }
     };

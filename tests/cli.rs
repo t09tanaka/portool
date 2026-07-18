@@ -1316,6 +1316,38 @@ fn ls_json_corrupt_ledger_is_an_error_envelope() {
     assert!(v["error"].as_str().unwrap().contains("corrupt"));
 }
 
+/// P2 (external review indication 14): `--json` is a machine interface, so
+/// stdout must be the versioned error envelope on *every* failure path, not
+/// just a corrupt ledger. Covers a broken config and a missing git repo
+/// (both of which used to `?`-out before any JSON was ever printed).
+#[test]
+fn ls_json_wraps_config_and_git_errors() {
+    let env = TestEnv::new();
+    let repo = env.path("app");
+    init_repo(&repo);
+    env.write_config("range = \"oops\"\n");
+
+    let out = env.run(&repo, &["ls", "--json"]);
+    assert!(!out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("stdout was not JSON: {e}; stdout: {:?}", out.stdout));
+    assert_eq!(v["format_version"], 1);
+    assert_eq!(v["ok"], false);
+    assert!(v["error"].as_str().is_some());
+
+    let env2 = TestEnv::new();
+    let dir = env2.path("not-a-repo");
+    fs::create_dir_all(&dir).unwrap();
+
+    let out2 = env2.run(&dir, &["ls", "--json"]);
+    assert!(!out2.status.success());
+    let v2: serde_json::Value = serde_json::from_slice(&out2.stdout)
+        .unwrap_or_else(|e| panic!("stdout was not JSON: {e}; stdout: {:?}", out2.stdout));
+    assert_eq!(v2["format_version"], 1);
+    assert_eq!(v2["ok"], false);
+    assert!(v2["error"].as_str().is_some());
+}
+
 // --- 10. deleted worktree is reclaimed by prune; --dry-run doesn't touch it -
 
 #[test]
