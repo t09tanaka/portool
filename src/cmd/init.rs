@@ -264,7 +264,7 @@ fn install_hook(ctx: &GitCtx) -> Result<HookOutcome> {
                 .unwrap_or(&hook_file);
             eprintln!(
                 "portool: Husky detected; installed {} (a tracked file -- commit it to share the hook)",
-                display.display()
+                crate::display::path(display)
             );
             eprintln!(
                 "note: Husky hooks can't fire on a brand-new worktree's first checkout \
@@ -279,10 +279,11 @@ fn install_hook(ctx: &GitCtx) -> Result<HookOutcome> {
             resolved,
         } => {
             eprintln!(
-                "warning: core.hooksPath is set to '{configured}' but {} is not an existing \
+                "warning: core.hooksPath is set to '{}' but {} is not an existing \
                  directory; git would ignore a hook installed at <git-common-dir>/hooks, so \
                  nothing was installed",
-                resolved.display()
+                crate::display::text(configured),
+                crate::display::path(resolved)
             );
             eprintln!(
                 "hint: once that directory exists, re-run 'portool init --hook-only', or \
@@ -299,10 +300,11 @@ fn install_hook(ctx: &GitCtx) -> Result<HookOutcome> {
             scope,
         } => {
             eprintln!(
-                "warning: core.hooksPath '{configured}' resolves outside this repository \
+                "warning: core.hooksPath '{}' resolves outside this repository \
                  ({}, {scope} scope); refusing to auto-install portool's hook there -- it \
                  could run on every repository's checkout",
-                resolved.display()
+                crate::display::text(configured),
+                crate::display::path(resolved)
             );
             eprintln!(
                 "hint: add this line to a per-repo post-checkout (and post-merge) hook instead:"
@@ -360,7 +362,10 @@ fn report_hook_removal(results: &[(&'static str, HookOutcome)]) {
                 eprintln!("warning: {name} hook is a symlink; not modified");
             }
             HookOutcome::ManualRequired { reason } => {
-                eprintln!("warning: {name} hook needs manual attention: {reason}");
+                eprintln!(
+                    "warning: {name} hook needs manual attention: {}",
+                    crate::display::text(reason)
+                );
             }
             HookOutcome::Removed | HookOutcome::NotFound => {}
             // `deinit_hook` never produces these -- they're install-only.
@@ -431,7 +436,7 @@ pub fn deinit(keep_allocations: bool) -> Result<()> {
             "portool: note: {} still lists '.env.portool' (added by an older portool \
              or by hand); remove it yourself if unwanted -- portool no longer edits \
              tracked files",
-            gitignore.display()
+            crate::display::path(&gitignore)
         );
     }
     println!("portool: deinitialized this project");
@@ -479,7 +484,7 @@ fn deinit_hook(hook_path: &Path) -> Result<HookOutcome> {
                 "warning: {} has a malformed portool managed block (mismatched, duplicate, \
                  or reversed '# >>> portool >>>' / '# <<< portool <<<' markers); leaving it \
                  untouched -- repair or remove the markers by hand",
-                hook_path.display()
+                crate::display::path(hook_path)
             );
             return Ok(HookOutcome::ManualRequired {
                 reason: format!(
@@ -607,7 +612,7 @@ fn install_into(hook_path: &Path, script: &str, block: &str) -> Result<HookOutco
         if meta.file_type().is_symlink() {
             eprintln!(
                 "warning: {} is a symlink; not modifying it",
-                hook_path.display()
+                crate::display::path(hook_path)
             );
             return Ok(HookOutcome::SkippedSymlink);
         }
@@ -645,7 +650,7 @@ fn install_into(hook_path: &Path, script: &str, block: &str) -> Result<HookOutco
                          duplicate, or reversed '# >>> portool >>>' / '# <<< portool <<<' \
                          markers); leaving it untouched -- repair or remove the markers by \
                          hand, then re-run 'portool init --hook-only'",
-                        hook_path.display()
+                        crate::display::path(hook_path)
                     );
                     return Ok(HookOutcome::ManualRequired {
                         reason: format!(
@@ -686,7 +691,7 @@ fn install_into(hook_path: &Path, script: &str, block: &str) -> Result<HookOutco
             } else {
                 eprintln!(
                     "warning: {} has a non-shell interpreter; not appending portool's shell block",
-                    hook_path.display()
+                    crate::display::path(hook_path)
                 );
                 eprintln!(
                     "hint: add this line to the hook your interpreter runs, if you want portool:"
@@ -711,7 +716,7 @@ fn install_into(hook_path: &Path, script: &str, block: &str) -> Result<HookOutco
             eprintln!(
                 "warning: {} exists but is not readable as UTF-8; leaving it untouched \
                  (portool's hook was NOT installed)",
-                hook_path.display()
+                crate::display::path(hook_path)
             );
             Ok(HookOutcome::ManualRequired {
                 reason: format!("{} is not readable as UTF-8", hook_path.display()),

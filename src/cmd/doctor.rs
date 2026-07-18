@@ -86,7 +86,7 @@ pub fn run(repair: bool, abandon_other_projects: bool) -> Result<()> {
             let moved_to = store::move_aside(&registry_path)?;
             eprintln!(
                 "portool: doctor: abandoned the version-{found} ledger (moved aside to {})",
-                moved_to.display()
+                crate::display::path(&moved_to)
             );
             Registry::empty(config.range)
         }
@@ -114,7 +114,7 @@ pub fn run(repair: bool, abandon_other_projects: bool) -> Result<()> {
             None => {
                 println!(
                     "doctor: warning: skipping worktree with non-UTF-8 path: {}",
-                    wt.to_string_lossy()
+                    crate::display::path(wt)
                 );
                 continue;
             }
@@ -138,7 +138,7 @@ pub fn run(repair: bool, abandon_other_projects: bool) -> Result<()> {
                 println!(
                     "doctor: warning: {}/.env.portool identifies a different project/worktree \
                      (copied from elsewhere?); not importing its block",
-                    wt_key
+                    crate::display::text(&wt_key)
                 );
                 continue;
             }
@@ -147,7 +147,7 @@ pub fn run(repair: bool, abandon_other_projects: bool) -> Result<()> {
             eprintln!(
                 "portool: doctor: {} records block {}-{}, which {reason}; skipping \
                  re-import (fix its .env.portool or run reallocate)",
-                wt.display(),
+                crate::display::path(wt),
                 block.0,
                 block.1
             );
@@ -157,7 +157,7 @@ pub fn run(repair: bool, abandon_other_projects: bool) -> Result<()> {
             eprintln!(
                 "portool: doctor: {} records block {}-{}, which overlaps an existing \
                  allocation; skipping re-import (fix its .env.portool or run reallocate)",
-                wt.display(),
+                crate::display::path(wt),
                 block.0,
                 block.1
             );
@@ -191,7 +191,7 @@ pub fn run(repair: bool, abandon_other_projects: bool) -> Result<()> {
             "portool: doctor: re-imported {}-{} for {}",
             block.0,
             block.1,
-            wt.display()
+            crate::display::path(wt)
         );
     }
 
@@ -214,9 +214,11 @@ pub fn run(repair: bool, abandon_other_projects: bool) -> Result<()> {
             if !ports::block_free(entry.block) {
                 in_use += 1;
                 println!(
-                    "portool: doctor: block {}-{} ({path}) has ports in use \
+                    "portool: doctor: block {}-{} ({}) has ports in use \
                      -- may be this worktree's own processes",
-                    entry.block.0, entry.block.1
+                    entry.block.0,
+                    entry.block.1,
+                    crate::display::text(path)
                 );
             }
         }
@@ -264,7 +266,7 @@ fn report_hook_health(ctx: &GitCtx) -> usize {
         {
             println!(
                 "portool: doctor: hook {name}: not executable (chmod +x {})",
-                path.display()
+                crate::display::path(&path)
             );
             findings += 1;
             continue;
@@ -293,9 +295,10 @@ fn report_hook_health(ctx: &GitCtx) -> usize {
         match embedded_bin_path(&content) {
             Some(bin) if !Path::new(&bin).exists() => {
                 println!(
-                    "portool: doctor: hook {name}: embedded portool path {bin} no longer \
+                    "portool: doctor: hook {name}: embedded portool path {} no longer \
                      exists; it falls back to PATH lookup, which GUI git clients may not \
-                     have (re-run 'portool init')"
+                     have (re-run 'portool init')",
+                    crate::display::text(&bin)
                 );
                 findings += 1;
             }
@@ -353,8 +356,8 @@ fn repair_corrupt(
         eprintln!(
             "portool: doctor: {} is corrupt ({reason}); moved aside to {} and starting \
              empty (--abandon-other-projects)",
-            registry_path.display(),
-            moved_to.display()
+            crate::display::path(registry_path),
+            crate::display::path(&moved_to)
         );
         return Ok(Registry::empty(config.range));
     }
@@ -372,8 +375,8 @@ fn repair_corrupt(
             eprintln!(
                 "portool: doctor: {} was corrupt ({reason}); copied aside to {} and \
                  restored the last good backup (all projects kept)",
-                registry_path.display(),
-                copied_to.display()
+                crate::display::path(registry_path),
+                crate::display::path(&copied_to)
             );
             Ok(backup)
         }

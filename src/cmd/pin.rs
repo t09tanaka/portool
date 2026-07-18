@@ -48,7 +48,7 @@ fn set_pinned(pinned: bool, label: Option<String>) -> Result<()> {
     println!(
         "portool: {} {}",
         if pinned { "pinned" } else { "unpinned" },
-        worktree_key
+        crate::display::text(&worktree_key)
     );
     Ok(())
 }

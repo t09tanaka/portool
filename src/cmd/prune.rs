@@ -99,12 +99,21 @@ fn prune_all(registry: &mut Registry, dry_run: bool) -> bool {
             let verb = if dry_run { "would prune" } else { "pruned" };
             for path in &reclaimable {
                 let block = project.worktrees[path].block;
-                println!("{verb} {path} (block {}-{})", block.0, block.1);
+                println!(
+                    "{verb} {} (block {}-{})",
+                    crate::display::text(path),
+                    block.0,
+                    block.1
+                );
                 project.worktrees.remove(path);
                 changed = true;
             }
             if project.worktrees.is_empty() {
-                println!("{verb} project {} ({key})", project.name);
+                println!(
+                    "{verb} project {} ({})",
+                    crate::display::text(&project.name),
+                    crate::display::text(key)
+                );
                 projects_to_remove.push(key.clone());
                 changed = true;
             }
@@ -119,8 +128,9 @@ fn prune_all(registry: &mut Registry, dry_run: bool) -> bool {
                 // misreading could free blocks that live worktrees' env
                 // files still hand out. Keep every entry and move on.
                 eprintln!(
-                    "portool: prune: skipping project {key}: listing worktrees failed \
-                     ({err}); its entries were kept"
+                    "portool: prune: skipping project {}: listing worktrees failed \
+                     ({err}); its entries were kept",
+                    crate::display::text(key)
                 );
                 continue;
             }
@@ -148,7 +158,12 @@ fn reclaim_project_worktrees(project: &mut ProjectEntry, live: &[PathBuf], dry_r
 
     let verb = if dry_run { "would prune" } else { "pruned" };
     for (path, block) in &reclaimed {
-        println!("{verb} {path} (block {}-{})", block.0, block.1);
+        println!(
+            "{verb} {} (block {}-{})",
+            crate::display::text(path),
+            block.0,
+            block.1
+        );
     }
     !reclaimed.is_empty()
 }

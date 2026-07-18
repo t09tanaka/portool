@@ -40,7 +40,7 @@ pub fn run() -> Result<()> {
             "portool: warning: {} is out of date (a backup refresh failed?); \
              it will be refreshed by the next save -- 'doctor --repair' would \
              currently restore stale state",
-            store::backup_path(&registry_path).display()
+            crate::display::path(&store::backup_path(&registry_path))
         );
     }
 
