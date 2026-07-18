@@ -5,6 +5,94 @@ All notable changes to portool are documented here. The format is based on
 [Semantic Versioning](https://semver.org/) (pre-1.0: a breaking change bumps
 the minor version).
 
+## [0.9.0] - 2026-07-18
+
+The 4th-round external review items: identity IDs widen to 128 bits, the
+crate drops its library target, hook-managed-block handling becomes fully
+fail-closed against destructive auto-repair, and several reporting/reclaim
+gaps close. **No ledger schema change** (still v3).
+
+### Breaking
+
+- **`PORTOOL_PROJECT_ID` / `PORTOOL_WORKTREE_ID` widen from 16 to 32 hex
+  characters** (64→128-bit truncated SHA-256). Existing worktrees pick up
+  new, longer IDs on their next `sync`; anything derived from the old ID —
+  Docker Compose project/container/network/volume names, per-worktree
+  caches — changes accordingly. Migration note: `doctor` will not re-import
+  a pre-0.9 `.env.portool` (its 16-hex IDs no longer match); run `portool
+  sync` in each worktree after upgrading to rewrite the env file.
+- **`unhook`/`deinit` exit non-zero when a hook file exists but cannot be
+  read**, instead of silently succeeding as if there were nothing to
+  remove.
+- **The crate no longer ships a library target.** `portool` is binary-only;
+  the CLI (documented commands, exit codes, file formats) is the only
+  interface, so there is no Rust API to depend on or that follows semver.
+- **`core.hooksPath` resolving outside the repository is refused in *any*
+  config scope** (`local`, `worktree`, `global`, `system`, or a
+  command-line `-c`), not just an absolute path set in shared
+  `global`/`system` scope. A relative `../` escape or a symlink into
+  another directory is now caught in every scope too.
+- **`exec --strict` and `--reallocate-on-conflict` are mutually
+  exclusive** — passing both is now a CLI usage error (exit 64) instead of
+  one silently winning.
+- **`unpin` now clears the pin's label**, so a later label-less `pin`
+  doesn't resurrect a stale name.
+- **`init` exits non-zero when the post-checkout hook could not actually be
+  installed** — a symlinked hook, a non-shell interpreter, or
+  unreadable/malformed existing content — even though the `info/exclude`
+  update and initial `sync` still ran.
+- **A malformed managed hook block is never auto-repaired.** Previously a
+  truncated block (a missing, duplicated, or reversed `# >>> portool >>>` /
+  `# <<< portool <<<` marker) was treated as extending to end-of-file and
+  owned wholesale, which could delete a user's own code appended after it.
+  `init`/`unhook`/`deinit` now leave a malformed block completely untouched
+  and demand manual repair.
+
+### Fixed
+
+- **The managed hook block is now inserted right after the shebang**
+  instead of appended at end-of-file, so a pre-existing top-level
+  `exit`/`exec` can no longer make it unreachable. `doctor` warns
+  (advisory) about an unreachable or malformed managed block.
+- **`prune --all` honors pins even when the repository directory is gone**,
+  so a pinned worktree in a deleted repo clone is no longer reclaimed out
+  from under its pin.
+- **Internal git spawns scrub inherited `GIT_*` environment variables**, so
+  running portool from inside another git operation can't leak the wrong
+  repo context into its own git calls; git command failures now surface
+  the underlying stderr instead of a generic message.
+- **`doctor` skips worktrees with a non-UTF-8 path** instead of risking a
+  lossy, potentially colliding ledger key, and verifies a worktree's
+  `.env.portool` `PORTOOL_PROJECT_ID` / `PORTOOL_WORKTREE_ID` match before
+  importing it.
+- **`deinit` removes `.env.portool` from the union of live worktrees and
+  ledger-recorded paths**, so it still cleans up every worktree even when
+  the ledger is missing, was abandoned, or is already empty.
+- **`check` warns when `registry.json.bak` looks stale**, so a silently
+  failed backup refresh doesn't go unnoticed until a repair is actually
+  needed; the backup refresh itself remains best-effort.
+- **A config whose `block_align` exceeds the pool's range capacity is
+  rejected at load** instead of only surfacing later as `PoolExhausted` on
+  every `sync`.
+- **Corrupt-ledger aside files are uniquely named**
+  (`registry.json.corrupt-<nanos>-<pid>`), so two repairs within the same
+  wall-clock second no longer collide on one filename.
+- **Human-readable output is sanitized across every command**, not just
+  `ls` and `sync` — control characters and ANSI escapes in worktree paths,
+  branch names, and labels can no longer inject themselves into terminal
+  output. Overlap validation is also sort-based (O(n log n)) instead of a
+  pairwise scan.
+
+### Added
+
+- **Pin labels show in human `ls` output** (a new trailing `LABEL`
+  column).
+- **`ls --json` emits the versioned error envelope for every failure
+  path**, not just some of them.
+- **MSRV is declared** (`rust-version = "1.85"`), with a matching CI job so
+  a build against an older toolchain fails predictably instead of hitting
+  an unexplained compile error.
+
 ## [0.8.0] - 2026-07-17
 
 The 3rd-round external review items: `exec`'s bind check stops being a

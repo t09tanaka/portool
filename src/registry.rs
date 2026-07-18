@@ -140,7 +140,7 @@ impl Registry {
         // Owner-grouped blocks: an entry's own `block` and `pending_block`
         // belong to the same owner and are allowed to overlap each other (a
         // grow-in-place move); every other pair must be disjoint.
-        let grouped = self.owner_grouped_blocks();
+        let mut grouped = self.owner_grouped_blocks();
         for &(_, (start, end)) in &grouped {
             if start > end {
                 return Err(Error::General(format!(
@@ -153,15 +153,29 @@ impl Registry {
                 ));
             }
         }
-        for (i, &(owner_a, a)) in grouped.iter().enumerate() {
-            for &(owner_b, b) in &grouped[i + 1..] {
-                if owner_a != owner_b && overlaps(a, b) {
-                    return Err(Error::General(format!(
-                        "invalid registry: blocks {}-{} and {}-{} overlap",
-                        a.0, a.1, b.0, b.1
-                    )));
+        // Sort by start, then sweep with a single running (owner, max-end)
+        // accumulator: within one connected run of overlapping intervals,
+        // any block whose start falls inside the accumulator's span must
+        // share its owner, or the two genuinely overlap and conflict.
+        // O(n log n) instead of the previous O(n^2) all-pairs comparison.
+        grouped.sort_by_key(|&(_, (start, _))| start);
+        let mut active: Option<(usize, (u16, u16))> = None;
+        for &(owner, block) in &grouped {
+            if let Some((active_owner, active_block)) = active {
+                if block.0 <= active_block.1 {
+                    if owner != active_owner {
+                        return Err(Error::General(format!(
+                            "invalid registry: blocks {}-{} and {}-{} overlap",
+                            active_block.0, active_block.1, block.0, block.1
+                        )));
+                    }
+                    if block.1 > active_block.1 {
+                        active = Some((active_owner, block));
+                    }
+                    continue;
                 }
             }
+            active = Some((owner, block));
         }
 
         Ok(())
@@ -622,6 +636,36 @@ mod tests {
             pinned: true,
         });
         assert!(reg.validate().is_err());
+    }
+
+    #[test]
+    fn overlap_validation_detects_cross_owner_overlap_after_sort() {
+        let mut reg = Registry::empty((3000, 9999));
+        // Pushed out of start order on purpose: owner0's block starts after
+        // owner1's and owner2's, so the sweep only finds the true overlap
+        // (owner2 vs owner0) if it sorts by start first -- comparing in raw
+        // push order would either miss it or misfire on the disjoint
+        // owner0/owner1 pair.
+        reg.reservations.push(Reservation {
+            block: (3010, 3020), // owner0: overlaps owner2, disjoint from owner1
+            label: None,
+            pinned: false,
+        });
+        reg.reservations.push(Reservation {
+            block: (3000, 3005), // owner1: disjoint from both other blocks
+            label: None,
+            pinned: false,
+        });
+        reg.reservations.push(Reservation {
+            block: (3008, 3012), // owner2: overlaps owner0, disjoint from owner1
+            label: None,
+            pinned: false,
+        });
+        assert!(reg.validate().is_err());
+
+        // Drop the overlapping block: same three-owner shape, no overlap now.
+        reg.reservations.pop();
+        assert!(reg.validate().is_ok());
     }
 
     #[test]

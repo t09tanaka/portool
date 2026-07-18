@@ -90,6 +90,19 @@ impl Config {
                 "invalid config: block_align must not be zero".into(),
             ));
         }
+        // A block_align wider than the whole pool can never be satisfied --
+        // every sync would eventually fail with PoolExhausted no matter how
+        // empty the pool is. Catch that at config-load time instead (P3
+        // external review). u32 arithmetic avoids overflow when range spans
+        // the full u16 width.
+        let span = (range.1 as u32) - (range.0 as u32) + 1;
+        if (block_align as u32) > span {
+            return Err(Error::General(format!(
+                "invalid config: block_align = {block_align} exceeds the port range capacity \
+                 {span} ({}-{}); no block could ever be allocated",
+                range.0, range.1
+            )));
+        }
 
         Ok(Config { range, block_align })
     }
@@ -175,7 +188,10 @@ mod tests {
 
     #[test]
     fn equal_range_bounds_are_allowed() {
-        let cfg = Config::from_toml_str("range = [3000, 3000]\n").unwrap();
+        // A single-port pool only fits a block_align = 1 block; the default
+        // block_align (5) would now be rejected by
+        // `config_rejects_block_align_larger_than_range` below.
+        let cfg = Config::from_toml_str("range = [3000, 3000]\nblock_align = 1\n").unwrap();
         assert_eq!(cfg.range, (3000, 3000));
     }
 
@@ -211,5 +227,19 @@ mod tests {
     fn range_including_port_zero_is_error() {
         let err = Config::from_toml_str("range = [0, 9999]\n").unwrap_err();
         assert_eq!(err.exit_code(), 1);
+    }
+
+    #[test]
+    fn config_rejects_block_align_larger_than_range() {
+        let err = Config::from_toml_str("range = [3000, 3001]\nblock_align = 5\n").unwrap_err();
+        assert!(err.to_string().contains("block_align"), "{err}");
+    }
+
+    #[test]
+    fn config_allows_block_align_equal_to_range_span() {
+        // The boundary case: block_align exactly fills the pool.
+        let cfg = Config::from_toml_str("range = [3000, 3004]\nblock_align = 5\n").unwrap();
+        assert_eq!(cfg.range, (3000, 3004));
+        assert_eq!(cfg.block_align, 5);
     }
 }

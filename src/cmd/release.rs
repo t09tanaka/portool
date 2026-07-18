@@ -33,7 +33,7 @@ pub fn run() -> Result<()> {
             remove_env_file(&ctx)?;
             println!(
                 "portool: {} had no allocation to release",
-                ctx.worktree_root.display()
+                crate::display::path(&ctx.worktree_root)
             );
             return Ok(());
         }
@@ -55,11 +55,14 @@ pub fn run() -> Result<()> {
             .worktrees
             .remove(&worktree_key);
         store::save(&registry_path, &registry)?;
-        println!("portool: released {}", ctx.worktree_root.display());
+        println!(
+            "portool: released {}",
+            crate::display::path(&ctx.worktree_root)
+        );
     } else {
         println!(
             "portool: {} had no allocation to release",
-            ctx.worktree_root.display()
+            crate::display::path(&ctx.worktree_root)
         );
     }
     Ok(())

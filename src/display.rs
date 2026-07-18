@@ -5,6 +5,7 @@
 //! layout uses display [`width`] instead of byte length. JSON output is
 //! untouched: serde escaping already makes it safe.
 
+use std::path::Path;
 use unicode_width::UnicodeWidthStr;
 
 /// Returns `s` safe for a terminal: `\n`, `\r`, `\t` become visible
@@ -22,6 +23,19 @@ pub fn sanitize(s: &str) -> String {
         }
     }
     out
+}
+
+/// A filesystem path, sanitized for terminal display. Worktree paths
+/// originate outside portool and may legally contain control characters.
+pub fn path(p: &Path) -> String {
+    sanitize(&p.display().to_string())
+}
+
+/// A human-facing label or name (branch, project, key, etc.), sanitized for
+/// terminal display. An alias for [`sanitize`] that names the intent at the
+/// call site.
+pub fn text(s: &str) -> String {
+    sanitize(s)
 }
 
 /// The terminal display width of `s` (wide CJK and emoji count as 2).
@@ -45,6 +59,17 @@ mod tests {
     #[test]
     fn sanitize_strips_ansi_escapes() {
         assert_eq!(sanitize("a\u{1b}[31mred"), "a\u{FFFD}[31mred");
+    }
+
+    #[test]
+    fn path_helper_sanitizes_control_chars() {
+        let p = std::path::PathBuf::from("/repo/worktrees/evil\u{1b}[31mbranch");
+        assert_eq!(path(&p), "/repo/worktrees/evil\u{FFFD}[31mbranch");
+    }
+
+    #[test]
+    fn text_helper_is_a_sanitize_alias() {
+        assert_eq!(text("a\u{1b}[31mred"), sanitize("a\u{1b}[31mred"));
     }
 
     #[test]

@@ -35,14 +35,20 @@ fn set_pinned(pinned: bool, label: Option<String>) -> Result<()> {
         .ok_or_else(|| no_allocation(&worktree_key))?;
 
     entry.pinned = pinned;
-    if let Some(label) = label {
-        entry.label = Some(label);
+    if pinned {
+        if let Some(label) = label {
+            entry.label = Some(label);
+        }
+    } else {
+        // A label's lifetime is the pin's lifetime: unpin clears it so a
+        // later label-less pin does not resurrect a stale name.
+        entry.label = None;
     }
     store::save(&registry_path, &registry)?;
     println!(
         "portool: {} {}",
         if pinned { "pinned" } else { "unpinned" },
-        worktree_key
+        crate::display::text(&worktree_key)
     );
     Ok(())
 }

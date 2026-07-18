@@ -16,7 +16,8 @@ pub fn run() -> Result<()> {
     Config::load()?;
 
     // Read-only: `load` never mutates anything.
-    match store::load(&paths::registry_path()?) {
+    let registry_path = paths::registry_path()?;
+    match store::load(&registry_path) {
         store::LedgerLoad::Missing | store::LedgerLoad::Loaded(_) => {}
         store::LedgerLoad::Corrupt { reason } => {
             return Err(Error::General(format!("registry is corrupt: {reason}")));
@@ -27,6 +28,20 @@ pub fn run() -> Result<()> {
         store::LedgerLoad::ReadError { reason } => {
             return Err(Error::General(format!("registry is unreadable: {reason}")));
         }
+    }
+
+    // 指摘13: a failed backup refresh only warns at save time, so `.bak` can
+    // silently go stale even though `registry.json` itself is healthy.
+    // Surfaced here as a warning, not a failure: staleness heals on the
+    // next save, and check's non-zero exits are reserved for real
+    // corruption.
+    if store::backup_is_stale(&registry_path).unwrap_or(false) {
+        eprintln!(
+            "portool: warning: {} is out of date (a backup refresh failed?); \
+             it will be refreshed by the next save -- 'doctor --repair' would \
+             currently restore stale state",
+            crate::display::path(&store::backup_path(&registry_path))
+        );
     }
 
     println!("portool: config and ledger are OK");

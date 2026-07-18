@@ -1150,3 +1150,30 @@ fn exec_env_file_overrides_beats_the_parent_environment() {
         "without the flag, the parent must still win"
     );
 }
+
+// --- 29. --strict and --reallocate-on-conflict are mutually exclusive --------
+
+/// Task 8: `--strict` and `--reallocate-on-conflict` cannot be used together.
+/// This is a clap usage error that exits 64 (EX_USAGE).
+#[test]
+fn strict_conflicts_with_reallocate_on_conflict() {
+    let env = TestEnv::new();
+    let repo = env.path("repo");
+    init_repo(&repo);
+
+    let output = env.run(
+        &repo,
+        &["exec", "--strict", "--reallocate-on-conflict", "--", "true"],
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(64),
+        "using --strict with --reallocate-on-conflict must be a usage error (exit 64)"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("conflict") || stderr.contains("cannot"),
+        "stderr should mention a conflict, was: {stderr}"
+    );
+}

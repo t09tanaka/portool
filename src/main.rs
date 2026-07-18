@@ -1,8 +1,34 @@
-//! `portool` CLI entry point: `clap` parsing, dispatch to [`portool::cmd`],
-//! and exit-code mapping only.
+//! portool: a passive global port ledger for git worktrees.
+//!
+//! **The only stable interface is the `portool` CLI.** As of v0.9.0 this
+//! crate is binary-only -- there is no library target, so every module
+//! below is a private implementation detail, unreachable from outside this
+//! binary and exempt from semver. Depend on the CLI's documented commands,
+//! exit codes, and file formats instead.
+//!
+//! This file itself is just `clap` parsing, dispatch to [`cmd`], and
+//! exit-code mapping.
+
+mod alloc;
+mod cmd;
+mod config;
+mod display;
+mod envfile;
+mod envread;
+mod error;
+mod fault;
+mod gc;
+mod gitctx;
+mod hooks;
+mod identity;
+mod lock;
+mod manifest;
+mod paths;
+mod ports;
+mod registry;
+mod store;
 
 use clap::{Parser, Subcommand};
-use portool::cmd;
 use std::process::exit;
 
 #[derive(Parser)]
@@ -55,7 +81,7 @@ enum Command {
         check_ports: bool,
         /// Fail (exit 1) if the allocated block's ports are already in use
         /// (implies --check-ports).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "reallocate_on_conflict")]
         strict: bool,
         /// Move to a fresh block if the allocated block's ports are in use
         /// (implies --check-ports). DANGER: processes already running keep

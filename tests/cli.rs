@@ -5,13 +5,83 @@
 //! [`Command::env`] (never via `std::env::set_var`, which would leak into
 //! this process and every other test). The real `~/.local/state` is never
 //! touched.
+//!
+//! As of v0.9.0 `portool` is a binary-only crate (no library target), so
+//! every expected value this file checks is computed independently, from
+//! the spec, using local helpers below -- never by importing `portool::…`
+//! and reusing the implementation under test.
 
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;
 use tempfile::TempDir;
+
+/// Marks the start of the managed block `init` appends to a foreign hook
+/// (mirrors `src/hooks.rs::HOOK_BLOCK_BEGIN`, computed independently).
+const HOOK_BLOCK_BEGIN: &str = "# >>> portool >>>";
+/// Marks the end of the managed block `init` appends to a foreign hook
+/// (mirrors `src/hooks.rs::HOOK_BLOCK_END`).
+const HOOK_BLOCK_END: &str = "# <<< portool <<<";
+/// The comment on the second line of portool's owned standalone hook script
+/// (mirrors `src/hooks.rs::HOOK_OWNED_COMMENT`).
+const HOOK_OWNED_COMMENT: &str = "# installed by portool";
+
+/// True when `content` carries any portool hook form (mirrors
+/// `src/hooks.rs::contains_portool_invocation`).
+fn contains_portool_invocation(content: &str) -> bool {
+    content.contains(HOOK_OWNED_COMMENT)
+        || content.contains(HOOK_BLOCK_BEGIN)
+        || content.contains("portool sync")
+}
+
+/// Whether inclusive ranges `a` and `b` share at least one point (mirrors
+/// `src/registry.rs::overlaps`).
+fn overlaps(a: (u16, u16), b: (u16, u16)) -> bool {
+    a.0 <= b.1 && b.0 <= a.1
+}
+
+/// The raw bytes of a path (mirrors `src/identity.rs::path_bytes`).
+fn path_bytes(path: &Path) -> &[u8] {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes()
+}
+
+/// The first 32 lowercase-hex characters of a SHA-256 digest (mirrors
+/// `src/identity.rs::truncated_hex`).
+fn truncated32(digest: &[u8]) -> String {
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex.truncate(32);
+    hex
+}
+
+/// The stable project identifier, computed independently from spec-v0.2 §5
+/// (mirrors `src/identity.rs::project_id`): the first 32 lowercase-hex
+/// characters of `SHA-256("portool-project-id-v1\0" + raw_bytes(common_dir))`.
+fn expected_project_id(common_dir: &Path) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"portool-project-id-v1\0");
+    hasher.update(path_bytes(common_dir));
+    truncated32(&hasher.finalize())
+}
+
+/// The stable worktree identifier, computed independently from spec-v0.2 §5
+/// (mirrors `src/identity.rs::worktree_id`): the first 32 lowercase-hex
+/// characters of `SHA-256("portool-worktree-id-v1\0" + raw_bytes(common_dir)
+/// + "\0" + raw_bytes(worktree_root))`.
+fn expected_worktree_id(common_dir: &Path, worktree_root: &Path) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"portool-worktree-id-v1\0");
+    hasher.update(path_bytes(common_dir));
+    hasher.update(b"\0");
+    hasher.update(path_bytes(worktree_root));
+    truncated32(&hasher.finalize())
+}
 
 /// An isolated `HOME` / `XDG_STATE_HOME` / `XDG_CONFIG_HOME` for one test,
 /// plus a scratch area (`root`) for throwaway git repositories.
@@ -67,6 +137,19 @@ impl TestEnv {
             .args(args)
             .output()
             .expect("failed to spawn portool")
+    }
+
+    /// Like [`Self::run`], but with additional environment variables set on
+    /// top of the isolated base environment -- for simulating a parent
+    /// process (e.g. a git hook) that exports repo-pinning `GIT_*`
+    /// variables into `portool`'s environment.
+    fn run_with_env(&self, dir: &Path, args: &[&str], extra_env: &[(&str, &Path)]) -> Output {
+        let mut cmd = self.command();
+        cmd.current_dir(dir).args(args);
+        for (key, value) in extra_env {
+            cmd.env(key, value);
+        }
+        cmd.output().expect("failed to spawn portool")
     }
 
     /// A not-yet-created path under this test's scratch root.
@@ -211,6 +294,85 @@ fn sync_outside_git_repo_exits_1() {
     );
 }
 
+/// P1 (external review v0.9): `discover`'s rev-parse failure must keep the
+/// legacy "not inside a git repository" wording (existing behavior other
+/// tests/users depend on) while also surfacing git's own stderr, instead of
+/// collapsing every possible failure into that one generic sentence.
+#[test]
+fn discover_error_reports_git_stderr() {
+    let env = TestEnv::new();
+    let dir = env.path("not-a-repo");
+    fs::create_dir_all(&dir).unwrap();
+
+    let output = env.run(&dir, &["sync"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("is not inside a git repository"),
+        "must keep the legacy wording, stderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("not a git repository"),
+        "must surface git's real stderr, not just the generic sentence, stderr was: {stderr}"
+    );
+}
+
+/// P1 (external review v0.9): a parent git process (most notably a git
+/// hook, per githooks(5)) exports repo-pinning `GIT_DIR`/`GIT_WORK_TREE` in
+/// its own environment. If `portool` (spawned from inside that hook)
+/// inherits them, `git -C <repo-a>` would silently operate on repo B
+/// instead -- every git spawn must scrub those variables so `-C` is the
+/// sole source of truth.
+#[test]
+fn git_dir_environment_does_not_override_dash_c_target() {
+    let env = TestEnv::new();
+    let repo_a = env.path("repo-a");
+    init_repo(&repo_a);
+    let repo_b = env.path("repo-b");
+    init_repo(&repo_b);
+
+    let output = env.run_with_env(
+        &repo_a,
+        &["sync"],
+        &[
+            ("GIT_DIR", &repo_b.join(".git")),
+            ("GIT_WORK_TREE", &repo_b),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // A clean run (no inherited GIT_* vars) must see repo A's allocation --
+    // if the bug were present, `sync` would have written repo B's identity
+    // into the registry instead.
+    let ls = env.run(&repo_a, &["ls", "--json"]);
+    assert!(ls.status.success());
+    let json: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&ls.stdout))
+        .expect("ls --json must emit valid JSON");
+    let allocations = json["allocations"].as_array().unwrap();
+    assert_eq!(allocations.len(), 1, "allocations: {allocations:?}");
+    assert_eq!(
+        allocations[0]["project_key"],
+        serde_json::json!(common_dir_key(&repo_a))
+    );
+    assert_eq!(
+        allocations[0]["path"],
+        serde_json::json!(worktree_key(&repo_a))
+    );
+
+    // And repo B, which was never actually touched by the sync above, must
+    // have no allocation of its own.
+    let registry = env.registry();
+    assert!(
+        registry["projects"].get(common_dir_key(&repo_b)).is_none(),
+        "repo B must not have been allocated a block: {registry:?}"
+    );
+}
+
 // --- 2. manifest-less repo: default PORT block ---------------------------
 
 #[test]
@@ -250,8 +412,8 @@ fn sync_without_manifest_allocates_default_block() {
              PORTOOL_WORKTREE_ID={}\n\
              PORT={start}\n",
             worktree_key(&repo),
-            portool::identity::project_id(&common_dir),
-            portool::identity::worktree_id(&common_dir, &worktree_root),
+            expected_project_id(&common_dir),
+            expected_worktree_id(&common_dir, &worktree_root),
         )
     );
 }
@@ -390,7 +552,7 @@ fn linked_worktree_gets_a_different_block() {
     }
     assert_ne!(main_block, wt_block);
     assert!(
-        !portool::registry::overlaps(main_block, wt_block),
+        !overlaps(main_block, wt_block),
         "the two worktrees' blocks must not overlap"
     );
 }
@@ -510,7 +672,7 @@ fn init_installs_hook_and_exclude_and_is_idempotent() {
     let hook_path = repo.join(".git/hooks/post-checkout");
     let hook_content_1 = fs::read_to_string(&hook_path).unwrap();
     assert!(hook_content_1.starts_with("#!/bin/sh\n# installed by portool\n"));
-    assert!(portool::hooks::contains_portool_invocation(&hook_content_1));
+    assert!(contains_portool_invocation(&hook_content_1));
     assert!(
         hook_content_1.contains("|| echo 'portool: sync failed; Git was not blocked' >&2"),
         "must report sync failure without propagating it"
@@ -626,7 +788,7 @@ fn init_with_custom_hookspath_installs_there_not_git_hooks() {
 
     let hook_path = repo.join("ci-hooks/post-checkout");
     let content_1 = fs::read_to_string(&hook_path).unwrap();
-    assert!(portool::hooks::contains_portool_invocation(&content_1));
+    assert!(contains_portool_invocation(&content_1));
     let mode = fs::metadata(&hook_path).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o755, "hook must be executable");
     assert!(
@@ -665,14 +827,97 @@ fn init_with_custom_hookspath_appends_to_existing_hook() {
 
     let content = fs::read_to_string(repo.join("ci-hooks/post-checkout")).unwrap();
     assert!(
-        content.starts_with("#!/bin/sh\necho existing\n"),
-        "the pre-existing hook body must be preserved"
+        content.starts_with("#!/bin/sh\n# >>> portool >>>\n"),
+        "the managed block must be inserted right after the shebang, not appended at EOF, got: {content}"
     );
-    assert!(portool::hooks::contains_portool_invocation(&content));
+    assert!(
+        content.ends_with("echo existing\n"),
+        "the pre-existing hook body must be preserved, got: {content}"
+    );
+    assert!(contains_portool_invocation(&content));
     assert_eq!(
-        content.matches(portool::hooks::HOOK_BLOCK_BEGIN).count(),
+        content.matches(HOOK_BLOCK_BEGIN).count(),
         1,
         "re-running init must not duplicate the managed block"
+    );
+}
+
+/// Regression (external review): a pre-existing hook ending in a top-level
+/// `exit 0` used to swallow portool's block, since it was appended at EOF --
+/// unreachable code after the `exit`. The block must be inserted right after
+/// the shebang instead, so it still runs.
+#[test]
+fn existing_hook_exit_before_managed_block_regression() {
+    let env = TestEnv::new();
+    let repo = env.path("app");
+    init_repo(&repo);
+    let hooks_dir = repo.join(".git/hooks");
+    fs::create_dir_all(&hooks_dir).unwrap();
+    fs::write(hooks_dir.join("post-checkout"), "#!/bin/sh\nexit 0\n").unwrap();
+
+    assert!(env.run(&repo, &["init"]).status.success());
+
+    let content = fs::read_to_string(hooks_dir.join("post-checkout")).unwrap();
+    let block_pos = content
+        .find(HOOK_BLOCK_BEGIN)
+        .expect("managed block must be present");
+    let exit_pos = content
+        .find("exit 0")
+        .expect("the original 'exit 0' must be preserved");
+    assert!(
+        block_pos < exit_pos,
+        "the managed block must sit before the pre-existing 'exit 0', got: {content}"
+    );
+
+    // The hook must actually fire despite the trailing 'exit 0': remove
+    // .env.portool, then let a real `git checkout` re-run the hook.
+    fs::remove_file(repo.join(".env.portool")).unwrap();
+    let output = git_with_portool(&env, &repo, &["checkout", "-q", "-b", "feature"]);
+    assert!(output.status.success());
+    assert!(
+        repo.join(".env.portool").exists(),
+        "sync must have run via the post-checkout hook"
+    );
+}
+
+/// External review: a hook location that resolves to a symlink means
+/// nothing was actually installed there; `init` must not exit 0 as if it had
+/// succeeded, even though the exclude update and `sync` already ran.
+#[test]
+fn init_exits_nonzero_when_hook_cannot_be_installed() {
+    let env = TestEnv::new();
+    let repo = env.path("app");
+    init_repo(&repo);
+    let hooks_dir = repo.join(".git/hooks");
+    fs::create_dir_all(&hooks_dir).unwrap();
+    std::os::unix::fs::symlink("/nonexistent", hooks_dir.join("post-checkout")).unwrap();
+
+    let out = env.run(&repo, &["init"]);
+    assert!(
+        !out.status.success(),
+        "init must fail when the post-checkout hook could not be installed"
+    );
+    assert!(
+        repo.join(".env.portool").exists(),
+        "the exclude update and sync must still have run before the hook failure is reported"
+    );
+}
+
+/// External review: a hook that can't be read (e.g. non-UTF-8 content) used
+/// to make `unhook` silently do nothing while still exiting 0.
+#[test]
+fn unhook_unreadable_hook_exits_nonzero() {
+    let env = TestEnv::new();
+    let repo = env.path("app");
+    init_repo(&repo);
+    assert!(env.run(&repo, &["init"]).status.success());
+
+    fs::write(repo.join(".git/hooks/post-checkout"), [0xFF, 0xFE]).unwrap();
+
+    let out = env.run(&repo, &["unhook"]);
+    assert!(
+        !out.status.success(),
+        "unhook must fail when a hook can't be read, not silently succeed while doing nothing"
     );
 }
 
@@ -718,8 +963,8 @@ fn init_refuses_global_scope_shared_hookspath() {
         "init must fail when no hook location is installable, stderr: {stderr}"
     );
     assert!(
-        stderr.contains("shared hooks dir") && stderr.contains("global"),
-        "must warn about the global-scope shared hooksPath, got: {stderr}"
+        stderr.contains("outside this repository") && stderr.contains("global"),
+        "must warn about the global-scope hooksPath resolving outside the repo, got: {stderr}"
     );
     assert!(
         stderr.contains("portool sync --quiet || true"),
@@ -728,6 +973,96 @@ fn init_refuses_global_scope_shared_hookspath() {
     assert!(
         !shared.join("post-checkout").exists(),
         "must not write into a shared global hooks dir"
+    );
+    assert!(
+        !repo.join(".git/hooks/post-checkout").exists(),
+        "must not fall back to the ignored default hooks dir"
+    );
+}
+
+/// External review P1 (v0.9.0): a *relative* `core.hooksPath` configured in
+/// global scope (`../shared-hooks`) resolves against the worktree root, not
+/// the config file's location -- so it can escape the repository just like
+/// an absolute shared path. `init` must refuse it regardless of scope.
+#[test]
+fn relative_global_hooks_path_escaping_repo_is_refused() {
+    let env = TestEnv::new();
+    let repo = env.path("repo");
+    init_repo(&repo);
+
+    let shared = env.path("shared-hooks");
+    fs::create_dir_all(&shared).unwrap();
+    let global_config = env.path("gitconfig-global");
+    fs::write(&global_config, "[core]\n\thooksPath = ../shared-hooks\n").unwrap();
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_portool"));
+    cmd.env_clear();
+    if let Ok(path) = std::env::var("PATH") {
+        cmd.env("PATH", path);
+    }
+    cmd.env("HOME", &env.home)
+        .env("XDG_STATE_HOME", &env.state)
+        .env("XDG_CONFIG_HOME", &env.config)
+        .env("GIT_CONFIG_GLOBAL", &global_config)
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .current_dir(&repo)
+        .args(["init", "--hook-only"]);
+    let output = cmd.output().expect("failed to spawn portool");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "init must fail when core.hooksPath escapes the repository, stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("outside"),
+        "must warn that the resolved hooksPath is outside the repo, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("portool sync --quiet || true"),
+        "must print the safe manual line, got: {stderr}"
+    );
+    assert!(
+        !shared.join("post-checkout").exists(),
+        "must not write into the repo's parent directory"
+    );
+    assert!(
+        !repo.join(".git/hooks/post-checkout").exists(),
+        "must not fall back to the ignored default hooks dir"
+    );
+}
+
+/// External review P1 (v0.9.0): a `core.hooksPath` set at `command` scope
+/// (highest-precedence `-c`/`GIT_CONFIG_*` env override, not `global` or
+/// `system`) that resolves outside the repository must be refused too --
+/// the old check only looked at `global`/`system` scope.
+#[test]
+fn command_scoped_hooks_path_is_refused() {
+    let env = TestEnv::new();
+    let repo = env.path("repo");
+    init_repo(&repo);
+
+    let outside = env.path("outside-hooks");
+    fs::create_dir_all(&outside).unwrap();
+
+    let output = env
+        .command()
+        .current_dir(&repo)
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+        .env("GIT_CONFIG_VALUE_0", outside.to_str().unwrap())
+        .args(["init", "--hook-only"])
+        .output()
+        .expect("failed to spawn portool");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "init must fail when a command-scoped core.hooksPath escapes the repository, stderr: {stderr}"
+    );
+    assert!(
+        !outside.join("post-checkout").exists(),
+        "must not write into a command-scoped hooksPath outside the repo"
     );
     assert!(
         !repo.join(".git/hooks/post-checkout").exists(),
@@ -797,7 +1132,7 @@ fn init_with_husky_hookspath_installs_user_managed_hook_and_chains() {
     );
 
     let user_hook = fs::read_to_string(repo.join(".husky/post-checkout")).unwrap();
-    assert!(portool::hooks::contains_portool_invocation(&user_hook));
+    assert!(contains_portool_invocation(&user_hook));
     assert_eq!(
         fs::read_to_string(repo.join(".husky/_/post-checkout")).unwrap(),
         husky_shim,
@@ -928,7 +1263,7 @@ fn ls_table_and_json_shapes() {
     let header = lines.next().unwrap();
     assert_eq!(
         header.split_whitespace().collect::<Vec<_>>(),
-        vec!["PROJECT", "WORKTREE", "BRANCH", "BLOCK", "STATUS"]
+        vec!["PROJECT", "WORKTREE", "BRANCH", "BLOCK", "STATUS", "LABEL"]
     );
     let data_lines: Vec<&str> = lines.collect();
     assert_eq!(data_lines.len(), 1, "only repo-a's row should be shown");
@@ -1049,6 +1384,38 @@ fn ls_json_corrupt_ledger_is_an_error_envelope() {
     assert_eq!(v["format_version"], 1);
     assert_eq!(v["ok"], false);
     assert!(v["error"].as_str().unwrap().contains("corrupt"));
+}
+
+/// P2 (external review indication 14): `--json` is a machine interface, so
+/// stdout must be the versioned error envelope on *every* failure path, not
+/// just a corrupt ledger. Covers a broken config and a missing git repo
+/// (both of which used to `?`-out before any JSON was ever printed).
+#[test]
+fn ls_json_wraps_config_and_git_errors() {
+    let env = TestEnv::new();
+    let repo = env.path("app");
+    init_repo(&repo);
+    env.write_config("range = \"oops\"\n");
+
+    let out = env.run(&repo, &["ls", "--json"]);
+    assert!(!out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("stdout was not JSON: {e}; stdout: {:?}", out.stdout));
+    assert_eq!(v["format_version"], 1);
+    assert_eq!(v["ok"], false);
+    assert!(v["error"].as_str().is_some());
+
+    let env2 = TestEnv::new();
+    let dir = env2.path("not-a-repo");
+    fs::create_dir_all(&dir).unwrap();
+
+    let out2 = env2.run(&dir, &["ls", "--json"]);
+    assert!(!out2.status.success());
+    let v2: serde_json::Value = serde_json::from_slice(&out2.stdout)
+        .unwrap_or_else(|e| panic!("stdout was not JSON: {e}; stdout: {:?}", out2.stdout));
+    assert_eq!(v2["format_version"], 1);
+    assert_eq!(v2["ok"], false);
+    assert!(v2["error"].as_str().is_some());
 }
 
 // --- 10. deleted worktree is reclaimed by prune; --dry-run doesn't touch it -
@@ -1176,16 +1543,22 @@ fn sync_without_installed_hook_prints_the_exact_hint_line() {
 
 // --- 14. exit code 3: the pool has no room for even one block -------------
 // (Batch C: exit code 2 / the per-project subrange model is retired; a block
-// that can't fit anywhere in the pool now fails with PoolExhausted = 3.)
+// that can't fit anywhere in the pool now fails with PoolExhausted = 3. A
+// pool narrower than `block_align` itself is now rejected at config-load
+// time instead -- see `config_rejects_config_where_block_align_exceeds_pool_capacity`
+// below and `config::tests::config_rejects_block_align_larger_than_range`.)
 
 #[test]
 fn sync_exits_3_when_pool_cannot_fit_a_block() {
     let env = TestEnv::new();
-    // The pool is only 4 ports wide, narrower than the default 5-wide block:
-    // no block fits anywhere in the pool.
-    env.write_config("range = [3000, 3003]\nblock_align = 5\n");
+    // The declared block_align (5) fits the pool (span 5), so config
+    // validation accepts it, but the manifest's declared ports need a
+    // 10-wide aligned block -- wider than the whole pool. No block fits
+    // anywhere, so allocation itself must fail with PoolExhausted.
+    env.write_config("range = [3000, 3004]\nblock_align = 5\n");
     let repo = env.path("repo");
     init_repo(&repo);
+    fs::write(repo.join(".portool.toml"), "[ports]\nweb = 0\napi = 5\n").unwrap();
 
     let output = env.run(&repo, &["sync"]);
     assert_eq!(
@@ -1193,6 +1566,33 @@ fn sync_exits_3_when_pool_cannot_fit_a_block() {
         Some(3),
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// --- 14b. an unallocatable config is rejected up front ---------------------
+
+#[test]
+fn config_rejects_config_where_block_align_exceeds_pool_capacity() {
+    let env = TestEnv::new();
+    // The pool is only 4 ports wide, narrower than the declared 5-wide
+    // block_align: no block could ever be allocated, so this must be a
+    // config error (exit 1), not an eventual PoolExhausted (external review
+    // P3) -- and it must fail before ever touching the ledger.
+    env.write_config("range = [3000, 3003]\nblock_align = 5\n");
+    let repo = env.path("repo");
+    init_repo(&repo);
+
+    let output = env.run(&repo, &["sync"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("block_align"),
+        "error must name block_align, got: {stderr}"
     );
 }
 
@@ -1279,6 +1679,89 @@ fn prune_all_reclaims_a_fully_deleted_project_and_leaves_others_untouched() {
     assert!(
         repo_b_project.get("subranges").is_none(),
         "v2 ledger must not have a subranges field"
+    );
+}
+
+/// External review P1 (Task 4): the pin contract says pinned entries are
+/// exempt from every GC path -- including the `prune --all` branch that
+/// handles a *whole repository* having vanished (not just one worktree).
+/// A pinned worktree's entry, and therefore its project entry, must
+/// survive even when `common_dir` no longer exists.
+#[test]
+fn prune_all_preserves_pinned_entries_when_common_dir_is_gone() {
+    let env = TestEnv::new();
+    env.write_config("range = [19400, 19409]\n");
+
+    let repo = env.path("repo");
+    init_repo(&repo);
+    assert!(env.run(&repo, &["sync"]).status.success());
+    assert!(env.run(&repo, &["pin"]).status.success());
+
+    let repo_key = common_dir_key(&repo);
+    let wt_key = worktree_key(&repo);
+
+    fs::remove_dir_all(&repo).unwrap();
+
+    let outside = env.path("outside");
+    fs::create_dir_all(&outside).unwrap();
+
+    let output = env.run(&outside, &["prune", "--all"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let out = env.run(&outside, &["ls", "--json", "--all"]);
+    assert!(out.status.success());
+    let json: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout))
+        .expect("ls --json must emit valid JSON");
+    let allocations = json["allocations"].as_array().unwrap();
+    let pinned_alloc = allocations
+        .iter()
+        .find(|a| a["project_key"] == serde_json::json!(repo_key))
+        .expect("the pinned project's entry must survive prune --all");
+    assert_eq!(pinned_alloc["pinned"], serde_json::json!(true));
+
+    let registry = env.registry();
+    assert!(
+        registry["projects"][&repo_key]["worktrees"]
+            .get(&wt_key)
+            .is_some(),
+        "the pinned worktree entry must still be in the ledger"
+    );
+}
+
+/// Companion regression check for the fix above: with no pin in place, the
+/// pre-existing behavior (reclaim the whole project once its repository is
+/// gone and its ports are free) must still hold.
+#[test]
+fn prune_all_reclaims_unpinned_when_common_dir_is_gone() {
+    let env = TestEnv::new();
+    env.write_config("range = [19400, 19409]\n");
+
+    let repo = env.path("repo");
+    init_repo(&repo);
+    assert!(env.run(&repo, &["sync"]).status.success());
+
+    let repo_key = common_dir_key(&repo);
+
+    fs::remove_dir_all(&repo).unwrap();
+
+    let outside = env.path("outside");
+    fs::create_dir_all(&outside).unwrap();
+
+    let output = env.run(&outside, &["prune", "--all"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let registry = env.registry();
+    assert!(
+        registry["projects"].get(&repo_key).is_none(),
+        "an unpinned project's entry must still be reclaimed once its repo is gone"
     );
 }
 
@@ -1720,6 +2203,44 @@ fn check_reports_health_and_corruption() {
     );
 }
 
+/// 指摘13: a backup refresh failure only warns (`store::save`), so
+/// `registry.json.bak` can silently go stale while `registry.json` itself
+/// stays healthy. `check` must surface that with a stderr warning -- but
+/// staleness heals on the next save, so exit code stays 0 (non-zero exits
+/// are reserved for real corruption).
+#[test]
+fn check_warns_when_backup_is_stale() {
+    let env = TestEnv::new();
+    let repo = env.path("repo");
+    init_repo(&repo);
+    assert!(env.run(&repo, &["sync"]).status.success());
+
+    let bak_path = env.state.join("portool").join("registry.json.bak");
+    let original_bak = fs::read(&bak_path).unwrap();
+    fs::write(&bak_path, b"stale backup contents").unwrap();
+
+    let out = env.run(&repo, &["check"]);
+    assert!(
+        out.status.success(),
+        "stale backup must still be exit 0 -- it heals on the next save"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("backup"),
+        "stderr must warn about the stale backup: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Restore the backup to match; the warning must disappear.
+    fs::write(&bak_path, &original_bak).unwrap();
+    let out = env.run(&repo, &["check"]);
+    assert!(out.status.success());
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("backup"),
+        "no warning once the backup matches again: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// `portool release` removes the worktree's entry and `.env.portool`.
 #[test]
 fn release_frees_the_block_and_removes_env_file() {
@@ -1816,6 +2337,88 @@ fn deinit_never_edits_a_user_gitignore() {
         String::from_utf8_lossy(&out.stdout).contains(".gitignore")
             || String::from_utf8_lossy(&out.stderr).contains(".gitignore"),
         "must hint about the leftover line"
+    );
+}
+
+/// P2 (external review,指摘8): a lost ledger must not leave `.env.portool`
+/// behind. `deinit` unions git's live worktree list with the ledger's
+/// recorded paths, so even with no `registry.json`/`.bak` at all it still
+/// finds and removes the env file via `git worktree list`.
+#[test]
+fn deinit_without_registry_removes_live_env_files() {
+    let env = TestEnv::new();
+    env.write_config("range = [19000, 19009]\n");
+    let repo = env.path("app");
+    init_repo(&repo);
+    assert!(env.run(&repo, &["init"]).status.success());
+    assert!(env.run(&repo, &["sync"]).status.success());
+    assert!(repo.join(".env.portool").exists());
+
+    fs::remove_file(env.registry_path()).unwrap();
+    fs::remove_file(env.state.join("portool").join("registry.json.bak")).unwrap();
+
+    let out = env.run(&repo, &["deinit"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !repo.join(".env.portool").exists(),
+        "env file must be removed even with no ledger at all"
+    );
+}
+
+/// A linked worktree's entry can go missing from the ledger (e.g. hand-
+/// edited, or a prior partial failure) while its `.env.portool` still sits
+/// on disk. `deinit` must still find and remove it via the live worktree
+/// union, alongside the worktree that IS still tracked in the ledger.
+#[test]
+fn deinit_removes_env_files_missing_from_registry() {
+    let env = TestEnv::new();
+    env.write_config("range = [19010, 19029]\n");
+    let repo = env.path("app");
+    init_repo(&repo);
+    assert!(env.run(&repo, &["init"]).status.success());
+    assert!(env.run(&repo, &["sync"]).status.success());
+    assert!(repo.join(".env.portool").exists());
+
+    let wt = env.path("app-wt");
+    git(&repo, &["branch", "feature-x"]);
+    git(
+        &repo,
+        &["worktree", "add", wt.to_str().unwrap(), "feature-x"],
+    );
+    assert!(env.run(&wt, &["sync"]).status.success());
+    assert!(wt.join(".env.portool").exists());
+
+    // Hand-remove just the linked worktree's ledger entry, simulating a
+    // lost/corrupted-and-partially-repaired entry -- its env file is still
+    // on disk and git still reports it as a live worktree.
+    let mut registry = env.registry();
+    registry["projects"][common_dir_key(&repo)]["worktrees"]
+        .as_object_mut()
+        .unwrap()
+        .remove(&worktree_key(&wt));
+    fs::write(
+        env.registry_path(),
+        serde_json::to_vec_pretty(&registry).unwrap(),
+    )
+    .unwrap();
+
+    let out = env.run(&repo, &["deinit"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !repo.join(".env.portool").exists(),
+        "the main worktree's env file (still in the ledger) must be removed"
+    );
+    assert!(
+        !wt.join(".env.portool").exists(),
+        "the linked worktree's env file (missing from the ledger) must be removed too"
     );
 }
 
@@ -2177,6 +2780,57 @@ fn doctor_skips_invalid_block_headers() {
     );
 }
 
+/// `doctor` must not import a block from a `.env.portool` whose
+/// `PORTOOL_PROJECT_ID`/`PORTOOL_WORKTREE_ID` don't match the IDs derived
+/// from the current project/worktree paths -- e.g. a file copied in from
+/// another worktree (external review P2 #7).
+#[test]
+fn doctor_skips_env_file_with_foreign_identity() {
+    let env = TestEnv::new();
+    let repo = env.path("repo");
+    init_repo(&repo);
+    assert!(env.run(&repo, &["sync"]).status.success());
+
+    // Simulate a `.env.portool` copied in from a different worktree: valid
+    // shape, but its identity lines belong to someone else.
+    let contents = fs::read_to_string(repo.join(".env.portool")).unwrap();
+    let foreign: String = contents
+        .lines()
+        .map(|line| {
+            if line.starts_with("PORTOOL_PROJECT_ID=") {
+                "PORTOOL_PROJECT_ID=00000000000000000000000000000000".to_string()
+            } else if line.starts_with("PORTOOL_WORKTREE_ID=") {
+                "PORTOOL_WORKTREE_ID=11111111111111111111111111111111".to_string()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    fs::write(repo.join(".env.portool"), foreign).unwrap();
+
+    // Delete the ledger entry doctor would otherwise consider already
+    // present, forcing it down the rebuild/import path.
+    fs::remove_file(env.registry_path()).unwrap();
+
+    let output = env.run(&repo, &["doctor"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("identifies a different project/worktree"),
+        "doctor must report the foreign identity, got: {stdout}"
+    );
+    assert!(
+        !env.registry_path().exists(),
+        "nothing valid was imported, so no ledger may be written"
+    );
+}
+
 /// `doctor` diagnoses hook-effectiveness problems (external review P1-4):
 /// "installed" must mean "will actually run". Covers a missing hook and a
 /// hook with a dead embedded `PORTOOL_BIN` path.
@@ -2209,6 +2863,76 @@ fn doctor_reports_hook_problems() {
     let out = env.run(&repo, &["doctor"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("/no/such/portool"), "got: {stdout}");
+}
+
+/// Task 3 (external review, doctor's unreachable-hook detection): a hook
+/// installed by portool <= 0.8 appended the managed block at EOF, after a
+/// top-level `exit 0` git never reaches past. Such a hook still "invokes
+/// portool" and is executable, so the pre-existing checks call it healthy;
+/// `doctor` must additionally flag it as unreachable. Built by hand (not via
+/// `init`, which now inserts after the shebang and would never reproduce
+/// this legacy layout).
+#[test]
+fn existing_hook_exit_before_managed_block_is_not_reported_healthy() {
+    let env = TestEnv::new();
+    let repo = env.path("app");
+    init_repo(&repo);
+    assert!(env.run(&repo, &["sync"]).status.success());
+
+    let hooks = repo.join(".git/hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    let legacy_layout = format!(
+        "#!/bin/sh\nexit 0\n{}\nPORTOOL_BIN=portool\nif command -v \"$PORTOOL_BIN\" >/dev/null 2>&1; then \"$PORTOOL_BIN\" sync --quiet || true; fi\n{}\n",
+        HOOK_BLOCK_BEGIN,
+        HOOK_BLOCK_END,
+    );
+    for name in ["post-checkout", "post-merge"] {
+        fs::write(hooks.join(name), &legacy_layout).unwrap();
+        fs::set_permissions(hooks.join(name), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let out = env.run(&repo, &["doctor"]);
+    assert!(
+        out.status.success(),
+        "doctor's hook-health report is advisory only; exit code must stay 0"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("top-level exit/exec before portool's block"),
+        "got: {stdout}"
+    );
+}
+
+/// Task 3: a hook with a malformed managed block (duplicate begin markers)
+/// still contains a portool invocation, so `doctor` must go on to flag the
+/// malformed layout specifically rather than calling the hook healthy.
+#[test]
+fn doctor_reports_a_malformed_managed_block() {
+    let env = TestEnv::new();
+    let repo = env.path("app");
+    init_repo(&repo);
+    assert!(env.run(&repo, &["sync"]).status.success());
+
+    let hooks = repo.join(".git/hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    let malformed = format!(
+        "#!/bin/sh\n{}\nportool sync --quiet || true\n{}\n{}\nother\n{}\n",
+        HOOK_BLOCK_BEGIN, HOOK_BLOCK_END, HOOK_BLOCK_BEGIN, HOOK_BLOCK_END,
+    );
+    fs::write(hooks.join("post-checkout"), &malformed).unwrap();
+    fs::set_permissions(
+        hooks.join("post-checkout"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+
+    let out = env.run(&repo, &["doctor"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("managed block is malformed"),
+        "got: {stdout}"
+    );
 }
 
 /// The config is validated before the lock-free fast path: a config broken
@@ -2303,8 +3027,8 @@ fn init_refuses_global_husky_shaped_hookspath() {
         "init must fail when no hook location is installable, stderr: {stderr}"
     );
     assert!(
-        stderr.contains("shared hooks dir") && stderr.contains("global"),
-        "must warn about the global-scope shared hooksPath, got: {stderr}"
+        stderr.contains("outside this repository") && stderr.contains("global"),
+        "must warn about the global-scope hooksPath resolving outside the repo, got: {stderr}"
     );
     assert!(
         !shared.parent().unwrap().join("post-checkout").exists()
@@ -2880,11 +3604,43 @@ fn pin_protects_a_stale_entry_from_prune() {
         .unwrap());
 }
 
-/// `unpin` clears `pinned` but keeps the label (only `pin --label`
-/// overwrites it). Runs from a live worktree, since `unpin` discovers the
-/// current worktree via git.
+/// External review P2 (indication 10): `pin --label` claims (help + README)
+/// the label shows up in `ls`, but the human table had no LABEL column.
+/// This asserts the header includes `LABEL` and the labeled row shows it.
 #[test]
-fn pin_then_unpin_clears_pinned_and_keeps_label() {
+fn human_ls_displays_pin_label() {
+    let env = TestEnv::new();
+    env.write_config("range = [18810, 18819]\n");
+    let repo = env.path("app");
+    init_repo(&repo);
+    assert!(env.run(&repo, &["sync"]).status.success());
+    assert!(env
+        .run(&repo, &["pin", "--label", "webapp"])
+        .status
+        .success());
+
+    let output = env.run(&repo, &["ls"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = stdout.lines();
+    let header = lines.next().unwrap();
+    assert_eq!(
+        header.split_whitespace().collect::<Vec<_>>(),
+        vec!["PROJECT", "WORKTREE", "BRANCH", "BLOCK", "STATUS", "LABEL"]
+    );
+    let data_line = lines.next().unwrap();
+    assert!(
+        data_line.contains("webapp"),
+        "labeled row must show the label in the human table, got: {data_line}"
+    );
+}
+
+/// A label's lifetime is the pin's lifetime (external review P2, indication
+/// 10): `unpin` must clear the label so a later label-less `pin` cannot
+/// resurrect a stale name. Runs from a live worktree, since `unpin`
+/// discovers the current worktree via git.
+#[test]
+fn unpin_clears_label() {
     let env = TestEnv::new();
     env.write_config("range = [18800, 18809]\n");
     let repo = env.path("app");
@@ -2924,8 +3680,8 @@ fn pin_then_unpin_clears_pinned_and_keeps_label() {
     assert_eq!(unpinned["pinned"], serde_json::json!(false));
     assert_eq!(
         unpinned["label"],
-        serde_json::json!("keep-me"),
-        "unpin must clear pinned but keep the label"
+        serde_json::json!(null),
+        "unpin must clear the label so a later label-less pin can't resurrect it"
     );
 }
 

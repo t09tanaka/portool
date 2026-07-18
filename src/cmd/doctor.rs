@@ -2,7 +2,7 @@
 //! v0.7.0, external review P0-1): diagnose and repair the current project.
 //!
 //! - **Repair** (`--repair`): the one and only place a bad ledger is set
-//!   aside to `registry.json.corrupt-<ts>`. Every other command fails
+//!   aside to `registry.json.corrupt-<nanos>-<pid>`. Every other command fails
 //!   closed on such a ledger and points here. Two distinct cases:
 //!   - *Corrupt*: restore-first. A valid `registry.json.bak` is restored in
 //!     place of the corrupt file, so every other project's allocations
@@ -28,7 +28,7 @@
 //! Rebuild is per-project: it only touches the project `doctor` runs in;
 //! other projects stay dropped until `doctor` runs in each (unless a
 //! backup restore already brought them back). The set-aside
-//! `registry.json.corrupt-<ts>` file is the authoritative artifact for
+//! `registry.json.corrupt-<nanos>-<pid>` file is the authoritative artifact for
 //! reconciling anything `doctor` didn't already restore or rebuild.
 
 use crate::config::Config;
@@ -86,7 +86,7 @@ pub fn run(repair: bool, abandon_other_projects: bool) -> Result<()> {
             let moved_to = store::move_aside(&registry_path)?;
             eprintln!(
                 "portool: doctor: abandoned the version-{found} ledger (moved aside to {})",
-                moved_to.display()
+                crate::display::path(&moved_to)
             );
             Registry::empty(config.range)
         }
@@ -109,7 +109,16 @@ pub fn run(repair: bool, abandon_other_projects: bool) -> Result<()> {
     let mut imported = 0usize;
 
     for wt in &live {
-        let wt_key = wt.to_string_lossy().into_owned();
+        let wt_key = match utf8_worktree_key(wt) {
+            Some(s) => s,
+            None => {
+                println!(
+                    "doctor: warning: skipping worktree with non-UTF-8 path: {}",
+                    crate::display::path(wt)
+                );
+                continue;
+            }
+        };
         let already = registry
             .find_project(&common_dir_key)
             .map(|p| p.worktrees.contains_key(&wt_key))
@@ -121,11 +130,31 @@ pub fn run(repair: bool, abandon_other_projects: bool) -> Result<()> {
             Some(block) => block,
             None => continue,
         };
+        // An env file with no ID lines (e.g. written before IDs existed, or
+        // hand-edited) bypasses this cross-check by design: there is
+        // nothing to verify, and the accidental-copy threat model this
+        // check defends against is specifically one where IDs *are*
+        // present but wrong. It falls through to normal block validation
+        // below instead.
+        if let Some((env_project_id, env_worktree_id)) = crate::envfile::read_identity_from_env(wt)
+        {
+            let expect_p = crate::identity::project_id(&ctx.common_dir);
+            let expect_w = crate::identity::worktree_id(&ctx.common_dir, wt);
+            if env_project_id != expect_p || env_worktree_id != expect_w {
+                println!(
+                    "doctor: warning: {}/.env.portool identifies a different project/worktree \
+                     (copied from elsewhere, or written by portool < 0.9?); not importing its \
+                     block",
+                    crate::display::text(&wt_key)
+                );
+                continue;
+            }
+        }
         if let Err(reason) = validate_block(block) {
             eprintln!(
                 "portool: doctor: {} records block {}-{}, which {reason}; skipping \
                  re-import (fix its .env.portool or run reallocate)",
-                wt.display(),
+                crate::display::path(wt),
                 block.0,
                 block.1
             );
@@ -135,7 +164,7 @@ pub fn run(repair: bool, abandon_other_projects: bool) -> Result<()> {
             eprintln!(
                 "portool: doctor: {} records block {}-{}, which overlaps an existing \
                  allocation; skipping re-import (fix its .env.portool or run reallocate)",
-                wt.display(),
+                crate::display::path(wt),
                 block.0,
                 block.1
             );
@@ -169,7 +198,7 @@ pub fn run(repair: bool, abandon_other_projects: bool) -> Result<()> {
             "portool: doctor: re-imported {}-{} for {}",
             block.0,
             block.1,
-            wt.display()
+            crate::display::path(wt)
         );
     }
 
@@ -192,9 +221,11 @@ pub fn run(repair: bool, abandon_other_projects: bool) -> Result<()> {
             if !ports::block_free(entry.block) {
                 in_use += 1;
                 println!(
-                    "portool: doctor: block {}-{} ({path}) has ports in use \
+                    "portool: doctor: block {}-{} ({}) has ports in use \
                      -- may be this worktree's own processes",
-                    entry.block.0, entry.block.1
+                    entry.block.0,
+                    entry.block.1,
+                    crate::display::text(path)
                 );
             }
         }
@@ -216,6 +247,7 @@ pub fn run(repair: bool, abandon_other_projects: bool) -> Result<()> {
 /// only). All advisories -- doctor's exit code is unaffected -- but a
 /// nonzero return suppresses the "nothing to repair" summary line.
 fn report_hook_health(ctx: &GitCtx) -> usize {
+    use crate::cmd::init::{managed_block_state, ManagedBlockState};
     use crate::hooks::{self, HooksLocation};
     use std::os::unix::fs::PermissionsExt;
 
@@ -241,7 +273,7 @@ fn report_hook_health(ctx: &GitCtx) -> usize {
         {
             println!(
                 "portool: doctor: hook {name}: not executable (chmod +x {})",
-                path.display()
+                crate::display::path(&path)
             );
             findings += 1;
             continue;
@@ -251,12 +283,29 @@ fn report_hook_health(ctx: &GitCtx) -> usize {
             findings += 1;
             continue;
         }
+        match managed_block_state(&content) {
+            ManagedBlockState::Valid { begin, .. } if top_level_exit_precedes(&content, begin) => {
+                println!(
+                    "portool: doctor: hook {name}: has a top-level exit/exec before portool's \
+                     block; the block may never run (re-run 'portool init' to move it)"
+                );
+                findings += 1;
+            }
+            ManagedBlockState::Malformed => {
+                println!(
+                    "portool: doctor: hook {name}: managed block is malformed; fix it by hand"
+                );
+                findings += 1;
+            }
+            _ => {}
+        }
         match embedded_bin_path(&content) {
             Some(bin) if !Path::new(&bin).exists() => {
                 println!(
-                    "portool: doctor: hook {name}: embedded portool path {bin} no longer \
+                    "portool: doctor: hook {name}: embedded portool path {} no longer \
                      exists; it falls back to PATH lookup, which GUI git clients may not \
-                     have (re-run 'portool init')"
+                     have (re-run 'portool init')",
+                    crate::display::text(&bin)
                 );
                 findings += 1;
             }
@@ -271,6 +320,21 @@ fn report_hook_health(ctx: &GitCtx) -> usize {
         }
     }
     findings
+}
+
+/// True when a line starting at column 0 (i.e. not indented -- so not inside
+/// an `if`/`case`/function body) and consisting of `exit`, `exit N`, `exec`,
+/// or `exec ...` appears among `content`'s first `before_line` lines. Used to
+/// flag a managed block that portool <= 0.8 appended at EOF, after a
+/// top-level `exit 0` git will never reach past.
+fn top_level_exit_precedes(content: &str, before_line: usize) -> bool {
+    content.lines().take(before_line).any(|line| {
+        if line.starts_with(char::is_whitespace) {
+            return false;
+        }
+        let t = line.trim_end();
+        t == "exit" || t.starts_with("exit ") || t == "exec" || t.starts_with("exec ")
+    })
 }
 
 /// Extracts the absolute path embedded as `PORTOOL_BIN="<path>"` in a hook
@@ -299,8 +363,8 @@ fn repair_corrupt(
         eprintln!(
             "portool: doctor: {} is corrupt ({reason}); moved aside to {} and starting \
              empty (--abandon-other-projects)",
-            registry_path.display(),
-            moved_to.display()
+            crate::display::path(registry_path),
+            crate::display::path(&moved_to)
         );
         return Ok(Registry::empty(config.range));
     }
@@ -318,8 +382,8 @@ fn repair_corrupt(
             eprintln!(
                 "portool: doctor: {} was corrupt ({reason}); copied aside to {} and \
                  restored the last good backup (all projects kept)",
-                registry_path.display(),
-                copied_to.display()
+                crate::display::path(registry_path),
+                crate::display::path(&copied_to)
             );
             Ok(backup)
         }
@@ -330,6 +394,16 @@ fn repair_corrupt(
             registry_path.display()
         ))),
     }
+}
+
+/// Converts a live worktree's path into its ledger key, or `None` when the
+/// path is not valid UTF-8. Ledger keys are JSON strings; a lossy
+/// conversion (`to_string_lossy`) could collide two distinct non-UTF-8
+/// paths onto the same key, reintroducing the risk `GitCtx::discover`
+/// deliberately fails closed on (external review P2 #7) -- so a non-UTF-8
+/// worktree path is skipped here rather than re-keyed.
+fn utf8_worktree_key(wt: &Path) -> Option<String> {
+    wt.to_str().map(str::to_owned)
 }
 
 /// The same per-block invariants [`Registry::validate`] enforces, applied
@@ -359,5 +433,40 @@ mod tests {
         assert!(validate_block((4000, 3999)).is_err());
         assert!(validate_block((3000, 3004)).is_ok());
         assert!(validate_block((3000, 3000)).is_ok());
+    }
+
+    #[test]
+    fn utf8_worktree_key_rejects_non_utf8_paths() {
+        // macOS's APFS enforces UTF-8 filenames, so this path can never be
+        // produced by a real worktree on this platform -- exercised directly
+        // via OsStr::from_bytes per the review-fix brief (external review
+        // P2 #7).
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let bad = Path::new(OsStr::from_bytes(b"/tmp/wt-\xff\xfe"));
+        assert_eq!(utf8_worktree_key(bad), None);
+    }
+
+    #[test]
+    fn utf8_worktree_key_accepts_utf8_paths() {
+        assert_eq!(
+            utf8_worktree_key(Path::new("/tmp/wt")),
+            Some("/tmp/wt".to_string())
+        );
+    }
+
+    #[test]
+    fn detects_top_level_exit_before_block() {
+        let content = "#!/bin/sh\nexit 0\n# >>> portool >>>\nB\n# <<< portool <<<\n";
+        assert!(top_level_exit_precedes(content, 2));
+        let indented =
+            "#!/bin/sh\nif x; then\n  exit 1\nfi\n# >>> portool >>>\nB\n# <<< portool <<<\n";
+        assert!(
+            !top_level_exit_precedes(indented, 4),
+            "indented exit is not top-level"
+        );
+        let exec_line =
+            "#!/bin/sh\nexec other-hook \"$@\"\n# >>> portool >>>\nB\n# <<< portool <<<\n";
+        assert!(top_level_exit_precedes(exec_line, 2));
     }
 }
