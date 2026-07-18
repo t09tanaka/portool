@@ -94,13 +94,15 @@ impl HooksLocation {
             } else {
                 ctx.worktree_root.join(raw)
             };
-            // canonicalize resolves symlinks; when it cannot be canonicalized
-            // (typically: it does not exist), this falls back to a lexical
-            // `..` resolution so `../x` cannot dodge the check by not
-            // existing yet.
-            let canonical = resolved
-                .canonicalize()
-                .unwrap_or_else(|_| lexical_normalize(&resolved));
+            // Resolve every symlink we can: canonicalize the longest existing
+            // ancestor (which follows symlinks in those components), then
+            // re-attach the not-yet-existing tail lexically. A bare
+            // `canonicalize` fails outright when the leaf is absent (Husky's
+            // `.husky/_` before `npm install`), and the old lexical-only
+            // fallback left an intermediate symlink (`.husky` -> ../outside)
+            // unresolved -- so an escape slipped through `is_inside_repo`
+            // (external review v0.10 P0-1, reproduced in tests/hook_symlink).
+            let canonical = canonicalize_existing_ancestor(&resolved);
 
             if !is_inside_repo(&canonical, &ctx.worktree_root, &ctx.common_dir) {
                 let scope = gitctx::config_scope(&ctx.worktree_root, "core.hooksPath");
@@ -178,6 +180,34 @@ fn classify(configured: Option<String>, worktree_root: &Path, common_dir: &Path)
 /// or under the git common dir (both already canonical from `GitCtx`).
 fn is_inside_repo(resolved: &Path, worktree_root: &Path, common_dir: &Path) -> bool {
     resolved.starts_with(worktree_root) || resolved.starts_with(common_dir)
+}
+
+/// Canonicalizes the longest existing prefix of `path` (resolving every
+/// symlink in those components), then re-appends the remaining not-yet-
+/// existing components lexically. Unlike a bare `canonicalize`, never fails
+/// on a missing leaf; unlike a bare lexical normalize, never leaves an
+/// existing intermediate symlink unresolved (external review v0.10 P0-1).
+fn canonicalize_existing_ancestor(path: &Path) -> PathBuf {
+    let mut ancestor = path.to_path_buf();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(canon) = ancestor.canonicalize() {
+            let mut out = canon;
+            for part in tail.iter().rev() {
+                out.push(part);
+            }
+            return lexical_normalize(&out);
+        }
+        match ancestor.file_name() {
+            Some(name) => {
+                tail.push(name.to_os_string());
+                if !ancestor.pop() {
+                    return lexical_normalize(path);
+                }
+            }
+            None => return lexical_normalize(path),
+        }
+    }
 }
 
 /// Textual `.`/`..` resolution for paths that cannot be canonicalized
@@ -379,6 +409,26 @@ mod tests {
         let root = root.canonicalize().unwrap();
         let resolved = root.join("hooks-link").canonicalize().unwrap();
         assert!(!is_inside_repo(&resolved, &root, &root.join(".git")));
+    }
+
+    #[test]
+    fn canonicalize_existing_ancestor_resolves_a_symlinked_intermediate() {
+        // The P0-1 root cause: `.husky` -> ../outside, hooksPath `.husky/_`.
+        // The `_` leaf does not exist, so a bare canonicalize fails; the fix
+        // must still resolve the `.husky` symlink in the existing prefix so
+        // the escape is caught.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(tmp.path().join("outside")).unwrap();
+        std::os::unix::fs::symlink("../outside", root.join(".husky")).unwrap();
+        let root = root.canonicalize().unwrap();
+
+        let resolved = canonicalize_existing_ancestor(&root.join(".husky/_"));
+        assert!(
+            !is_inside_repo(&resolved, &root, &root.join(".git")),
+            "a symlinked .husky must resolve outside the repo, got {resolved:?}"
+        );
     }
 
     #[test]

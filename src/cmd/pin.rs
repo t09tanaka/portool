@@ -44,7 +44,7 @@ fn set_pinned(pinned: bool, label: Option<String>) -> Result<()> {
         // later label-less pin does not resurrect a stale name.
         entry.label = None;
     }
-    store::save(&registry_path, &registry)?;
+    store::save(&registry_path, &mut registry)?;
     println!(
         "portool: {} {}",
         if pinned { "pinned" } else { "unpinned" },

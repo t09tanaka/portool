@@ -5,6 +5,76 @@ All notable changes to portool are documented here. The format is based on
 [Semantic Versioning](https://semver.org/) (pre-1.0: a breaking change bumps
 the minor version).
 
+## [0.10.0] - 2026-07-18
+
+The 5th-round external review's seven P0 items: hook writes become
+symlink-safe, the ledger gains a stale-backup recovery contract, `deinit`/
+`unhook` become transactional, the machine-readable API stops hiding pending
+moves, identity checks reject half-written state, and shebang classification
+is tokenized. **Ledger schema bumps to v4** (a v3 ledger auto-migrates).
+
+### Breaking
+
+- **Ledger schema v4** adds a top-level monotonic `sequence`, and every
+  `.env.portool` header now carries a `sequence:` field. A v3 ledger
+  migrates automatically in memory and is rewritten on the next locked
+  save; a pre-0.10 `.env.portool` (no `sequence:`) keeps working and gains a
+  `sequence:` field the next time a slow-path `sync` rewrites it (a branch
+  change, a manifest change, or `reallocate`) — until then it is simply
+  excluded from stale-backup detection, which stays sound via the ledger's
+  own backup comparison and `doctor` reconciliation. Nothing you depend on
+  in the CLI output changes shape except the additive `ls --json` fields
+  below.
+- **`portool check` now exits non-zero on a degraded backup** — one whose
+  parsed `sequence` is behind the ledger, or that is unreadable/corrupt —
+  instead of only printing a warning. A missing backup (fresh ledger) is
+  still just a warning.
+- **`deinit` and `unhook` exit non-zero and print a `partial_deinit` /
+  `partial_unhook` JSON object** listing residue when they cannot fully
+  complete (a symlink/unreadable/malformed/non-shell hook that still invokes
+  portool), instead of reporting success. A clean run is unchanged.
+
+### Security
+
+- **Hook writes are symlink-safe (P0-1).** Every hook and `info/exclude`
+  write now goes through an `openat(O_NOFOLLOW)`, fd-relative walk that
+  refuses the moment any path component below the repository boundary is a
+  symlink, `..`, or otherwise escapes — closing a reproduced escape where a
+  symlinked `.husky` (or hooks dir, or hook file) redirected a write outside
+  the repository. The check and the write share the same verified directory
+  descriptor, so a check-then-swap race cannot slip through. A
+  `core.hooksPath` whose nearest existing ancestor resolves outside the repo
+  is now refused even when its leaf does not yet exist (the old
+  lexical-only fallback left an intermediate symlink unresolved).
+- **Shebang classification is tokenized (P0-6).** Hook interpreter detection
+  parses the shebang (resolving `/usr/bin/env [-S] <cmd>`, matching the
+  interpreter *basename* exactly against `sh`/`bash`/`dash`) instead of a
+  substring test, and fails closed on an unknown interpreter, an empty file,
+  a leading BOM, or an oversized shebang — so `zsh`, `flash`, or a Python
+  hook is never mistaken for a POSIX shell.
+
+### Added
+
+- **A stale-backup recovery contract (P0-2).** The ledger's monotonic
+  `sequence` is mirrored into each `.env.portool`. `doctor --repair`
+  restores the whole ledger from its backup (all projects kept) and emits a
+  machine-readable `portool_recovery` advisory noting that other projects
+  may need their own repair. `sync`/`reallocate` quarantine new allocation
+  when a *tracked* worktree's env records a higher sequence than the ledger
+  (a stale-backup rollback), pointing at `doctor --repair`.
+- **`ls --json` allocations now carry `pending_block`, `env_block`,
+  `state`, and `sync_required` (P0-4).** `state` is one of `ok`,
+  `pending_move`, `recovery_required`, `env_missing`, or `stale`, so a
+  machine consumer is never shown a clean state while a move is pending or
+  the env disagrees with the ledger.
+
+### Fixed
+
+- **Partial identity state is rejected (P0-5).** A `.env.portool` with
+  exactly one of `PORTOOL_PROJECT_ID` / `PORTOOL_WORKTREE_ID` is now treated
+  as corruption (`doctor` refuses to import it and asks for manual repair),
+  never conflated with a legitimately ID-less pre-0.9 file.
+
 ## [0.9.0] - 2026-07-18
 
 The 4th-round external review items: identity IDs widen to 128 bits, the

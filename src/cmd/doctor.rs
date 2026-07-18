@@ -61,6 +61,7 @@ pub fn run(repair: bool, abandon_other_projects: bool) -> Result<()> {
     let config = Config::load()?;
     let _lock = lock::acquire(&paths::lock_path()?, LOCK_TIMEOUT)?;
     let registry_path = paths::registry_path()?;
+    let mut restored_from_backup = false;
     let mut registry = match store::load(&registry_path) {
         store::LedgerLoad::Loaded(registry) => registry,
         store::LedgerLoad::Missing => Registry::empty(config.range),
@@ -98,7 +99,10 @@ pub fn run(repair: bool, abandon_other_projects: bool) -> Result<()> {
                     registry_path.display()
                 )));
             }
-            repair_corrupt(&registry_path, &reason, abandon_other_projects, &config)?
+            let (registry, restored) =
+                repair_corrupt(&registry_path, &reason, abandon_other_projects, &config)?;
+            restored_from_backup = restored;
+            registry
         }
     };
 
@@ -130,25 +134,37 @@ pub fn run(repair: bool, abandon_other_projects: bool) -> Result<()> {
             Some(block) => block,
             None => continue,
         };
-        // An env file with no ID lines (e.g. written before IDs existed, or
-        // hand-edited) bypasses this cross-check by design: there is
-        // nothing to verify, and the accidental-copy threat model this
-        // check defends against is specifically one where IDs *are*
-        // present but wrong. It falls through to normal block validation
-        // below instead.
-        if let Some((env_project_id, env_worktree_id)) = crate::envfile::read_identity_from_env(wt)
-        {
-            let expect_p = crate::identity::project_id(&ctx.common_dir);
-            let expect_w = crate::identity::worktree_id(&ctx.common_dir, wt);
-            if env_project_id != expect_p || env_worktree_id != expect_w {
+        // Three-valued identity check (external review v0.10 P0-5):
+        // - `Absent` (no ID lines) bypasses the cross-check by design -- a
+        //   pre-identity or hand-edited file has nothing to verify, and the
+        //   accidental-copy threat model is specifically about *present but
+        //   wrong* IDs. It falls through to normal block validation.
+        // - `Partial` (exactly one ID line) is corruption, never conflated
+        //   with `Absent`: refuse to import and ask for manual repair.
+        match crate::envfile::read_identity_from_env(wt) {
+            crate::envfile::EnvIdentity::Complete(env_project_id, env_worktree_id) => {
+                let expect_p = crate::identity::project_id(&ctx.common_dir);
+                let expect_w = crate::identity::worktree_id(&ctx.common_dir, wt);
+                if env_project_id != expect_p || env_worktree_id != expect_w {
+                    println!(
+                        "doctor: warning: {}/.env.portool identifies a different \
+                         project/worktree (copied from elsewhere, or written by portool \
+                         < 0.9?); not importing its block",
+                        crate::display::text(&wt_key)
+                    );
+                    continue;
+                }
+            }
+            crate::envfile::EnvIdentity::Partial => {
                 println!(
-                    "doctor: warning: {}/.env.portool identifies a different project/worktree \
-                     (copied from elsewhere, or written by portool < 0.9?); not importing its \
-                     block",
+                    "doctor: warning: {}/.env.portool has only one of \
+                     PORTOOL_PROJECT_ID/PORTOOL_WORKTREE_ID (corrupt or half-written); \
+                     not importing -- repair or remove its .env.portool by hand",
                     crate::display::text(&wt_key)
                 );
                 continue;
             }
+            crate::envfile::EnvIdentity::Absent => { /* pre-identity file: fall through */ }
         }
         if let Err(reason) = validate_block(block) {
             eprintln!(
@@ -202,7 +218,24 @@ pub fn run(repair: bool, abandon_other_projects: bool) -> Result<()> {
         );
     }
 
-    if imported > 0 {
+    // P0-2 sequence reconciliation: after a stale-backup restore, the
+    // restored ledger's `sequence` can sit *below* a tracked worktree's env
+    // sequence (the env was written at a sequence the ledger has since
+    // regressed past). That state permanently quarantines `sync`
+    // (`env_seq > ledger_seq`), and its user-facing remedy is *this* command,
+    // so `doctor` must clear it: having just reconciled every live block, the
+    // ledger is authoritative, so advance its sequence to at least the
+    // highest env sequence. The subsequent `save` bumps it strictly past
+    // that, clearing the quarantine and refreshing the (now-fresh) backup.
+    let mut sequence_advanced = false;
+    if let Some(max_env_seq) = max_project_env_sequence(&registry, &common_dir_key) {
+        if registry.sequence <= max_env_seq {
+            registry.sequence = max_env_seq;
+            sequence_advanced = true;
+        }
+    }
+
+    if imported > 0 || sequence_advanced {
         // Never persist a ledger the next command would reject as corrupt:
         // the per-block guards above should make this unreachable, but a
         // validation failure here must abort the save, not ship.
@@ -211,7 +244,13 @@ pub fn run(repair: bool, abandon_other_projects: bool) -> Result<()> {
                 "doctor produced an invalid ledger ({err}); nothing was saved"
             ))
         })?;
-        store::save(&registry_path, &registry)?;
+        store::save(&registry_path, &mut registry)?;
+        if sequence_advanced {
+            println!(
+                "portool: doctor: advanced the ledger sequence past this project's env \
+                 files (cleared a stale-backup quarantine)"
+            );
+        }
     }
 
     // 2. Report this project's blocks whose ports are currently in use.
@@ -235,7 +274,20 @@ pub fn run(repair: bool, abandon_other_projects: bool) -> Result<()> {
     //    "will actually run".
     let hook_findings = report_hook_health(&ctx);
 
-    if imported == 0 && in_use == 0 && hook_findings == 0 {
+    // 4. P0-2: after a restore-from-backup, this project has been reconciled
+    //    from its live worktrees' env blocks, but other projects have NOT --
+    //    doctor is per-project. Report this machine-readably so automation can
+    //    tell that a recovery-loss window may exist until `doctor --repair`
+    //    runs in each other project too.
+    if restored_from_backup {
+        println!(
+            "{{\"portool_recovery\":{{\"restored_from_backup\":true,\"restored_sequence\":{},\"reconciled_project\":{},\"other_projects_may_need_repair\":true}}}}",
+            registry.sequence,
+            serde_json::to_string(&common_dir_key).expect("string serializes")
+        );
+    }
+
+    if imported == 0 && in_use == 0 && hook_findings == 0 && !restored_from_backup {
         println!("portool: doctor: nothing to repair for this project");
     }
     Ok(())
@@ -352,12 +404,16 @@ fn embedded_bin_path(content: &str) -> Option<String> {
 /// `registry.json.bak` brings back *every* project (external review P0-1);
 /// only the explicit --abandon-other-projects flag falls back to the
 /// destructive start-from-empty rebuild.
+///
+/// Returns `(registry, restored_from_backup)`: the second field is `true`
+/// only on the restore-from-backup path, so `run` can emit the P0-2 recovery
+/// advisory afterward.
 fn repair_corrupt(
     registry_path: &Path,
     reason: &str,
     abandon_other_projects: bool,
     config: &Config,
-) -> Result<Registry> {
+) -> Result<(Registry, bool)> {
     if abandon_other_projects {
         let moved_to = store::move_aside(registry_path)?;
         eprintln!(
@@ -366,11 +422,11 @@ fn repair_corrupt(
             crate::display::path(registry_path),
             crate::display::path(&moved_to)
         );
-        return Ok(Registry::empty(config.range));
+        return Ok((Registry::empty(config.range), false));
     }
 
     match store::load(&store::backup_path(registry_path)) {
-        store::LedgerLoad::Loaded(backup) => {
+        store::LedgerLoad::Loaded(mut backup) => {
             // Copy (not rename) the corrupt file aside, then let save()'s
             // atomic rename overwrite it in one step: registry.json is
             // never missing at any instant. If the save fails here, the
@@ -378,14 +434,14 @@ fn repair_corrupt(
             // mistake the state for a fresh install and refresh the backup
             // with a near-empty ledger.
             let copied_to = store::copy_aside(registry_path)?;
-            store::save(registry_path, &backup)?;
+            store::save(registry_path, &mut backup)?;
             eprintln!(
                 "portool: doctor: {} was corrupt ({reason}); copied aside to {} and \
                  restored the last good backup (all projects kept)",
                 crate::display::path(registry_path),
                 crate::display::path(&copied_to)
             );
-            Ok(backup)
+            Ok((backup, true))
         }
         _ => Err(Error::General(format!(
             "{} is corrupt ({reason}) and no valid backup exists; a plain repair would \
@@ -394,6 +450,22 @@ fn repair_corrupt(
             registry_path.display()
         ))),
     }
+}
+
+/// The highest ledger `sequence` recorded across the `.env.portool` files of
+/// the worktrees this ledger tracks for `common_dir_key` (mirrors the set
+/// `sync`'s quarantine scans), or `None` when none record one. Used to
+/// advance a restored ledger past its own worktrees' envs so their newer
+/// sequence can never permanently quarantine `sync`.
+fn max_project_env_sequence(registry: &Registry, common_dir_key: &str) -> Option<u64> {
+    let project = registry.find_project(common_dir_key)?;
+    let mut max = None;
+    for path in project.worktrees.keys() {
+        if let Some(seq) = crate::envfile::read_sequence_from_env(Path::new(path)) {
+            max = Some(max.map_or(seq, |m: u64| m.max(seq)));
+        }
+    }
+    max
 }
 
 /// Converts a live worktree's path into its ledger key, or `None` when the

@@ -14,11 +14,13 @@ use std::path::Path;
 /// `Some`, one `<KEY>_PORT=<port>` line is emitted per declared port, in
 /// the manifest's (offset-ascending) order. When `manifest` is `None`, a
 /// single `PORT=<block_start>` line is emitted instead.
+#[allow(clippy::too_many_arguments)]
 pub fn render(
     project_name: &str,
     worktree_path: &str,
     block: (u16, u16),
     generation: u64,
+    sequence: u64,
     manifest: Option<&Manifest>,
     project_id: &str,
     worktree_id: &str,
@@ -30,10 +32,11 @@ pub fn render(
     // agent-created) worktree path must not be able to escape the comment
     // and inject an executable line into a file the README tells users to
     // `source` (batch D #13). Control characters are replaced with spaces so
-    // the header is always a single, inert comment line.
+    // the header is always a single, inert comment line. `sequence` mirrors
+    // the ledger's monotonic counter for stale-backup detection (P0-2).
     let _ = writeln!(
         out,
-        "# block: {}-{}  generation: {generation}  project: {}  worktree: {}",
+        "# block: {}-{}  generation: {generation}  sequence: {sequence}  project: {}  worktree: {}",
         block.0,
         block.1,
         sanitize_comment(project_name),
@@ -114,10 +117,98 @@ pub fn read_block_from_env(worktree: &Path) -> Option<(u16, u16)> {
     None
 }
 
-/// The identity pair recorded in a worktree's `.env.portool`, or `None`
-/// when the file is missing/unreadable or either variable is absent.
-pub fn read_identity_from_env(worktree: &Path) -> Option<(String, String)> {
+/// The ledger `sequence` recorded in a worktree's `.env.portool` header, or
+/// `None` when the file/line is absent or the field is missing/unparseable
+/// (e.g. a pre-v0.10 env). Used to detect a restore-from-stale-backup: an env
+/// recording a higher sequence than the ledger proves the ledger was rolled
+/// back (external review v0.10 P0-2).
+pub fn read_sequence_from_env(worktree: &Path) -> Option<u64> {
     let contents = std::fs::read_to_string(worktree.join(".env.portool")).ok()?;
+    for line in contents.lines() {
+        let Some(rest) = line.strip_prefix("# block: ") else {
+            continue;
+        };
+        let mut it = rest.split_whitespace();
+        while let Some(tok) = it.next() {
+            if tok == "sequence:" {
+                return it.next()?.parse().ok();
+            }
+        }
+    }
+    None
+}
+
+/// Returns `content` with the `sequence: N` field removed from its `# block:`
+/// header line, so the sync fast path can byte-compare the rest of the file
+/// without the ledger-global sequence (which changes on every save, including
+/// other projects') forcing a needless rewrite. Only the header comment is
+/// normalized; every variable line is untouched.
+pub fn strip_sequence(content: &str) -> String {
+    let mut result = content
+        .lines()
+        .map(|line| {
+            if line.starts_with("# block: ") {
+                strip_sequence_field(line)
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if content.ends_with('\n') {
+        result.push('\n');
+    }
+    result
+}
+
+/// Drops the `sequence: N` token pair from the *metadata* region of a single
+/// `# block:` header line (everything up to the free-text `project:` field),
+/// re-joining the remaining tokens with single spaces. Stopping at `project:`
+/// keeps a worktree path that happens to contain a `sequence:` token (paths
+/// may hold spaces and colons) from being mangled. Both sides of the
+/// fast-path comparison pass through this identically, so the exact spacing
+/// does not matter -- only that the real sequence value is gone from both.
+fn strip_sequence_field(line: &str) -> String {
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    let mut in_metadata = true;
+    while i < tokens.len() {
+        if tokens[i] == "project:" {
+            in_metadata = false;
+        }
+        if in_metadata && tokens[i] == "sequence:" {
+            i += 2; // skip "sequence:" and its value
+            continue;
+        }
+        out.push(tokens[i]);
+        i += 1;
+    }
+    out.join(" ")
+}
+
+/// The three distinct identity states a worktree's `.env.portool` can be in
+/// (external review v0.10 P0-5). A half-written file with exactly one ID line
+/// must never be conflated with a legitimately ID-less old file: the former is
+/// corruption, the latter is a pre-identity file that `doctor` imports by
+/// design.
+#[derive(Debug, PartialEq, Eq)]
+pub enum EnvIdentity {
+    /// Neither ID line is present (file missing/unreadable, or written before
+    /// identity lines existed).
+    Absent,
+    /// Both ID lines are present.
+    Complete(String, String),
+    /// Exactly one ID line is present -> corruption / manual repair required.
+    Partial,
+}
+
+/// Three-valued identity read (external review v0.10 P0-5).
+pub fn read_identity_from_env(worktree: &Path) -> EnvIdentity {
+    let contents = match std::fs::read_to_string(worktree.join(".env.portool")) {
+        Ok(contents) => contents,
+        Err(_) => return EnvIdentity::Absent,
+    };
     let mut project = None;
     let mut wt = None;
     for line in contents.lines() {
@@ -127,7 +218,11 @@ pub fn read_identity_from_env(worktree: &Path) -> Option<(String, String)> {
             wt = Some(v.trim().to_string());
         }
     }
-    Some((project?, wt?))
+    match (project, wt) {
+        (Some(p), Some(w)) => EnvIdentity::Complete(p, w),
+        (None, None) => EnvIdentity::Absent,
+        _ => EnvIdentity::Partial,
+    }
 }
 
 #[cfg(test)]
@@ -155,6 +250,7 @@ mod tests {
             "/home/user/dev/myapp",
             (3000, 3004),
             1,
+            5,
             Some(&manifest),
             PROJECT_ID,
             WORKTREE_ID,
@@ -162,7 +258,7 @@ mod tests {
         .unwrap();
 
         let expected = "# generated by portool \u{2014} DO NOT EDIT\n\
-# block: 3000-3004  generation: 1  project: myapp  worktree: /home/user/dev/myapp\n\
+# block: 3000-3004  generation: 1  sequence: 5  project: myapp  worktree: /home/user/dev/myapp\n\
 PORTOOL_PROJECT_ID=abe4c983b7295f370a207b1614878153\n\
 PORTOOL_WORKTREE_ID=740da24128c5e2f7abf4fa15ab4253f3\n\
 WEB_PORT=3000\n\
@@ -180,6 +276,7 @@ DB_PORT=3003\n";
             "/home/user/dev/myapp",
             (3000, 3004),
             2,
+            9,
             None,
             PROJECT_ID,
             WORKTREE_ID,
@@ -187,7 +284,7 @@ DB_PORT=3003\n";
         .unwrap();
 
         let expected = "# generated by portool \u{2014} DO NOT EDIT\n\
-# block: 3000-3004  generation: 2  project: myapp  worktree: /home/user/dev/myapp\n\
+# block: 3000-3004  generation: 2  sequence: 9  project: myapp  worktree: /home/user/dev/myapp\n\
 PORTOOL_PROJECT_ID=abe4c983b7295f370a207b1614878153\n\
 PORTOOL_WORKTREE_ID=740da24128c5e2f7abf4fa15ab4253f3\n\
 PORT=3000\n";
@@ -203,6 +300,7 @@ PORT=3000\n";
             "/w",
             (3000, 3004),
             1,
+            3,
             Some(&manifest),
             PROJECT_ID,
             WORKTREE_ID,
@@ -241,6 +339,7 @@ PORT=3000\n";
             "/home/user/dev/myapp",
             block,
             1,
+            3,
             Some(&manifest),
             PROJECT_ID,
             WORKTREE_ID,
@@ -272,14 +371,16 @@ PORT=3000\n";
 
     #[test]
     fn ends_with_trailing_newline() {
-        let rendered = render("p", "/w", (3000, 3004), 1, None, PROJECT_ID, WORKTREE_ID).unwrap();
+        let rendered =
+            render("p", "/w", (3000, 3004), 1, 3, None, PROJECT_ID, WORKTREE_ID).unwrap();
         assert!(rendered.ends_with('\n'));
     }
 
     #[test]
     fn read_block_from_env_round_trips_with_render() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let rendered = render("p", "/w", (3005, 3009), 4, None, PROJECT_ID, WORKTREE_ID).unwrap();
+        let rendered =
+            render("p", "/w", (3005, 3009), 4, 3, None, PROJECT_ID, WORKTREE_ID).unwrap();
         std::fs::write(tmp.path().join(".env.portool"), rendered).unwrap();
 
         assert_eq!(read_block_from_env(tmp.path()), Some((3005, 3009)));
@@ -292,32 +393,135 @@ PORT=3000\n";
     }
 
     #[test]
-    fn read_identity_from_env_parses_both_ids() {
+    fn read_sequence_from_env_round_trips() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let rendered = render("p", "/w", (3005, 3009), 4, None, PROJECT_ID, WORKTREE_ID).unwrap();
+        let rendered = render(
+            "p",
+            "/w",
+            (3005, 3009),
+            4,
+            42,
+            None,
+            PROJECT_ID,
+            WORKTREE_ID,
+        )
+        .unwrap();
         std::fs::write(tmp.path().join(".env.portool"), rendered).unwrap();
+        assert_eq!(read_sequence_from_env(tmp.path()), Some(42));
+    }
 
+    #[test]
+    fn read_sequence_from_env_absent_when_no_sequence_field() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // A pre-v0.10 header without a sequence field.
+        std::fs::write(
+            tmp.path().join(".env.portool"),
+            "# generated by portool\n# block: 3000-3004  generation: 1  project: p  worktree: /w\nPORT=3000\n",
+        )
+        .unwrap();
+        assert_eq!(read_sequence_from_env(tmp.path()), None);
+    }
+
+    #[test]
+    fn strip_sequence_makes_headers_with_differing_sequence_compare_equal() {
+        let a = render("p", "/w", (3000, 3004), 1, 1, None, PROJECT_ID, WORKTREE_ID).unwrap();
+        let b = render(
+            "p",
+            "/w",
+            (3000, 3004),
+            1,
+            999,
+            None,
+            PROJECT_ID,
+            WORKTREE_ID,
+        )
+        .unwrap();
+        assert_ne!(a, b, "raw renders differ only in sequence");
         assert_eq!(
-            read_identity_from_env(tmp.path()),
-            Some((PROJECT_ID.to_string(), WORKTREE_ID.to_string()))
+            strip_sequence(&a),
+            strip_sequence(&b),
+            "stripping the sequence field must make them equal"
         );
     }
 
     #[test]
-    fn read_identity_from_env_missing_file_is_none() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        assert_eq!(read_identity_from_env(tmp.path()), None);
+    fn strip_sequence_leaves_variable_lines_untouched() {
+        let rendered =
+            render("p", "/w", (3000, 3004), 1, 5, None, PROJECT_ID, WORKTREE_ID).unwrap();
+        let stripped = strip_sequence(&rendered);
+        assert!(stripped.contains("PORT=3000"));
+        assert!(!stripped.contains("sequence:"));
     }
 
     #[test]
-    fn read_identity_from_env_missing_variable_is_none() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        std::fs::write(
-            tmp.path().join(".env.portool"),
-            "# generated by portool \u{2014} DO NOT EDIT\nPORTOOL_PROJECT_ID=abe4c983b7295f370a207b1614878153\nPORT=3000\n",
+    fn strip_sequence_does_not_mangle_a_worktree_path_containing_sequence() {
+        // A worktree path holding a `sequence:` token (paths may contain
+        // spaces and colons) must not lose part of its path -- only the real
+        // metadata `sequence:` field, before `project:`, is stripped.
+        let a = render(
+            "p",
+            "/home/u/sequence: 900/repo",
+            (3000, 3004),
+            1,
+            1,
+            None,
+            PROJECT_ID,
+            WORKTREE_ID,
         )
         .unwrap();
-        assert_eq!(read_identity_from_env(tmp.path()), None);
+        let b = render(
+            "p",
+            "/home/u/sequence: 900/repo",
+            (3000, 3004),
+            1,
+            999,
+            None,
+            PROJECT_ID,
+            WORKTREE_ID,
+        )
+        .unwrap();
+        assert_eq!(strip_sequence(&a), strip_sequence(&b));
+        assert!(strip_sequence(&a).contains("sequence: 900/repo"));
+    }
+
+    #[test]
+    fn read_identity_from_env_parses_both_ids() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rendered =
+            render("p", "/w", (3005, 3009), 4, 3, None, PROJECT_ID, WORKTREE_ID).unwrap();
+        std::fs::write(tmp.path().join(".env.portool"), rendered).unwrap();
+
+        assert_eq!(
+            read_identity_from_env(tmp.path()),
+            EnvIdentity::Complete(PROJECT_ID.to_string(), WORKTREE_ID.to_string())
+        );
+    }
+
+    #[test]
+    fn read_identity_from_env_missing_file_is_absent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert_eq!(read_identity_from_env(tmp.path()), EnvIdentity::Absent);
+    }
+
+    #[test]
+    fn read_identity_from_env_three_valued() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let env = tmp.path().join(".env.portool");
+        // Only project -> Partial.
+        std::fs::write(&env, "PORTOOL_PROJECT_ID=aa\nPORT=3000\n").unwrap();
+        assert_eq!(read_identity_from_env(tmp.path()), EnvIdentity::Partial);
+        // Only worktree -> Partial.
+        std::fs::write(&env, "PORTOOL_WORKTREE_ID=bb\nPORT=3000\n").unwrap();
+        assert_eq!(read_identity_from_env(tmp.path()), EnvIdentity::Partial);
+        // Neither -> Absent (a pre-identity file).
+        std::fs::write(&env, "PORT=3000\n").unwrap();
+        assert_eq!(read_identity_from_env(tmp.path()), EnvIdentity::Absent);
+        // Both -> Complete.
+        std::fs::write(&env, "PORTOOL_PROJECT_ID=aa\nPORTOOL_WORKTREE_ID=bb\n").unwrap();
+        assert_eq!(
+            read_identity_from_env(tmp.path()),
+            EnvIdentity::Complete("aa".to_string(), "bb".to_string())
+        );
     }
 
     #[test]
@@ -330,6 +534,7 @@ PORT=3000\n";
             "/tmp/wt\necho PWNED > /tmp/pwned",
             (3000, 3004),
             1,
+            3,
             None,
             PROJECT_ID,
             WORKTREE_ID,

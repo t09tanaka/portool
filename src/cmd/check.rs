@@ -30,18 +30,33 @@ pub fn run() -> Result<()> {
         }
     }
 
-    // 指摘13: a failed backup refresh only warns at save time, so `.bak` can
-    // silently go stale even though `registry.json` itself is healthy.
-    // Surfaced here as a warning, not a failure: staleness heals on the
-    // next save, and check's non-zero exits are reserved for real
-    // corruption.
-    if store::backup_is_stale(&registry_path).unwrap_or(false) {
-        eprintln!(
-            "portool: warning: {} is out of date (a backup refresh failed?); \
-             it will be refreshed by the next save -- 'doctor --repair' would \
-             currently restore stale state",
-            crate::display::path(&store::backup_path(&registry_path))
-        );
+    // P0-2: report the backup's recovery health by parsed sequence. A backup
+    // that is *behind* the ledger (or unreadable) is a degraded state -- a
+    // `doctor --repair` from it would roll allocations back -- so it is a
+    // non-zero exit, not a mere warning. A `Missing` backup is only a warning
+    // (it heals on the next save).
+    match store::backup_status(&registry_path) {
+        store::BackupStatus::Fresh => {}
+        store::BackupStatus::Missing => {
+            eprintln!(
+                "portool: warning: {} has no backup yet; it will be created on the next save",
+                crate::display::path(&store::backup_path(&registry_path))
+            );
+        }
+        store::BackupStatus::Behind { main_seq, bak_seq } => {
+            return Err(Error::General(format!(
+                "backup is behind the ledger (ledger sequence {main_seq}, backup {bak_seq}); \
+                 a 'doctor --repair' would currently restore stale state -- investigate \
+                 before relying on recovery"
+            )));
+        }
+        store::BackupStatus::Corrupt => {
+            return Err(Error::General(
+                "the ledger backup is unreadable/corrupt; recovery from it is not \
+                 currently possible"
+                    .to_string(),
+            ));
+        }
     }
 
     println!("portool: config and ledger are OK");

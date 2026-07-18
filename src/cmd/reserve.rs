@@ -24,7 +24,7 @@ pub fn reserve(spec: &str, label: Option<String>) -> Result<()> {
         if label.is_some() && label != existing.label {
             existing.label = label;
             registry.validate()?;
-            store::save(&registry_path, &registry)?;
+            store::save(&registry_path, &mut registry)?;
             println!(
                 "portool: {}-{} was already reserved; label updated",
                 block.0, block.1
@@ -47,7 +47,7 @@ pub fn reserve(spec: &str, label: Option<String>) -> Result<()> {
         pinned: true,
     });
     registry.validate()?;
-    store::save(&registry_path, &registry)?;
+    store::save(&registry_path, &mut registry)?;
     println!("portool: reserved {}-{}", block.0, block.1);
     Ok(())
 }
@@ -74,7 +74,7 @@ pub fn unreserve(spec: &str) -> Result<()> {
     match index {
         Some(index) => {
             let removed = registry.reservations.remove(index);
-            store::save(&registry_path, &registry)?;
+            store::save(&registry_path, &mut registry)?;
             println!(
                 "portool: unreserved {}-{}",
                 removed.block.0, removed.block.1

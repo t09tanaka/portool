@@ -11,6 +11,7 @@ use crate::fault;
 use crate::registry::Registry;
 use std::fs;
 use std::io::Write;
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -35,6 +36,264 @@ pub enum LedgerLoad {
     /// found" (permissions, EIO, path is a directory, ...). The ledger may
     /// well still be intact on disk, so callers must never overwrite it.
     ReadError { reason: String },
+}
+
+// --- symlink-safe, fd-relative writes under a repository boundary (P0-1) ---
+//
+// Every hook write goes through these instead of `fs::create_dir_all` +
+// `NamedTempFile`, so a symlink planted anywhere along the path (a `.husky`
+// symlink, a symlinked hooks dir, or the hook file itself) can never redirect
+// a write outside the repository. The directory walk is fd-relative
+// (`openat` with `O_NOFOLLOW | O_DIRECTORY`), which closes the TOCTOU window a
+// canonicalize-then-write check would leave open: the same descriptor that was
+// verified is the one written through.
+
+/// `openat(dirfd, name, O_RDONLY|O_NOFOLLOW|O_DIRECTORY)` -- or, when `dirfd`
+/// is `None`, `open(name, ...)` for the boundary itself. Fails on a symlink
+/// component (`ELOOP`) or a non-directory.
+fn open_dir_nofollow(name: &Path, dirfd: Option<RawFd>) -> std::io::Result<fs::File> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let c = CString::new(name.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    let fd = match dirfd {
+        Some(d) => unsafe { libc::openat(d, c.as_ptr(), flags) },
+        None => unsafe { libc::open(c.as_ptr(), flags) },
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fd is a freshly opened, owned descriptor.
+    Ok(unsafe { fs::File::from_raw_fd(fd) })
+}
+
+/// The `Normal` path components of `target` relative to `boundary`, with the
+/// leaf split off. Errors if `target` is not under `boundary` or any relative
+/// component is `..`/`.`/root (an escape attempt).
+fn repo_relative_components(
+    boundary: &Path,
+    target: &Path,
+) -> Result<(Vec<std::ffi::OsString>, std::ffi::OsString)> {
+    let rel = target.strip_prefix(boundary).map_err(|_| {
+        Error::General(format!(
+            "refusing to write {}: it is not under {}",
+            target.display(),
+            boundary.display()
+        ))
+    })?;
+    let mut components: Vec<std::ffi::OsString> = Vec::new();
+    for c in rel.components() {
+        match c {
+            std::path::Component::Normal(name) => components.push(name.to_os_string()),
+            _ => {
+                return Err(Error::General(format!(
+                    "refusing to write {}: a path component escapes {}",
+                    target.display(),
+                    boundary.display()
+                )))
+            }
+        }
+    }
+    let leaf = components.pop().ok_or_else(|| {
+        Error::General(format!(
+            "refusing to write {}: empty path",
+            target.display()
+        ))
+    })?;
+    Ok((components, leaf))
+}
+
+/// Opens the parent directory of `target` as a verified fd, plus the leaf
+/// name, walking every component below `boundary` with `O_NOFOLLOW` so no
+/// symlink is ever followed. Fails if a parent is missing (create it first
+/// with [`create_dirs_repo_relative`]) or is a symlink/non-directory.
+fn open_parent_dir_fd(boundary: &Path, target: &Path) -> Result<(fs::File, std::ffi::OsString)> {
+    let (components, leaf) = repo_relative_components(boundary, target)?;
+    let mut dir = open_dir_nofollow(boundary, None).map_err(|e| {
+        Error::General(format!(
+            "refusing to write under {}: boundary is not a real directory ({e})",
+            boundary.display()
+        ))
+    })?;
+    for name in components {
+        dir = open_dir_nofollow(Path::new(&name), Some(dir.as_raw_fd())).map_err(|e| {
+            Error::General(format!(
+                "refusing to write under {}: intermediate '{}' is not a real directory ({e})",
+                boundary.display(),
+                Path::new(&name).display()
+            ))
+        })?;
+    }
+    Ok((dir, leaf))
+}
+
+/// Ensures every intermediate directory of `target` exists under `boundary`,
+/// creating missing ones with `mkdirat` (mode 0755). Refuses to descend
+/// through a symlink or non-directory.
+pub fn create_dirs_repo_relative(boundary: &Path, target: &Path) -> Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let (names, _leaf) = repo_relative_components(boundary, target)?;
+    let mut dir = open_dir_nofollow(boundary, None).map_err(|e| {
+        Error::General(format!(
+            "refusing to create dirs under {}: boundary is not a real directory ({e})",
+            boundary.display()
+        ))
+    })?;
+    for name in names {
+        let c = CString::new(name.as_bytes())
+            .map_err(|_| Error::General("directory name contains NUL".into()))?;
+        match open_dir_nofollow(Path::new(&name), Some(dir.as_raw_fd())) {
+            Ok(next) => dir = next,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let rc = unsafe { libc::mkdirat(dir.as_raw_fd(), c.as_ptr(), 0o755) };
+                if rc < 0 {
+                    return Err(Error::from(std::io::Error::last_os_error()));
+                }
+                dir = open_dir_nofollow(Path::new(&name), Some(dir.as_raw_fd())).map_err(|e| {
+                    Error::General(format!(
+                        "refusing to create dirs under {}: '{}' is not a real directory ({e})",
+                        boundary.display(),
+                        Path::new(&name).display()
+                    ))
+                })?;
+            }
+            Err(e) => {
+                return Err(Error::General(format!(
+                    "refusing to create dirs under {}: '{}' is not a real directory ({e})",
+                    boundary.display(),
+                    Path::new(&name).display()
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Atomically writes `contents` to `target` with permission `mode`, refusing
+/// if any component below `boundary` is a symlink or escapes it. Temp file +
+/// `renameat`, both relative to the verified parent-directory fd, so the
+/// verified directory is exactly the one written into (TOCTOU-safe). Returns
+/// the final path written.
+pub fn atomic_write_within(
+    boundary: &Path,
+    target: &Path,
+    contents: &[u8],
+    mode: u32,
+) -> Result<PathBuf> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let (dir, leaf) = open_parent_dir_fd(boundary, target)?;
+    let dirfd = dir.as_raw_fd();
+
+    let tmp_name = format!(
+        ".portool-tmp-{}-{}",
+        std::process::id(),
+        leaf.to_string_lossy()
+    );
+    let tmp_c = CString::new(tmp_name.as_bytes())
+        .map_err(|_| Error::General("temp name contains NUL".into()))?;
+    // O_EXCL: a pre-existing temp of this exact name is an anomaly, not
+    // something to silently truncate. O_NOFOLLOW: never write through a
+    // symlink even at the leaf temp.
+    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let fd = unsafe { libc::openat(dirfd, tmp_c.as_ptr(), flags, mode as libc::c_uint) };
+    if fd < 0 {
+        return Err(Error::from(std::io::Error::last_os_error()));
+    }
+    // SAFETY: fd is a freshly opened, owned descriptor.
+    let mut tmp = unsafe { fs::File::from_raw_fd(fd) };
+    let write_result = (|| -> std::io::Result<()> {
+        tmp.write_all(contents)?;
+        tmp.sync_all()?;
+        Ok(())
+    })();
+    drop(tmp);
+    if let Err(e) = write_result {
+        unsafe { libc::unlinkat(dirfd, tmp_c.as_ptr(), 0) };
+        return Err(Error::from(e));
+    }
+    // openat with O_CREAT|O_EXCL honors `mode` only subject to umask; force
+    // the exact bits so a restrictive umask can't drop the execute bit a hook
+    // needs.
+    let rc = unsafe { libc::fchmodat(dirfd, tmp_c.as_ptr(), mode as libc::mode_t, 0) };
+    if rc < 0 {
+        let e = std::io::Error::last_os_error();
+        unsafe { libc::unlinkat(dirfd, tmp_c.as_ptr(), 0) };
+        return Err(Error::from(e));
+    }
+    let leaf_c = CString::new(leaf.as_bytes())
+        .map_err(|_| Error::General("leaf name contains NUL".into()))?;
+    let rc = unsafe { libc::renameat(dirfd, tmp_c.as_ptr(), dirfd, leaf_c.as_ptr()) };
+    if rc < 0 {
+        let e = std::io::Error::last_os_error();
+        unsafe { libc::unlinkat(dirfd, tmp_c.as_ptr(), 0) };
+        return Err(Error::from(e));
+    }
+    // Best-effort durability of the rename.
+    let _ = dir.sync_all();
+    Ok(boundary.join(
+        target
+            .strip_prefix(boundary)
+            .expect("checked in repo_relative_components"),
+    ))
+}
+
+/// Sets `target`'s permission bits to `mode`, refusing if any component below
+/// `boundary` is a symlink or escapes it. Uses `fchmodat` relative to the
+/// verified parent-directory fd, so it can never chmod a file outside the
+/// repository even if a component was swapped for a symlink.
+pub fn chmod_within(boundary: &Path, target: &Path, mode: u32) -> Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let (dir, leaf) = open_parent_dir_fd(boundary, target)?;
+    let leaf_c = CString::new(leaf.as_bytes())
+        .map_err(|_| Error::General("leaf name contains NUL".into()))?;
+    // AT_SYMLINK_NOFOLLOW so a leaf that became a symlink is never chmod'd
+    // through; portool's caller has already rejected symlink leaves, this is
+    // belt-and-suspenders. (Linux may reject NOFOLLOW-on-non-symlink with
+    // ENOTSUP; fall back to a plain fchmodat, still fd-relative so it stays
+    // inside the verified directory.)
+    let rc = unsafe {
+        libc::fchmodat(
+            dir.as_raw_fd(),
+            leaf_c.as_ptr(),
+            mode as libc::mode_t,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    let enotsup =
+        err.raw_os_error() == Some(libc::ENOTSUP) || err.raw_os_error() == Some(libc::EOPNOTSUPP);
+    if enotsup {
+        let rc =
+            unsafe { libc::fchmodat(dir.as_raw_fd(), leaf_c.as_ptr(), mode as libc::mode_t, 0) };
+        if rc == 0 {
+            return Ok(());
+        }
+        return Err(Error::from(std::io::Error::last_os_error()));
+    }
+    Err(Error::from(err))
+}
+
+/// Removes `target`, refusing if any component below `boundary` is a symlink
+/// or escapes it. `unlinkat` relative to the verified parent-directory fd.
+pub fn unlink_within(boundary: &Path, target: &Path) -> Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let (dir, leaf) = open_parent_dir_fd(boundary, target)?;
+    let leaf_c = CString::new(leaf.as_bytes())
+        .map_err(|_| Error::General("leaf name contains NUL".into()))?;
+    let rc = unsafe { libc::unlinkat(dir.as_raw_fd(), leaf_c.as_ptr(), 0) };
+    if rc < 0 {
+        return Err(Error::from(std::io::Error::last_os_error()));
+    }
+    Ok(())
 }
 
 /// Loads the registry at `path` without ever touching the file.
@@ -134,7 +393,12 @@ pub fn copy_aside(path: &Path) -> Result<PathBuf> {
 /// warning on stderr, never a command failure. The backup is written via
 /// temp-file + rename too (external review 3rd round P1-3) -- a crash mid-
 /// backup can no longer leave a partially overwritten `.bak`.
-pub fn save(path: &Path, registry: &Registry) -> Result<()> {
+pub fn save(path: &Path, registry: &mut Registry) -> Result<()> {
+    // Bump the monotonic ledger sequence on every save (external review v0.10
+    // P0-2). `save` is always called under the ledger lock, so this is the
+    // single serialization point for the counter. `saturating_add` keeps a
+    // (practically unreachable) overflow from wrapping the counter back.
+    registry.sequence = registry.sequence.saturating_add(1);
     let json = serde_json::to_string_pretty(registry)?;
     write_atomic_impl(path, json.as_bytes(), None)?;
     fault::point("after_registry_write");
@@ -203,19 +467,43 @@ pub fn backup_path(path: &Path) -> PathBuf {
     path.with_file_name(format!("{file_name}.bak"))
 }
 
-/// True when the ledger exists but its `.bak` sibling is missing or does
-/// not match byte-for-byte -- i.e. the last backup refresh failed and a
-/// `doctor --repair` would restore stale state. Heals on the next save.
-pub fn backup_is_stale(path: &Path) -> std::io::Result<bool> {
-    let main = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(e),
+/// The recovery health of the ledger's `.bak` sibling, compared by parsed
+/// `sequence` (external review v0.10 P0-2). `Behind` means restoring the
+/// backup would roll the ledger *back* -- a degraded state `check` surfaces
+/// as a non-zero exit, because a `doctor --repair` would currently lose
+/// allocations newer than the backup.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BackupStatus {
+    /// The backup is at least as new as the ledger (or there is no ledger yet).
+    Fresh,
+    /// The ledger exists but has no `.bak` sibling.
+    Missing,
+    /// The backup's sequence is older than the ledger's.
+    Behind { main_seq: u64, bak_seq: u64 },
+    /// The ledger or its backup is unreadable/corrupt; recovery is unsafe.
+    Corrupt,
+}
+
+/// Compares the ledger and its `.bak` by parsed `sequence`.
+pub fn backup_status(path: &Path) -> BackupStatus {
+    let main = match load(path) {
+        LedgerLoad::Loaded(registry) => registry,
+        LedgerLoad::Missing => return BackupStatus::Fresh, // nothing to back up yet
+        _ => return BackupStatus::Corrupt,
     };
-    match std::fs::read(backup_path(path)) {
-        Ok(bak) => Ok(bak != main),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
-        Err(e) => Err(e),
+    match load(&backup_path(path)) {
+        LedgerLoad::Loaded(bak) => {
+            if bak.sequence < main.sequence {
+                BackupStatus::Behind {
+                    main_seq: main.sequence,
+                    bak_seq: bak.sequence,
+                }
+            } else {
+                BackupStatus::Fresh
+            }
+        }
+        LedgerLoad::Missing => BackupStatus::Missing,
+        _ => BackupStatus::Corrupt,
     }
 }
 
@@ -428,11 +716,26 @@ mod tests {
     fn save_then_load_round_trips() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("registry.json");
-        let registry = sample_registry();
+        let mut registry = sample_registry();
 
-        save(&path, &registry).unwrap();
+        save(&path, &mut registry).unwrap();
 
+        // save bumps the in-memory registry's sequence too, so the reloaded
+        // ledger matches it exactly.
+        assert_eq!(registry.sequence, 1);
         assert_eq!(load_strict(&path).unwrap(), Some(registry));
+    }
+
+    #[test]
+    fn save_increments_sequence_each_time() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("registry.json");
+        let mut registry = Registry::empty((3000, 9999));
+        save(&path, &mut registry).unwrap();
+        assert_eq!(registry.sequence, 1);
+        save(&path, &mut registry).unwrap();
+        assert_eq!(registry.sequence, 2);
+        assert_eq!(load_strict(&path).unwrap().unwrap().sequence, 2);
     }
 
     #[test]
@@ -440,7 +743,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("nested").join("dir").join("registry.json");
 
-        save(&path, &Registry::empty((3000, 9999))).unwrap();
+        save(&path, &mut Registry::empty((3000, 9999))).unwrap();
 
         assert!(path.exists());
     }
@@ -450,7 +753,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("registry.json");
 
-        save(&path, &Registry::empty((3000, 9999))).unwrap();
+        save(&path, &mut Registry::empty((3000, 9999))).unwrap();
 
         let mut entries = dir_entries(tmp.path());
         entries.sort();
@@ -465,10 +768,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("registry.json");
 
-        save(&path, &Registry::empty((3000, 9999))).unwrap();
-        save(&path, &sample_registry()).unwrap();
+        save(&path, &mut Registry::empty((3000, 9999))).unwrap();
+        let mut sample = sample_registry();
+        save(&path, &mut sample).unwrap();
 
-        assert_eq!(load_strict(&path).unwrap(), Some(sample_registry()));
+        assert_eq!(load_strict(&path).unwrap(), Some(sample));
     }
 
     #[test]
@@ -506,7 +810,7 @@ mod tests {
     fn save_writes_a_backup_sibling() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("registry.json");
-        save(&path, &sample_registry()).unwrap();
+        save(&path, &mut sample_registry()).unwrap();
 
         let bak = backup_path(&path);
         assert!(bak.exists());
@@ -521,14 +825,12 @@ mod tests {
     fn backup_lags_one_save_behind_on_the_next_write() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("registry.json");
-        save(&path, &Registry::empty((3000, 9999))).unwrap();
-        save(&path, &sample_registry()).unwrap();
-        // After the second save the backup equals the *second* saved state
-        // (copy happens after persist), and load_strict on it succeeds.
-        assert_eq!(
-            load_strict(&backup_path(&path)).unwrap(),
-            Some(sample_registry())
-        );
+        save(&path, &mut Registry::empty((3000, 9999))).unwrap();
+        let mut sample = sample_registry();
+        save(&path, &mut sample).unwrap(); // bumps sample.sequence
+                                           // After the second save the backup equals the *second* saved state
+                                           // (copy happens after persist), sequence and all.
+        assert_eq!(load_strict(&backup_path(&path)).unwrap(), Some(sample));
     }
 
     #[test]
@@ -547,34 +849,128 @@ mod tests {
     }
 
     #[test]
-    fn backup_is_stale_false_when_main_ledger_is_missing() {
+    fn backup_status_fresh_when_main_ledger_is_missing() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("registry.json");
-
-        assert!(!backup_is_stale(&path).unwrap());
+        assert_eq!(backup_status(&path), BackupStatus::Fresh);
     }
 
     #[test]
-    fn backup_is_stale_true_when_bak_is_missing() {
+    fn backup_status_missing_when_bak_absent() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("registry.json");
-        fs::write(&path, b"{}").unwrap();
-
-        assert!(backup_is_stale(&path).unwrap());
+        // A valid ledger with no .bak sibling.
+        write_atomic(
+            &path,
+            serde_json::to_string(&Registry::empty((3000, 9999)))
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(backup_status(&path), BackupStatus::Missing);
     }
 
     #[test]
-    fn backup_is_stale_true_when_bak_differs_and_false_once_fresh() {
+    fn backup_status_fresh_after_save_and_behind_when_bak_sequence_is_older() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("registry.json");
-        save(&path, &sample_registry()).unwrap();
-        assert!(
-            !backup_is_stale(&path).unwrap(),
-            "a freshly saved backup must not be stale"
+        let mut reg = sample_registry();
+        save(&path, &mut reg).unwrap(); // ledger seq 1, bak seq 1
+        assert_eq!(backup_status(&path), BackupStatus::Fresh);
+
+        // Advance the ledger without refreshing the backup (simulating a
+        // failed backup write): the backup's sequence now lags behind.
+        save(&path, &mut reg).unwrap(); // ledger seq 2
+                                        // Roll the backup back to a stale (seq 1) copy by hand.
+        let mut stale = sample_registry();
+        stale.sequence = 1;
+        write_atomic(
+            &backup_path(&path),
+            serde_json::to_string(&stale).unwrap().as_bytes(),
+        )
+        .unwrap();
+        match backup_status(&path) {
+            BackupStatus::Behind { main_seq, bak_seq } => {
+                assert_eq!(main_seq, 2);
+                assert_eq!(bak_seq, 1);
+            }
+            other => panic!("expected Behind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn backup_status_corrupt_when_bak_unparseable() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("registry.json");
+        save(&path, &mut sample_registry()).unwrap();
+        fs::write(backup_path(&path), b"{ not json").unwrap();
+        assert_eq!(backup_status(&path), BackupStatus::Corrupt);
+    }
+
+    #[test]
+    fn atomic_write_within_writes_and_sets_mode() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("sub/dir/file");
+        create_dirs_repo_relative(tmp.path(), &target).unwrap();
+        let written = atomic_write_within(tmp.path(), &target, b"hi", 0o755).unwrap();
+        assert_eq!(fs::read(&written).unwrap(), b"hi");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o755
         );
+    }
 
-        fs::write(backup_path(&path), b"stale contents").unwrap();
-        assert!(backup_is_stale(&path).unwrap());
+    #[test]
+    fn atomic_write_within_refuses_a_symlinked_intermediate() {
+        let tmp = TempDir::new().unwrap();
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        // repo/hooks -> ../outside (escape)
+        std::os::unix::fs::symlink(&outside, repo.join("hooks")).unwrap();
+        let target = repo.join("hooks/post-checkout");
+
+        let err = atomic_write_within(&repo, &target, b"x", 0o755).unwrap_err();
+        assert!(
+            err.to_string().contains("not a real directory")
+                || err.to_string().contains("refusing"),
+            "unexpected: {err}"
+        );
+        // Nothing leaked into the escape target.
+        assert!(fs::read_dir(&outside).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn atomic_write_within_refuses_a_target_outside_boundary() {
+        let tmp = TempDir::new().unwrap();
+        let boundary = tmp.path().join("repo");
+        fs::create_dir_all(&boundary).unwrap();
+        let target = tmp.path().join("elsewhere/file");
+        assert!(atomic_write_within(&boundary, &target, b"x", 0o644).is_err());
+    }
+
+    #[test]
+    fn create_dirs_repo_relative_refuses_symlinked_component() {
+        let tmp = TempDir::new().unwrap();
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        std::os::unix::fs::symlink(&outside, repo.join("link")).unwrap();
+        let target = repo.join("link/sub/file");
+        assert!(create_dirs_repo_relative(&repo, &target).is_err());
+        assert!(fs::read_dir(&outside).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn unlink_within_removes_only_inside_boundary() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("f");
+        fs::write(&target, b"x").unwrap();
+        unlink_within(tmp.path(), &target).unwrap();
+        assert!(!target.exists());
     }
 
     #[test]
@@ -583,7 +979,7 @@ mod tests {
         // exactly registry.json + registry.json.bak (no .bak.tmp residue).
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("registry.json");
-        save(&path, &sample_registry()).unwrap();
+        save(&path, &mut sample_registry()).unwrap();
 
         let mut entries = dir_entries(tmp.path());
         entries.sort();

@@ -120,6 +120,7 @@ fn try_fast_path(ctx: &GitCtx) -> Result<Option<SyncOutcome>> {
         &worktree_key,
         entry.block,
         entry.generation,
+        registry.sequence,
         manifest_state.manifest.as_ref(),
         &identity::project_id(&ctx.common_dir),
         &identity::worktree_id(&ctx.common_dir, &ctx.worktree_root),
@@ -135,8 +136,19 @@ fn try_fast_path(ctx: &GitCtx) -> Result<Option<SyncOutcome>> {
     let metadata_current = entry.branch.as_deref() == ctx.branch.as_deref()
         && entry.last_seen_at.date_naive() == Local::now().date_naive();
 
+    // Compare with the `sequence:` header field stripped from both sides
+    // (P0-2): the ledger-global sequence changes on every save (even other
+    // projects'), so an unchanged worktree would otherwise be needlessly
+    // rewritten on every sync, defeating the lock-free fast path. The env's
+    // recorded sequence only matters for stale-backup detection, not for
+    // deciding a rewrite.
     let actual = std::fs::read(ctx.worktree_root.join(".env.portool"));
-    if !(metadata_current && matches!(actual, Ok(bytes) if bytes == expected.as_bytes())) {
+    let env_matches = matches!(&actual, Ok(bytes) if
+    match std::str::from_utf8(bytes) {
+        Ok(text) => envfile::strip_sequence(text) == envfile::strip_sequence(&expected),
+        Err(_) => false,
+    });
+    if !(metadata_current && env_matches) {
         return Ok(None);
     }
 
@@ -188,6 +200,24 @@ fn slow_path(ctx: &GitCtx, config: &Config, quiet: bool) -> Result<SyncOutcome> 
     // ledger forward to match it; otherwise roll back (the pending target
     // was reserved but never handed out).
     resolve_pending_move(&mut registry, &common_dir_key, &worktree_key, ctx);
+
+    // P0-2 quarantine: if a worktree this ledger *already tracks* has an
+    // `.env.portool` recording a higher ledger sequence than the ledger
+    // itself, the ledger was rolled back to a stale backup (this ledger wrote
+    // that env at a sequence it has since regressed past). Refuse to allocate
+    // and steer to `doctor --repair`, which reconciles every live worktree's
+    // block. Scoped to tracked worktrees so an env written by a *different*
+    // ledger (whose sequence is unrelated) can never false-trigger this.
+    if let Some(env_seq) = max_tracked_env_sequence(&registry, &common_dir_key) {
+        if env_seq > registry.sequence {
+            return Err(Error::General(format!(
+                "the port ledger looks restored from a stale backup (a tracked worktree's \
+                 .env.portool records sequence {env_seq} but the ledger is at {}); run \
+                 'portool doctor --repair' to reconcile before allocating",
+                registry.sequence
+            )));
+        }
+    }
 
     // Spec §8.1 implicit GC, run BEFORE allocation (external review P1-8):
     // freeing this project's stale entries first lets a re-created worktree
@@ -277,11 +307,15 @@ fn slow_path(ctx: &GitCtx, config: &Config, quiet: bool) -> Result<SyncOutcome> 
         Some(entry) => entry.generation,
         None => 1,
     };
+    // The env records the ledger's current sequence; the persisting save then
+    // bumps the ledger past it, so a healthy env is always <= the ledger and
+    // only a stale-backup restore can make an env's sequence exceed it (P0-2).
     let rendered = envfile::render(
         &ctx.project_name,
         &worktree_key,
         final_block,
         new_generation,
+        registry.sequence,
         manifest_state.manifest.as_ref(),
         &identity::project_id(&ctx.common_dir),
         &identity::worktree_id(&ctx.common_dir, &ctx.worktree_root),
@@ -299,7 +333,7 @@ fn slow_path(ctx: &GitCtx, config: &Config, quiet: bool) -> Result<SyncOutcome> 
             .get_mut(&worktree_key)
             .expect("existing_entry implies the entry exists");
         entry.pending_block = Some(final_block);
-        store::save(&registry_path, &registry)?;
+        store::save(&registry_path, &mut registry)?;
         crate::fault::point("after_pending_save");
 
         crate::fault::point("before_env_write");
@@ -339,7 +373,7 @@ fn slow_path(ctx: &GitCtx, config: &Config, quiet: bool) -> Result<SyncOutcome> 
         entry.last_seen_at = now;
     }
 
-    store::save(&registry_path, &registry)?;
+    store::save(&registry_path, &mut registry)?;
 
     // For a non-move (fresh allocation or in-place refresh), the ledger
     // write comes first: a crash here leaves the block reserved with a
@@ -508,6 +542,7 @@ pub fn reallocate(ctx: &GitCtx, quiet: bool) -> Result<SyncOutcome> {
         &worktree_key,
         new_block,
         new_generation,
+        registry.sequence,
         manifest_state.manifest.as_ref(),
         &identity::project_id(&ctx.common_dir),
         &identity::worktree_id(&ctx.common_dir, &ctx.worktree_root),
@@ -524,7 +559,7 @@ pub fn reallocate(ctx: &GitCtx, quiet: bool) -> Result<SyncOutcome> {
             .expect("entry existed above");
         entry.pending_block = Some(new_block);
     }
-    store::save(&registry_path, &registry)?;
+    store::save(&registry_path, &mut registry)?;
     crate::fault::point("after_pending_save");
 
     crate::fault::point("before_env_write");
@@ -546,7 +581,7 @@ pub fn reallocate(ctx: &GitCtx, quiet: bool) -> Result<SyncOutcome> {
         entry.manifest_hash = manifest_state.hash.clone();
         entry.last_seen_at = now;
     }
-    store::save(&registry_path, &registry)?;
+    store::save(&registry_path, &mut registry)?;
 
     if !quiet {
         println!(
@@ -615,6 +650,24 @@ fn resolve_pending_move(
         entry.generation += 1;
     }
     entry.pending_block = None;
+}
+
+/// The highest ledger `sequence` recorded in the `.env.portool` of a worktree
+/// **this ledger already tracks** for `common_dir_key`, or `None` when none
+/// record one. Scoped to tracked worktrees so a sequence written by an
+/// unrelated ledger (a foreign checkout, a hook run under a different state
+/// dir) can never be compared against this ledger's counter -- sequences are
+/// only meaningful within one ledger. A tracked worktree's env exceeding the
+/// ledger's sequence means the ledger regressed (stale-backup restore).
+fn max_tracked_env_sequence(registry: &Registry, common_dir_key: &str) -> Option<u64> {
+    let project = registry.find_project(common_dir_key)?;
+    let mut max = None;
+    for path in project.worktrees.keys() {
+        if let Some(seq) = envfile::read_sequence_from_env(Path::new(path)) {
+            max = Some(max.map_or(seq, |m: u64| m.max(seq)));
+        }
+    }
+    max
 }
 
 /// Local-timezone RFC 3339 timestamp, truncated to whole seconds (cross-task

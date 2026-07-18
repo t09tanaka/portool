@@ -51,7 +51,7 @@ pub fn run(all: bool, dry_run: bool) -> Result<()> {
     };
 
     if changed {
-        store::save(&paths::registry_path()?, &registry)?;
+        store::save(&paths::registry_path()?, &mut registry)?;
     }
     Ok(())
 }
