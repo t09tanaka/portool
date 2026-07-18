@@ -1473,16 +1473,22 @@ fn sync_without_installed_hook_prints_the_exact_hint_line() {
 
 // --- 14. exit code 3: the pool has no room for even one block -------------
 // (Batch C: exit code 2 / the per-project subrange model is retired; a block
-// that can't fit anywhere in the pool now fails with PoolExhausted = 3.)
+// that can't fit anywhere in the pool now fails with PoolExhausted = 3. A
+// pool narrower than `block_align` itself is now rejected at config-load
+// time instead -- see `config_rejects_config_where_block_align_exceeds_pool_capacity`
+// below and `config::tests::config_rejects_block_align_larger_than_range`.)
 
 #[test]
 fn sync_exits_3_when_pool_cannot_fit_a_block() {
     let env = TestEnv::new();
-    // The pool is only 4 ports wide, narrower than the default 5-wide block:
-    // no block fits anywhere in the pool.
-    env.write_config("range = [3000, 3003]\nblock_align = 5\n");
+    // The declared block_align (5) fits the pool (span 5), so config
+    // validation accepts it, but the manifest's declared ports need a
+    // 10-wide aligned block -- wider than the whole pool. No block fits
+    // anywhere, so allocation itself must fail with PoolExhausted.
+    env.write_config("range = [3000, 3004]\nblock_align = 5\n");
     let repo = env.path("repo");
     init_repo(&repo);
+    fs::write(repo.join(".portool.toml"), "[ports]\nweb = 0\napi = 5\n").unwrap();
 
     let output = env.run(&repo, &["sync"]);
     assert_eq!(
@@ -1490,6 +1496,33 @@ fn sync_exits_3_when_pool_cannot_fit_a_block() {
         Some(3),
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// --- 14b. an unallocatable config is rejected up front ---------------------
+
+#[test]
+fn config_rejects_config_where_block_align_exceeds_pool_capacity() {
+    let env = TestEnv::new();
+    // The pool is only 4 ports wide, narrower than the declared 5-wide
+    // block_align: no block could ever be allocated, so this must be a
+    // config error (exit 1), not an eventual PoolExhausted (external review
+    // P3) -- and it must fail before ever touching the ledger.
+    env.write_config("range = [3000, 3003]\nblock_align = 5\n");
+    let repo = env.path("repo");
+    init_repo(&repo);
+
+    let output = env.run(&repo, &["sync"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("block_align"),
+        "error must name block_align, got: {stderr}"
     );
 }
 

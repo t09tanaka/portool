@@ -96,7 +96,7 @@ pub fn load_strict(path: &Path) -> Result<Option<Registry>> {
     }
 }
 
-/// Renames the ledger aside to `<path>.corrupt-<unix seconds>` and returns
+/// Renames the ledger aside to `<path>.corrupt-<nanos>-<pid>` and returns
 /// the new path. Only `portool doctor --repair` calls this -- an explicit,
 /// user-requested reset is the single place a bad ledger may be moved.
 pub fn move_aside(path: &Path) -> Result<PathBuf> {
@@ -111,7 +111,7 @@ pub fn move_aside(path: &Path) -> Result<PathBuf> {
     Ok(corrupt_path)
 }
 
-/// Copies the (bad) ledger to a `.corrupt-<unix seconds>` sibling without
+/// Copies the (bad) ledger to a `.corrupt-<nanos>-<pid>` sibling without
 /// removing the original, and returns the sibling's path. The restore path
 /// of `doctor --repair` uses this instead of [`move_aside`]: if the
 /// subsequent save of the restored backup fails, `registry.json` still
@@ -220,15 +220,20 @@ pub fn backup_is_stale(path: &Path) -> std::io::Result<bool> {
 }
 
 fn corrupt_sibling_path(path: &Path) -> PathBuf {
-    let secs = SystemTime::now()
+    // Nanosecond resolution + pid keeps two repairs of the same ledger in
+    // the same second from colliding and silently overwriting each other's
+    // forensic aside file (external review P3): second-resolution alone
+    // isn't unique enough when `doctor --repair` can run more than once per
+    // second, e.g. in tests or scripted repair loops.
+    let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+        .unwrap_or_default();
+    let pid = std::process::id();
     let file_name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "registry.json".to_string());
-    path.with_file_name(format!("{file_name}.corrupt-{secs}"))
+    path.with_file_name(format!("{file_name}.corrupt-{}-{pid}", now.as_nanos()))
 }
 
 #[cfg(test)]
@@ -385,6 +390,38 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .starts_with("registry.json.corrupt-"));
+    }
+
+    #[test]
+    fn corrupt_sibling_paths_are_unique_within_a_second() {
+        // Two repairs of the same ledger within the same wall-clock second
+        // must not collide (external review P3): second-resolution alone
+        // isn't unique enough. Calling `corrupt_sibling_path` twice and
+        // asserting the results differ would be flaky (nanos could
+        // theoretically tie under a coarse clock source), so instead assert
+        // the format actually carries the nanos and pid components that
+        // make collisions practically impossible.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("registry.json");
+
+        let sibling = corrupt_sibling_path(&path);
+        let name = sibling.file_name().unwrap().to_string_lossy().to_string();
+        let suffix = name
+            .strip_prefix("registry.json.corrupt-")
+            .expect("must keep the .corrupt- prefix");
+        let (nanos, pid) = suffix
+            .split_once('-')
+            .expect("suffix must be `<nanos>-<pid>`");
+
+        assert!(
+            nanos.parse::<u128>().is_ok(),
+            "nanos component must be numeric: {nanos}"
+        );
+        assert_eq!(
+            pid.parse::<u32>().ok(),
+            Some(std::process::id()),
+            "pid component must be the current process id"
+        );
     }
 
     #[test]
