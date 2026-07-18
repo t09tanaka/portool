@@ -371,15 +371,21 @@ idempotent — running `init` again never duplicates the hook content or the
 keeps its pre-1.0 name even though it now touches `info/exclude`.)
 
 `init` **exits non-zero** whenever the hook doesn't end up actually
-installed and runnable — a `core.hooksPath` pointing at a directory that
-doesn't exist, a `core.hooksPath` that resolves outside the repository in
-*any* config scope (see [`core.hooksPath` and Husky](#corehookspath-and-husky)
-below), a symlinked hook file, a hook with a non-shell interpreter, or a
-hook that couldn't be read or has a malformed managed block — and prints
-the exact line to add to your hook manager instead of silently succeeding
-with nothing installed. The `info/exclude` update and the initial `sync`
-still run first in this case; only the hook-install step is reported as a
-failure.
+installed and runnable, and prints the exact line to add to your hook
+manager instead of silently succeeding with nothing installed. What else
+runs before the non-zero exit depends on which case triggered it:
+
+- A symlinked hook file, a hook with a non-shell interpreter, or a hook
+  that couldn't be read or has a malformed managed block: the hook-install
+  step itself doesn't error, so the `info/exclude` update and the initial
+  `sync` still run first; only the hook-install step is then reported as a
+  failure.
+- A `core.hooksPath` pointing at a directory that doesn't exist, or a
+  `core.hooksPath` that resolves outside the repository in *any* config
+  scope (see [`core.hooksPath` and Husky](#corehookspath-and-husky)
+  below): hook installation itself fails outright, so `init` exits
+  immediately and the `info/exclude` update and initial `sync` do **not**
+  run.
 
 `init` writes the ignore rule to `$GIT_COMMON_DIR/info/exclude` — shared by
 every worktree of the repo, never committed, and independent of the tracked

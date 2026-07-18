@@ -2,7 +2,7 @@
 //! v0.7.0, external review P0-1): diagnose and repair the current project.
 //!
 //! - **Repair** (`--repair`): the one and only place a bad ledger is set
-//!   aside to `registry.json.corrupt-<ts>`. Every other command fails
+//!   aside to `registry.json.corrupt-<nanos>-<pid>`. Every other command fails
 //!   closed on such a ledger and points here. Two distinct cases:
 //!   - *Corrupt*: restore-first. A valid `registry.json.bak` is restored in
 //!     place of the corrupt file, so every other project's allocations
@@ -28,7 +28,7 @@
 //! Rebuild is per-project: it only touches the project `doctor` runs in;
 //! other projects stay dropped until `doctor` runs in each (unless a
 //! backup restore already brought them back). The set-aside
-//! `registry.json.corrupt-<ts>` file is the authoritative artifact for
+//! `registry.json.corrupt-<nanos>-<pid>` file is the authoritative artifact for
 //! reconciling anything `doctor` didn't already restore or rebuild.
 
 use crate::config::Config;
