@@ -161,16 +161,23 @@ pub fn strip_sequence(content: &str) -> String {
     result
 }
 
-/// Drops the `sequence: N` token pair from a single `# block:` header line,
-/// re-joining the remaining tokens with single spaces. Both sides of the
+/// Drops the `sequence: N` token pair from the *metadata* region of a single
+/// `# block:` header line (everything up to the free-text `project:` field),
+/// re-joining the remaining tokens with single spaces. Stopping at `project:`
+/// keeps a worktree path that happens to contain a `sequence:` token (paths
+/// may hold spaces and colons) from being mangled. Both sides of the
 /// fast-path comparison pass through this identically, so the exact spacing
-/// does not matter -- only that the sequence value is gone from both.
+/// does not matter -- only that the real sequence value is gone from both.
 fn strip_sequence_field(line: &str) -> String {
     let tokens: Vec<&str> = line.split_whitespace().collect();
     let mut out = Vec::new();
     let mut i = 0;
+    let mut in_metadata = true;
     while i < tokens.len() {
-        if tokens[i] == "sequence:" {
+        if tokens[i] == "project:" {
+            in_metadata = false;
+        }
+        if in_metadata && tokens[i] == "sequence:" {
             i += 2; // skip "sequence:" and its value
             continue;
         }
@@ -444,6 +451,37 @@ PORT=3000\n";
         let stripped = strip_sequence(&rendered);
         assert!(stripped.contains("PORT=3000"));
         assert!(!stripped.contains("sequence:"));
+    }
+
+    #[test]
+    fn strip_sequence_does_not_mangle_a_worktree_path_containing_sequence() {
+        // A worktree path holding a `sequence:` token (paths may contain
+        // spaces and colons) must not lose part of its path -- only the real
+        // metadata `sequence:` field, before `project:`, is stripped.
+        let a = render(
+            "p",
+            "/home/u/sequence: 900/repo",
+            (3000, 3004),
+            1,
+            1,
+            None,
+            PROJECT_ID,
+            WORKTREE_ID,
+        )
+        .unwrap();
+        let b = render(
+            "p",
+            "/home/u/sequence: 900/repo",
+            (3000, 3004),
+            1,
+            999,
+            None,
+            PROJECT_ID,
+            WORKTREE_ID,
+        )
+        .unwrap();
+        assert_eq!(strip_sequence(&a), strip_sequence(&b));
+        assert!(strip_sequence(&a).contains("sequence: 900/repo"));
     }
 
     #[test]

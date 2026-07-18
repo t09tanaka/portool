@@ -218,7 +218,24 @@ pub fn run(repair: bool, abandon_other_projects: bool) -> Result<()> {
         );
     }
 
-    if imported > 0 {
+    // P0-2 sequence reconciliation: after a stale-backup restore, the
+    // restored ledger's `sequence` can sit *below* a tracked worktree's env
+    // sequence (the env was written at a sequence the ledger has since
+    // regressed past). That state permanently quarantines `sync`
+    // (`env_seq > ledger_seq`), and its user-facing remedy is *this* command,
+    // so `doctor` must clear it: having just reconciled every live block, the
+    // ledger is authoritative, so advance its sequence to at least the
+    // highest env sequence. The subsequent `save` bumps it strictly past
+    // that, clearing the quarantine and refreshing the (now-fresh) backup.
+    let mut sequence_advanced = false;
+    if let Some(max_env_seq) = max_project_env_sequence(&registry, &common_dir_key) {
+        if registry.sequence <= max_env_seq {
+            registry.sequence = max_env_seq;
+            sequence_advanced = true;
+        }
+    }
+
+    if imported > 0 || sequence_advanced {
         // Never persist a ledger the next command would reject as corrupt:
         // the per-block guards above should make this unreachable, but a
         // validation failure here must abort the save, not ship.
@@ -228,6 +245,12 @@ pub fn run(repair: bool, abandon_other_projects: bool) -> Result<()> {
             ))
         })?;
         store::save(&registry_path, &mut registry)?;
+        if sequence_advanced {
+            println!(
+                "portool: doctor: advanced the ledger sequence past this project's env \
+                 files (cleared a stale-backup quarantine)"
+            );
+        }
     }
 
     // 2. Report this project's blocks whose ports are currently in use.
@@ -427,6 +450,22 @@ fn repair_corrupt(
             registry_path.display()
         ))),
     }
+}
+
+/// The highest ledger `sequence` recorded across the `.env.portool` files of
+/// the worktrees this ledger tracks for `common_dir_key` (mirrors the set
+/// `sync`'s quarantine scans), or `None` when none record one. Used to
+/// advance a restored ledger past its own worktrees' envs so their newer
+/// sequence can never permanently quarantine `sync`.
+fn max_project_env_sequence(registry: &Registry, common_dir_key: &str) -> Option<u64> {
+    let project = registry.find_project(common_dir_key)?;
+    let mut max = None;
+    for path in project.worktrees.keys() {
+        if let Some(seq) = crate::envfile::read_sequence_from_env(Path::new(path)) {
+            max = Some(max.map_or(seq, |m: u64| m.max(seq)));
+        }
+    }
+    max
 }
 
 /// Converts a live worktree's path into its ledger key, or `None` when the

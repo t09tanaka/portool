@@ -54,8 +54,12 @@ fn strip_sequence_field(content: &str) -> String {
                 let tokens: Vec<&str> = line.split_whitespace().collect();
                 let mut out = Vec::new();
                 let mut i = 0;
+                let mut in_metadata = true;
                 while i < tokens.len() {
-                    if tokens[i] == "sequence:" {
+                    if tokens[i] == "project:" {
+                        in_metadata = false;
+                    }
+                    if in_metadata && tokens[i] == "sequence:" {
                         i += 2;
                         continue;
                     }

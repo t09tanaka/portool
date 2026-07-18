@@ -242,4 +242,28 @@ fn stale_backup_rollback_quarantines_new_allocation() {
         "must point at recovery: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+
+    // The remedy the quarantine prints -- `doctor --repair` -- must actually
+    // clear it: doctor advances the ledger sequence past this project's env
+    // files, so the next sync is no longer quarantined. (Regression test for
+    // the independent review's HIGH finding: the recovery path used to
+    // deadlock the exact state it was built to recover from.)
+    let repair = env.run(&a, &["doctor", "--repair"]);
+    assert!(
+        repair.status.success(),
+        "doctor --repair must succeed: {}",
+        String::from_utf8_lossy(&repair.stderr)
+    );
+    let after = env.run(&a, &["sync"]);
+    assert!(
+        after.status.success(),
+        "sync must work again after doctor --repair; stderr: {}",
+        String::from_utf8_lossy(&after.stderr)
+    );
+    let after_b = env.run(&b, &["sync"]);
+    assert!(
+        after_b.status.success(),
+        "the new worktree's sync must work after repair; stderr: {}",
+        String::from_utf8_lossy(&after_b.stderr)
+    );
 }
