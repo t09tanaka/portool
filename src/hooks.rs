@@ -94,8 +94,9 @@ impl HooksLocation {
             } else {
                 ctx.worktree_root.join(raw)
             };
-            // canonicalize resolves symlinks; a nonexistent dir falls back to a
-            // lexical `..` resolution so `../x` cannot dodge the check by not
+            // canonicalize resolves symlinks; when it cannot be canonicalized
+            // (typically: it does not exist), this falls back to a lexical
+            // `..` resolution so `../x` cannot dodge the check by not
             // existing yet.
             let canonical = resolved
                 .canonicalize()

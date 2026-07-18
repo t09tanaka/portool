@@ -130,6 +130,12 @@ pub fn run(repair: bool, abandon_other_projects: bool) -> Result<()> {
             Some(block) => block,
             None => continue,
         };
+        // An env file with no ID lines (e.g. written before IDs existed, or
+        // hand-edited) bypasses this cross-check by design: there is
+        // nothing to verify, and the accidental-copy threat model this
+        // check defends against is specifically one where IDs *are*
+        // present but wrong. It falls through to normal block validation
+        // below instead.
         if let Some((env_project_id, env_worktree_id)) = crate::envfile::read_identity_from_env(wt)
         {
             let expect_p = crate::identity::project_id(&ctx.common_dir);
@@ -137,7 +143,8 @@ pub fn run(repair: bool, abandon_other_projects: bool) -> Result<()> {
             if env_project_id != expect_p || env_worktree_id != expect_w {
                 println!(
                     "doctor: warning: {}/.env.portool identifies a different project/worktree \
-                     (copied from elsewhere?); not importing its block",
+                     (copied from elsewhere, or written by portool < 0.9?); not importing its \
+                     block",
                     crate::display::text(&wt_key)
                 );
                 continue;

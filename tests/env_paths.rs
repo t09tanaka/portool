@@ -103,7 +103,7 @@ fn home_fallback_resolves_state_dir() {
 
     let out = run(
         &scratch,
-        &["reserve", "18500-18504"],
+        &["reserve", "19410-19414"],
         &[("HOME", env.home.to_str().unwrap())],
     );
     assert!(
@@ -124,7 +124,7 @@ fn home_fallback_resolves_state_dir() {
     );
 
     let contents = fs::read_to_string(&registry_path).unwrap();
-    assert!(contents.contains("18500"), "registry contents: {contents}");
+    assert!(contents.contains("19410"), "registry contents: {contents}");
 }
 
 // --- state_dir / config_dir: XDG_* override HOME ----------------------------
@@ -142,7 +142,7 @@ fn xdg_vars_override_home_for_state_dir() {
 
     let out = run(
         &scratch,
-        &["reserve", "18510-18514"],
+        &["reserve", "19420-19424"],
         &[
             ("HOME", env.home.to_str().unwrap()),
             ("XDG_STATE_HOME", env.state.to_str().unwrap()),
@@ -297,7 +297,7 @@ fn empty_xdg_state_home_is_treated_as_unset() {
 
     let out = run(
         &scratch,
-        &["reserve", "18520-18524"],
+        &["reserve", "19430-19434"],
         &[("HOME", env.home.to_str().unwrap()), ("XDG_STATE_HOME", "")],
     );
     assert!(
@@ -325,7 +325,7 @@ fn non_absolute_xdg_state_home_is_ignored_with_warning() {
 
     let out = run(
         &scratch,
-        &["reserve", "18530-18534"],
+        &["reserve", "19440-19444"],
         &[
             ("HOME", env.home.to_str().unwrap()),
             ("XDG_STATE_HOME", "relative/state"),

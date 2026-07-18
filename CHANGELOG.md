@@ -18,7 +18,12 @@ gaps close. **No ledger schema change** (still v3).
   characters** (64→128-bit truncated SHA-256). Existing worktrees pick up
   new, longer IDs on their next `sync`; anything derived from the old ID —
   Docker Compose project/container/network/volume names, per-worktree
-  caches — changes accordingly.
+  caches — changes accordingly. Migration note: `doctor` will not re-import
+  a pre-0.9 `.env.portool` (its 16-hex IDs no longer match); run `portool
+  sync` in each worktree after upgrading to rewrite the env file.
+- **`unhook`/`deinit` exit non-zero when a hook file exists but cannot be
+  read**, instead of silently succeeding as if there were nothing to
+  remove.
 - **The crate no longer ships a library target.** `portool` is binary-only;
   the CLI (documented commands, exit codes, file formats) is the only
   interface, so there is no Rust API to depend on or that follows semver.

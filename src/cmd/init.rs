@@ -1,7 +1,9 @@
 //! `portool init` (spec §9.1, frozen decisions 2, 6, 7, 8; hardening batch A;
 //! Task 6): installs the `post-checkout` and `post-merge` hooks into the
 //! repository's *effective* hooks location (honoring `core.hooksPath` /
-//! Husky, and refusing shared global/system scope -- see `crate::hooks`),
+//! Husky, and refusing a `core.hooksPath` that resolves outside the
+//! repository regardless of which config scope set it -- see
+//! `crate::hooks`),
 //! appends `.env.portool` to `$GIT_COMMON_DIR/info/exclude` (never the
 //! tracked `.gitignore`), and runs `sync` once. The installed hooks always
 //! exit 0, so a portool failure never fails the caller's git command.
@@ -72,7 +74,8 @@ pub(crate) enum HookOutcome {
     SkippedSymlink,
     /// Nothing was written because the hook needs a human to look at it
     /// (non-shell interpreter, unreadable content, or a malformed managed
-    /// block). `reason` is safe to show the user as-is.
+    /// block). `reason` embeds a raw path; callers sanitize it before
+    /// terminal display.
     ManualRequired { reason: String },
 }
 
