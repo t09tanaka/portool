@@ -2728,9 +2728,9 @@ fn doctor_skips_env_file_with_foreign_identity() {
         .lines()
         .map(|line| {
             if line.starts_with("PORTOOL_PROJECT_ID=") {
-                "PORTOOL_PROJECT_ID=0000000000000000".to_string()
+                "PORTOOL_PROJECT_ID=00000000000000000000000000000000".to_string()
             } else if line.starts_with("PORTOOL_WORKTREE_ID=") {
-                "PORTOOL_WORKTREE_ID=1111111111111111".to_string()
+                "PORTOOL_WORKTREE_ID=11111111111111111111111111111111".to_string()
             } else {
                 line.to_string()
             }

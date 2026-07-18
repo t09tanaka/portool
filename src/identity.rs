@@ -9,9 +9,9 @@ use std::path::Path;
 
 const PROJECT_ID_DOMAIN: &[u8] = b"portool-project-id-v1\0";
 const WORKTREE_ID_DOMAIN: &[u8] = b"portool-worktree-id-v1\0";
-const ID_LEN: usize = 16;
+const ID_LEN: usize = 32;
 
-/// The stable project identifier: the first 16 lowercase-hex characters of
+/// The stable project identifier: the first 32 lowercase-hex characters of
 /// `SHA-256("portool-project-id-v1\0" + raw_bytes(common_dir))`. Identical
 /// across every worktree of the same project.
 pub fn project_id(common_dir: &Path) -> String {
@@ -21,7 +21,7 @@ pub fn project_id(common_dir: &Path) -> String {
     truncated_hex(&hasher.finalize())
 }
 
-/// The stable worktree identifier: the first 16 lowercase-hex characters of
+/// The stable worktree identifier: the first 32 lowercase-hex characters of
 /// `SHA-256("portool-worktree-id-v1\0" + raw_bytes(common_dir) + "\0" +
 /// raw_bytes(worktree_root))`. Unique per worktree, stable across branch
 /// checkouts.
@@ -54,8 +54,8 @@ fn truncated_hex(digest: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    fn is_lowercase_hex_16(s: &str) -> bool {
-        s.len() == 16
+    fn is_lowercase_hex_32(s: &str) -> bool {
+        s.len() == 32
             && s.chars()
                 .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
     }
@@ -64,7 +64,7 @@ mod tests {
     fn project_id_matches_known_vector() {
         assert_eq!(
             project_id(Path::new("/home/user/dev/myapp/.git")),
-            "abe4c983b7295f37"
+            "abe4c983b7295f370a207b1614878153"
         );
     }
 
@@ -75,14 +75,14 @@ mod tests {
                 Path::new("/home/user/dev/myapp/.git"),
                 Path::new("/home/user/dev/myapp")
             ),
-            "740da24128c5e2f7"
+            "740da24128c5e2f7abf4fa15ab4253f3"
         );
         assert_eq!(
             worktree_id(
                 Path::new("/home/user/dev/myapp/.git"),
                 Path::new("/home/user/dev/myapp-wt/feat-api")
             ),
-            "39c020aea86d3272"
+            "39c020aea86d32725152b538ecda3d04"
         );
     }
 
@@ -104,10 +104,10 @@ mod tests {
     }
 
     #[test]
-    fn ids_are_always_16_lowercase_hex_chars() {
+    fn ids_are_always_32_lowercase_hex_chars() {
         let common = Path::new("/home/user/dev/myapp/.git");
         let root = Path::new("/home/user/dev/myapp");
-        assert!(is_lowercase_hex_16(&project_id(common)));
-        assert!(is_lowercase_hex_16(&worktree_id(common, root)));
+        assert!(is_lowercase_hex_32(&project_id(common)));
+        assert!(is_lowercase_hex_32(&worktree_id(common, root)));
     }
 }
