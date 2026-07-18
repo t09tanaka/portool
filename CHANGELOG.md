@@ -18,9 +18,13 @@ is tokenized. **Ledger schema bumps to v4** (a v3 ledger auto-migrates).
 - **Ledger schema v4** adds a top-level monotonic `sequence`, and every
   `.env.portool` header now carries a `sequence:` field. A v3 ledger
   migrates automatically in memory and is rewritten on the next locked
-  save; a pre-0.10 `.env.portool` (no `sequence:`) keeps working and is
-  re-stamped on its next `sync`. Nothing you depend on in the CLI output
-  changes shape except the additive `ls --json` fields below.
+  save; a pre-0.10 `.env.portool` (no `sequence:`) keeps working and gains a
+  `sequence:` field the next time a slow-path `sync` rewrites it (a branch
+  change, a manifest change, or `reallocate`) — until then it is simply
+  excluded from stale-backup detection, which stays sound via the ledger's
+  own backup comparison and `doctor` reconciliation. Nothing you depend on
+  in the CLI output changes shape except the additive `ls --json` fields
+  below.
 - **`portool check` now exits non-zero on a degraded backup** — one whose
   parsed `sequence` is behind the ledger, or that is unreadable/corrupt —
   instead of only printing a warning. A missing backup (fresh ledger) is
