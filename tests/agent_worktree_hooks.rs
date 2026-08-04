@@ -298,8 +298,83 @@ fn unhook_in_a_linked_worktree_reports_the_main_worktree_hook_as_residue() {
         stdout_of(&out)
     );
     assert!(
+        !stdout_of(&out).contains("no portool hooks found"),
+        "the summary must not claim nothing was found while reporting residue, got: {}",
+        stdout_of(&out)
+    );
+    assert!(
         stderr_of(&out).contains("main worktree"),
         "must say where to run unhook, got: {}",
+        stderr_of(&out)
+    );
+}
+
+/// `init` deciding "already installed" (exit 0) must use the same line-exact
+/// test as a real install, not the loose substring heuristic `sync`'s nag
+/// uses -- otherwise a hook that merely *mentions* portool in a comment would
+/// make `init` report success while nothing actually invokes portool.
+#[test]
+fn a_hook_that_only_mentions_portool_does_not_count_as_installed() {
+    let env = Env::new();
+    let hooks_dir = env.use_relative_hooks_dir();
+    std::fs::write(
+        hooks_dir.join("post-checkout"),
+        "#!/bin/sh\n# TODO: portool sync --quiet here one day\nexit 0\n",
+    )
+    .unwrap();
+    let worktree = env.add_agent_worktree(&hooks_dir);
+
+    let out = env.portool(&worktree, &["init", "--hook-only"]);
+
+    assert!(
+        !out.status.success(),
+        "a commented-out mention must not read as installed: {}",
+        stderr_of(&out)
+    );
+    assert!(
+        stderr_of(&out).contains("main worktree"),
+        "must point at the worktree to install in, got: {}",
+        stderr_of(&out)
+    );
+}
+
+/// The relaxation is for a repository's *own* per-repo config. A `global`
+/// `core.hooksPath` is a directory every repository on the machine shares, so
+/// it keeps the scope-carrying refusal v0.9.0 made scope-independent -- even
+/// when it happens to point inside this repository's main worktree.
+#[test]
+fn a_global_hooks_path_into_the_main_worktree_keeps_the_shared_scope_refusal() {
+    let env = Env::new();
+    let hooks_dir = env.use_relative_hooks_dir();
+    let worktree = env.add_agent_worktree(&hooks_dir);
+    // Drop the per-worktree value and set the same path globally instead.
+    env.git(
+        &worktree,
+        &["config", "--worktree", "--unset", "core.hooksPath"],
+    );
+    env.git(&env.repo, &["config", "--unset", "core.hooksPath"]);
+    let global_config = env.home.join("gitconfig");
+    std::fs::write(
+        &global_config,
+        format!("[core]\n\thooksPath = {}\n", hooks_dir.display()),
+    )
+    .unwrap();
+
+    let out = env
+        .command(Path::new(env!("CARGO_BIN_EXE_portool")), &worktree)
+        .env("GIT_CONFIG_GLOBAL", &global_config)
+        .args(["init", "--hook-only"])
+        .output()
+        .unwrap();
+
+    assert!(
+        !hooks_dir.join("post-checkout").exists(),
+        "a global hooks dir must never be installed into"
+    );
+    assert!(!out.status.success(), "init must fail closed");
+    assert!(
+        stderr_of(&out).contains("resolves outside this repository"),
+        "must keep the scope-independent refusal, got: {}",
         stderr_of(&out)
     );
 }

@@ -24,9 +24,15 @@ surface changes — a v4 ledger and every `.env.portool` stay as they are.
   installable location", and `init` exited non-zero — all while the hook was
   in fact installed and allocating ports on every checkout.
 
-  An **absolute** `core.hooksPath` landing inside this repository's own main
-  worktree is now followed for detection, so `sync`, `doctor`, and `init`
-  say the same thing there as they do in the main worktree.
+  An **absolute**, per-repo (`local`/`worktree` scope) `core.hooksPath`
+  landing inside this repository's own main worktree is now followed for
+  detection, so `sync`, `doctor`, and `init` say the same thing there as they
+  do in the main worktree.
+
+- **`unhook`/`deinit` no longer print "no portool hooks found" while reporting
+  the same hook as residue.** A hook that exists but belongs to another
+  worktree of the repository is now reported as left in place, with a pointer
+  to the worktree to run the command in, instead of being silently skipped.
 
 ### Unchanged on purpose
 
@@ -40,6 +46,15 @@ surface changes — a v4 ledger and every `.env.portool` stay as they are.
   explicitly a *relative* `core.hooksPath` that `../`-escapes into the main
   worktree (git would resolve it against the cwd, so no single directory can
   be assumed).
+- v0.9.0's out-of-repo refusal stays **scope-independent**: a
+  `global`/`system`/command-line `core.hooksPath` keeps its scope-carrying
+  `SharedScope` warning even when it happens to point inside this
+  repository's main worktree, because it is still a directory every other
+  repository shares.
+- `init` decides "already installed" (exit 0) with the same line-exact test a
+  real install uses, never the substring heuristic behind `sync`'s nag — a
+  hook that merely *mentions* portool in a comment does not earn a success
+  exit.
 
 ## [0.10.0] - 2026-07-18
 

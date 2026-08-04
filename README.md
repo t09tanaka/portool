@@ -807,8 +807,9 @@ When `core.hooksPath` is set, git ignores `<git-common-dir>/hooks`, so
   (`local`/`worktree`) scope or as a repo-relative path: portool installs or
   appends `<hooksPath>/post-checkout` (and `post-merge`) there, idempotently.
 
-- **An absolute `core.hooksPath` inside this repository's *main* worktree,
-  read from a linked worktree**: the hooks belong to this same repository,
+- **An absolute, per-repo (`local`/`worktree` scope) `core.hooksPath` inside
+  this repository's *main* worktree, read from a linked worktree**: the hooks
+  belong to this same repository,
   so portool follows them — `sync` and `doctor` report the hook git actually
   runs, exactly as they would in the main worktree. `init` still doesn't
   write there (they're another checkout's files, often tracked ones): it

@@ -351,6 +351,11 @@ fn install_hook(ctx: &GitCtx) -> Result<HookOutcome> {
 ///   already being allocated and nagging would be a false alarm.
 /// - otherwise -> point at the main worktree and exit non-zero, because
 ///   nothing was wired up.
+///
+/// The "already invoking portool" test is [`is_portool_managed_hook`], not the
+/// loose [`crate::hooks::contains_portool_invocation`] heuristic: this decides
+/// an install outcome, and `init` exiting 0 while nothing actually runs is the
+/// exact failure [`finish_hook_install`] exists to prevent.
 fn install_hook_in_main_worktree(
     inner: &HooksLocation,
     main_worktree: &Path,
@@ -358,7 +363,7 @@ fn install_hook_in_main_worktree(
     let installed = inner
         .hook_file("post-checkout")
         .and_then(|path| fs::read_to_string(path).ok())
-        .is_some_and(|content| crate::hooks::contains_portool_invocation(&content));
+        .is_some_and(|content| is_portool_managed_hook(&content));
 
     if installed {
         eprintln!(
@@ -383,6 +388,22 @@ fn install_hook_in_main_worktree(
     Err(Error::General(
         "no hook was installed; see the hints above".to_string(),
     ))
+}
+
+/// True when `content` is a hook portool itself installed and git will run:
+/// its owned standalone script, or a foreign hook carrying a *valid* managed
+/// block. Line-exact, exactly like [`install_into`]'s own decisions -- unlike
+/// [`crate::hooks::contains_portool_invocation`], which is a substring
+/// heuristic fit only for warnings (a commented-out `portool sync` line, or
+/// the string in unrelated prose, would satisfy it). A malformed managed block
+/// deliberately reads as *not* installed: `install_into` refuses to rewrite
+/// one, so it needs manual repair rather than an "all good" exit 0.
+fn is_portool_managed_hook(content: &str) -> bool {
+    is_owned_standalone(content)
+        || matches!(
+            managed_block_state(content),
+            ManagedBlockState::Valid { .. }
+        )
 }
 
 /// The repository boundary a hooks location's files must stay within: the
@@ -493,9 +514,26 @@ fn remove_hooks(ctx: &GitCtx) -> Result<Vec<(&'static str, HookOutcome)>> {
     let mut results = Vec::new();
     for name in ["post-checkout", "post-merge"] {
         if let Some(path) = loc.hook_file(name) {
-            // Without a boundary the location is never one portool installs
-            // into, so there is nothing of portool's to remove there.
+            // A readable hook with no boundary to write within: the effective
+            // hooks belong to the main worktree (`MainWorktree` -- the only
+            // location that yields a hook file but no boundary). It may well
+            // still invoke portool, so it must be *reported*, not silently
+            // skipped, or the summary would claim nothing was found while
+            // `unneutralized_hooks` lists it as residue two lines later.
             let Some(boundary) = boundary.as_deref() else {
+                if hook_is_neutralized(&loc, name) {
+                    continue;
+                }
+                results.push((
+                    name,
+                    HookOutcome::ManualRequired {
+                        reason: format!(
+                            "{} belongs to another worktree of this repository and was left \
+                             untouched",
+                            path.display()
+                        ),
+                    },
+                ));
                 continue;
             };
             results.push((name, deinit_hook(boundary, &path)?));
@@ -506,14 +544,21 @@ fn remove_hooks(ctx: &GitCtx) -> Result<Vec<(&'static str, HookOutcome)>> {
 
 /// Prints a summary of `results` (from [`remove_hooks`]) that matches what
 /// actually happened: "removed" only when at least one hook's content was
-/// actually removed, "no portool hooks found" when every hook had nothing of
-/// portool's to remove, plus a warning per hook that needs manual attention.
+/// actually removed, "left in place" when portool content was found but
+/// couldn't be removed from here, "no portool hooks found" only when every
+/// hook genuinely had nothing of portool's, plus a warning per hook that needs
+/// manual attention.
 fn report_hook_removal(results: &[(&'static str, HookOutcome)]) {
-    if results
+    let removed = results
         .iter()
-        .any(|(_, outcome)| matches!(outcome, HookOutcome::Removed))
-    {
+        .any(|(_, outcome)| matches!(outcome, HookOutcome::Removed));
+    let left_in_place = results
+        .iter()
+        .any(|(_, outcome)| matches!(outcome, HookOutcome::ManualRequired { .. }));
+    if removed {
         println!("portool: removed portool's hooks");
+    } else if left_in_place {
+        println!("portool: portool's hooks were left in place; see the warnings below");
     } else {
         println!("portool: no portool hooks found");
     }

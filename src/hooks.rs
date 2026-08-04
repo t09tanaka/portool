@@ -179,6 +179,13 @@ impl HooksLocation {
 /// - a relative `core.hooksPath`: git resolves it against the process's cwd,
 ///   not a fixed root, so a `../`-escape into the main worktree can't be
 ///   given one settled meaning -- refuse rather than guess;
+/// - a value that isn't set per-repository (`local`/`worktree`). v0.9.0 made
+///   the out-of-repo refusal deliberately scope-*independent*, so a
+///   `global`/`system`/`command` value that merely happens to land inside
+///   this repository keeps its scope-carrying `SharedScope` warning: it is
+///   still a hooks dir every other repository shares. `--show-scope` predates
+///   git 2.26, so an unknown scope is refused too, matching the rest of the
+///   conservative-on-old-git behaviour.
 /// - `git worktree list` failing, or reporting a main worktree that is the
 ///   current one (nothing was escaped) or doesn't contain `resolved`.
 fn main_worktree_containing(
@@ -187,6 +194,10 @@ fn main_worktree_containing(
     raw_is_absolute: bool,
 ) -> Option<PathBuf> {
     if !raw_is_absolute {
+        return None;
+    }
+    let scope = gitctx::config_scope(&ctx.worktree_root, "core.hooksPath")?;
+    if scope != "local" && scope != "worktree" {
         return None;
     }
     // `git worktree list` reports the main worktree first, always.
