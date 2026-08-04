@@ -57,6 +57,22 @@ pub enum HooksLocation {
         configured: String,
         resolved: PathBuf,
     },
+    /// An absolute `core.hooksPath` that resolves inside this repository's
+    /// *main* worktree while `ctx` is a linked worktree. Agent harnesses
+    /// write exactly this shape into a linked worktree's `config.worktree`
+    /// when they absolutize a repo-relative `core.hooksPath` (Husky,
+    /// lefthook, ...), because git resolves a relative value against the
+    /// process's cwd and it would otherwise miss from a linked worktree.
+    /// Git *does* run those hooks for this worktree, so detection follows
+    /// them via `inner`; installing/removing never does, because they are
+    /// another checkout's files.
+    MainWorktree {
+        /// How the path classifies when rooted at the main worktree --
+        /// `Husky`, `Custom`, or `Missing`. Never itself `MainWorktree`.
+        inner: Box<HooksLocation>,
+        /// The main worktree root the hooks directory lives under.
+        main_worktree: PathBuf,
+    },
     /// `core.hooksPath` resolves (after canonicalization) to a directory
     /// outside this repository -- whatever scope set it, and however it
     /// escaped (absolute path, relative `../`, or a symlink). Auto-installing
@@ -84,12 +100,18 @@ impl HooksLocation {
     /// shared dir cannot slip through by looking like Husky's `.husky/_`
     /// (external review P1 #3, hardened further to close relative/symlink
     /// escapes and non-global scopes).
+    ///
+    /// The one relaxation is [`HooksLocation::MainWorktree`]: an *absolute*
+    /// value landing inside this repository's own main worktree, seen from
+    /// a linked worktree, is the same repository's hooks -- so it is
+    /// followed for detection, never written to.
     pub fn resolve(ctx: &GitCtx) -> HooksLocation {
         let configured = gitctx::config_path_value(&ctx.worktree_root, "core.hooksPath");
 
         if let Some(value) = configured.as_deref().filter(|v| !v.trim().is_empty()) {
             let raw = PathBuf::from(value);
-            let resolved = if raw.is_absolute() {
+            let raw_is_absolute = raw.is_absolute();
+            let resolved = if raw_is_absolute {
                 raw
             } else {
                 ctx.worktree_root.join(raw)
@@ -105,6 +127,18 @@ impl HooksLocation {
             let canonical = canonicalize_existing_ancestor(&resolved);
 
             if !is_inside_repo(&canonical, &ctx.worktree_root, &ctx.common_dir) {
+                if let Some(main_worktree) =
+                    main_worktree_containing(ctx, &canonical, raw_is_absolute)
+                {
+                    return HooksLocation::MainWorktree {
+                        inner: Box::new(classify(
+                            Some(value.to_string()),
+                            &main_worktree,
+                            &ctx.common_dir,
+                        )),
+                        main_worktree,
+                    };
+                }
                 let scope = gitctx::config_scope(&ctx.worktree_root, "core.hooksPath");
                 return HooksLocation::SharedScope {
                     configured: value.to_string(),
@@ -128,9 +162,42 @@ impl HooksLocation {
             // The stored path is `<.husky>/post-checkout`; sibling hooks
             // live next to it (`<.husky>/post-merge`, ...).
             HooksLocation::Husky { hook_file } => hook_file.parent().map(|dir| dir.join(name)),
+            // Git runs the main worktree's hook for this worktree too, so
+            // *reading* it is how `sync`/`doctor` see the truth; the callers
+            // that write (`init`/`unhook`) gate on the boundary instead.
+            HooksLocation::MainWorktree { inner, .. } => inner.hook_file(name),
             HooksLocation::Missing { .. } | HooksLocation::SharedScope { .. } => None,
         }
     }
+}
+
+/// The repository's main worktree, when `resolved` lives inside it and `ctx`
+/// is one of its *linked* worktrees -- the [`HooksLocation::MainWorktree`]
+/// shape. `None` (i.e. keep [`HooksLocation::SharedScope`]) for every case
+/// that isn't provably the same repository's own hooks:
+///
+/// - a relative `core.hooksPath`: git resolves it against the process's cwd,
+///   not a fixed root, so a `../`-escape into the main worktree can't be
+///   given one settled meaning -- refuse rather than guess;
+/// - `git worktree list` failing, or reporting a main worktree that is the
+///   current one (nothing was escaped) or doesn't contain `resolved`.
+fn main_worktree_containing(
+    ctx: &GitCtx,
+    resolved: &Path,
+    raw_is_absolute: bool,
+) -> Option<PathBuf> {
+    if !raw_is_absolute {
+        return None;
+    }
+    // `git worktree list` reports the main worktree first, always.
+    let main_worktree = gitctx::worktree_list_at(&ctx.worktree_root)
+        .ok()?
+        .into_iter()
+        .next()?;
+    if main_worktree == ctx.worktree_root || !resolved.starts_with(&main_worktree) {
+        return None;
+    }
+    Some(main_worktree)
 }
 
 /// Pure classification of a raw `core.hooksPath` value (spec: relative
@@ -324,6 +391,49 @@ mod tests {
         );
 
         assert_eq!(loc, HooksLocation::Custom { hooks_dir: hooks });
+    }
+
+    /// `MainWorktree` exists so `sync`/`doctor` read the hook git actually
+    /// runs; that means `hook_file` must see straight through to the inner
+    /// classification, for both the Husky and the plain-directory shape.
+    #[test]
+    fn main_worktree_hook_file_delegates_to_the_inner_location() {
+        for (inner, expected) in [
+            (
+                HooksLocation::Custom {
+                    hooks_dir: PathBuf::from("/work/repo/.husky/tracked"),
+                },
+                "/work/repo/.husky/tracked/post-merge",
+            ),
+            (
+                HooksLocation::Husky {
+                    hook_file: PathBuf::from("/work/repo/.husky/post-checkout"),
+                },
+                "/work/repo/.husky/post-merge",
+            ),
+        ] {
+            let loc = HooksLocation::MainWorktree {
+                inner: Box::new(inner),
+                main_worktree: root(),
+            };
+            assert_eq!(loc.hook_file("post-merge"), Some(PathBuf::from(expected)));
+        }
+    }
+
+    /// A `MainWorktree` whose inner classification has nowhere to install
+    /// (the hooks dir vanished) must stay uninstallable, not fall back to
+    /// git's default dir.
+    #[test]
+    fn main_worktree_wrapping_a_missing_dir_has_no_hook_file() {
+        let loc = HooksLocation::MainWorktree {
+            inner: Box::new(HooksLocation::Missing {
+                configured: "/work/repo/gone".to_string(),
+                resolved: PathBuf::from("/work/repo/gone"),
+            }),
+            main_worktree: root(),
+        };
+
+        assert_eq!(loc.hook_file("post-checkout"), None);
     }
 
     #[test]

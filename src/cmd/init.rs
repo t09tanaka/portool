@@ -248,9 +248,10 @@ fn finish_hook_install(outcome: HookOutcome) -> Result<()> {
 
 /// Installs portool's hooks where git will actually run them. When that's
 /// nowhere safe -- a `core.hooksPath` dir that doesn't exist / isn't Husky's
-/// (`Missing`), or one that resolves outside the repository regardless of
-/// scope (`SharedScope`) -- it warns with the manual line instead of
-/// writing.
+/// (`Missing`), one that resolves outside the repository regardless of scope
+/// (`SharedScope`), or this repository's own main worktree seen from a
+/// linked one (`MainWorktree`) -- it warns with the manual line, or points
+/// at the worktree that owns those files, instead of writing.
 fn install_hook(ctx: &GitCtx) -> Result<HookOutcome> {
     let loc = HooksLocation::resolve(ctx);
     match &loc {
@@ -291,6 +292,10 @@ fn install_hook(ctx: &GitCtx) -> Result<HookOutcome> {
             );
             Ok(outcome)
         }
+        HooksLocation::MainWorktree {
+            inner,
+            main_worktree,
+        } => install_hook_in_main_worktree(inner, main_worktree),
         HooksLocation::Missing {
             configured,
             resolved,
@@ -334,6 +339,52 @@ fn install_hook(ctx: &GitCtx) -> Result<HookOutcome> {
     }
 }
 
+/// Handles `init` for a [`HooksLocation::MainWorktree`]: the effective hooks
+/// belong to this repository's main worktree, so git already runs them here
+/// and there is nothing to install *in this worktree*. Writing into another
+/// checkout's files (a tracked `.husky/post-checkout`, say) from a linked
+/// worktree is never portool's call, so this only reports:
+///
+/// - hook already invoking portool -> `AlreadyCurrent`, `init` exits 0. This
+///   is the common case for agent-created worktrees, whose harness copies the
+///   main worktree's `core.hooksPath` in absolute form -- the ports are
+///   already being allocated and nagging would be a false alarm.
+/// - otherwise -> point at the main worktree and exit non-zero, because
+///   nothing was wired up.
+fn install_hook_in_main_worktree(
+    inner: &HooksLocation,
+    main_worktree: &Path,
+) -> Result<HookOutcome> {
+    let installed = inner
+        .hook_file("post-checkout")
+        .and_then(|path| fs::read_to_string(path).ok())
+        .is_some_and(|content| crate::hooks::contains_portool_invocation(&content));
+
+    if installed {
+        eprintln!(
+            "portool: core.hooksPath points at this repository's main worktree ({}), \
+             where portool's post-checkout hook is already installed; git runs it for \
+             this worktree too, so there is nothing to do here",
+            crate::display::path(main_worktree)
+        );
+        return Ok(HookOutcome::AlreadyCurrent);
+    }
+
+    eprintln!(
+        "warning: core.hooksPath points at this repository's main worktree ({}); \
+         portool does not write into another checkout's files from a linked worktree, \
+         so nothing was installed",
+        crate::display::path(main_worktree)
+    );
+    eprintln!(
+        "hint: run 'portool init' once in that worktree -- git then runs the hook for \
+         every worktree of this repository, including this one"
+    );
+    Err(Error::General(
+        "no hook was installed; see the hints above".to_string(),
+    ))
+}
+
 /// The repository boundary a hooks location's files must stay within: the
 /// worktree root for Husky (`.husky/...`), the common dir (or worktree, for a
 /// relative custom path) for git's default/custom hooks dir. Both roots are
@@ -353,7 +404,23 @@ fn hook_boundary(loc: &HooksLocation, ctx: &GitCtx) -> Option<PathBuf> {
                 None
             }
         }
-        HooksLocation::Missing { .. } | HooksLocation::SharedScope { .. } => None,
+        // Another checkout's files: readable for detection, never written.
+        HooksLocation::MainWorktree { .. }
+        | HooksLocation::Missing { .. }
+        | HooksLocation::SharedScope { .. } => None,
+    }
+}
+
+/// Explains a hook that `unhook`/`deinit` could not neutralize because it
+/// lives in this repository's main worktree: removal has to happen there.
+/// Silent for every other location.
+fn hint_hooks_owned_by_main_worktree(loc: &HooksLocation) {
+    if let HooksLocation::MainWorktree { main_worktree, .. } = loc {
+        eprintln!(
+            "hint: this worktree's core.hooksPath points at the main worktree ({}); \
+             run 'portool unhook' (or 'portool deinit') there to remove the hook",
+            crate::display::path(main_worktree)
+        );
     }
 }
 
@@ -373,6 +440,7 @@ pub fn unhook() -> Result<()> {
     if residue.is_empty() {
         Ok(())
     } else {
+        hint_hooks_owned_by_main_worktree(&loc);
         println!(
             "{{\"partial_unhook\":{{\"residue\":{}}}}}",
             serde_json::to_string(&residue).expect("residue serializes")
@@ -493,6 +561,9 @@ pub fn deinit(keep_allocations: bool) -> Result<()> {
 
     // 2. Verify each hook is actually neutralized before touching allocations.
     let hooks_neutralized = unneutralized_hooks(&loc);
+    if !hooks_neutralized.is_empty() {
+        hint_hooks_owned_by_main_worktree(&loc);
+    }
     residue.extend(hooks_neutralized.iter().cloned());
 
     if !keep_allocations {
