@@ -5,6 +5,57 @@ All notable changes to portool are documented here. The format is based on
 [Semantic Versioning](https://semver.org/) (pre-1.0: a breaking change bumps
 the minor version).
 
+## [0.10.1] - 2026-08-04
+
+A detection fix for agent-created worktrees. No schema, file-format, or CLI
+surface changes — a v4 ledger and every `.env.portool` stay as they are.
+
+### Fixed
+
+- **A linked worktree whose `core.hooksPath` points at the main worktree is
+  no longer reported as uninstalled.** Agent harnesses that check worktrees
+  out for you (Claude Code's task chips / `EnterWorktree`, under
+  `.claude/worktrees/<name>`) copy a repo-relative `core.hooksPath` (Husky,
+  lefthook, …) into the new worktree's `config.worktree` in **absolute**
+  form — they have to, since git resolves a relative value against the
+  process's cwd. portool classified that as a hooks directory outside the
+  repository and refused it, so from those worktrees `sync` nagged "run
+  'portool init' to install the post-checkout hook", `doctor` reported "no
+  installable location", and `init` exited non-zero — all while the hook was
+  in fact installed and allocating ports on every checkout.
+
+  An **absolute**, per-repo (`local`/`worktree` scope) `core.hooksPath`
+  landing inside this repository's own main worktree is now followed for
+  detection, so `sync`, `doctor`, and `init` say the same thing there as they
+  do in the main worktree.
+
+- **`unhook`/`deinit` no longer print "no portool hooks found" while reporting
+  the same hook as residue.** A hook that exists but belongs to another
+  worktree of the repository is now reported as left in place, with a pointer
+  to the worktree to run the command in, instead of being silently skipped.
+
+### Unchanged on purpose
+
+- portool still never **writes** into another checkout's files from a linked
+  worktree: `init` exits 0 ("nothing to do here") when the main worktree's
+  hook already invokes portool, and otherwise points at that worktree
+  instead of installing; `unhook`/`deinit` report the hook as residue (with
+  the same pointer) rather than editing it.
+- Every other escape stays refused exactly as before — a hooks directory
+  outside the repository in any config scope, a symlink escape, and now
+  explicitly a *relative* `core.hooksPath` that `../`-escapes into the main
+  worktree (git would resolve it against the cwd, so no single directory can
+  be assumed).
+- v0.9.0's out-of-repo refusal stays **scope-independent**: a
+  `global`/`system`/command-line `core.hooksPath` keeps its scope-carrying
+  `SharedScope` warning even when it happens to point inside this
+  repository's main worktree, because it is still a directory every other
+  repository shares.
+- `init` decides "already installed" (exit 0) with the same line-exact test a
+  real install uses, never the substring heuristic behind `sync`'s nag — a
+  hook that merely *mentions* portool in a comment does not earn a success
+  exit.
+
 ## [0.10.0] - 2026-07-18
 
 The 5th-round external review's seven P0 items: hook writes become

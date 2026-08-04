@@ -248,9 +248,10 @@ fn finish_hook_install(outcome: HookOutcome) -> Result<()> {
 
 /// Installs portool's hooks where git will actually run them. When that's
 /// nowhere safe -- a `core.hooksPath` dir that doesn't exist / isn't Husky's
-/// (`Missing`), or one that resolves outside the repository regardless of
-/// scope (`SharedScope`) -- it warns with the manual line instead of
-/// writing.
+/// (`Missing`), one that resolves outside the repository regardless of scope
+/// (`SharedScope`), or this repository's own main worktree seen from a
+/// linked one (`MainWorktree`) -- it warns with the manual line, or points
+/// at the worktree that owns those files, instead of writing.
 fn install_hook(ctx: &GitCtx) -> Result<HookOutcome> {
     let loc = HooksLocation::resolve(ctx);
     match &loc {
@@ -291,6 +292,10 @@ fn install_hook(ctx: &GitCtx) -> Result<HookOutcome> {
             );
             Ok(outcome)
         }
+        HooksLocation::MainWorktree {
+            inner,
+            main_worktree,
+        } => install_hook_in_main_worktree(inner, main_worktree),
         HooksLocation::Missing {
             configured,
             resolved,
@@ -334,6 +339,73 @@ fn install_hook(ctx: &GitCtx) -> Result<HookOutcome> {
     }
 }
 
+/// Handles `init` for a [`HooksLocation::MainWorktree`]: the effective hooks
+/// belong to this repository's main worktree, so git already runs them here
+/// and there is nothing to install *in this worktree*. Writing into another
+/// checkout's files (a tracked `.husky/post-checkout`, say) from a linked
+/// worktree is never portool's call, so this only reports:
+///
+/// - hook already invoking portool -> `AlreadyCurrent`, `init` exits 0. This
+///   is the common case for agent-created worktrees, whose harness copies the
+///   main worktree's `core.hooksPath` in absolute form -- the ports are
+///   already being allocated and nagging would be a false alarm.
+/// - otherwise -> point at the main worktree and exit non-zero, because
+///   nothing was wired up.
+///
+/// The "already invoking portool" test is [`is_portool_managed_hook`], not the
+/// loose [`crate::hooks::contains_portool_invocation`] heuristic: this decides
+/// an install outcome, and `init` exiting 0 while nothing actually runs is the
+/// exact failure [`finish_hook_install`] exists to prevent.
+fn install_hook_in_main_worktree(
+    inner: &HooksLocation,
+    main_worktree: &Path,
+) -> Result<HookOutcome> {
+    let installed = inner
+        .hook_file("post-checkout")
+        .and_then(|path| fs::read_to_string(path).ok())
+        .is_some_and(|content| is_portool_managed_hook(&content));
+
+    if installed {
+        eprintln!(
+            "portool: core.hooksPath points at this repository's main worktree ({}), \
+             where portool's post-checkout hook is already installed; git runs it for \
+             this worktree too, so there is nothing to do here",
+            crate::display::path(main_worktree)
+        );
+        return Ok(HookOutcome::AlreadyCurrent);
+    }
+
+    eprintln!(
+        "warning: core.hooksPath points at this repository's main worktree ({}); \
+         portool does not write into another checkout's files from a linked worktree, \
+         so nothing was installed",
+        crate::display::path(main_worktree)
+    );
+    eprintln!(
+        "hint: run 'portool init' once in that worktree -- git then runs the hook for \
+         every worktree of this repository, including this one"
+    );
+    Err(Error::General(
+        "no hook was installed; see the hints above".to_string(),
+    ))
+}
+
+/// True when `content` is a hook portool itself installed and git will run:
+/// its owned standalone script, or a foreign hook carrying a *valid* managed
+/// block. Line-exact, exactly like [`install_into`]'s own decisions -- unlike
+/// [`crate::hooks::contains_portool_invocation`], which is a substring
+/// heuristic fit only for warnings (a commented-out `portool sync` line, or
+/// the string in unrelated prose, would satisfy it). A malformed managed block
+/// deliberately reads as *not* installed: `install_into` refuses to rewrite
+/// one, so it needs manual repair rather than an "all good" exit 0.
+fn is_portool_managed_hook(content: &str) -> bool {
+    is_owned_standalone(content)
+        || matches!(
+            managed_block_state(content),
+            ManagedBlockState::Valid { .. }
+        )
+}
+
 /// The repository boundary a hooks location's files must stay within: the
 /// worktree root for Husky (`.husky/...`), the common dir (or worktree, for a
 /// relative custom path) for git's default/custom hooks dir. Both roots are
@@ -353,7 +425,23 @@ fn hook_boundary(loc: &HooksLocation, ctx: &GitCtx) -> Option<PathBuf> {
                 None
             }
         }
-        HooksLocation::Missing { .. } | HooksLocation::SharedScope { .. } => None,
+        // Another checkout's files: readable for detection, never written.
+        HooksLocation::MainWorktree { .. }
+        | HooksLocation::Missing { .. }
+        | HooksLocation::SharedScope { .. } => None,
+    }
+}
+
+/// Explains a hook that `unhook`/`deinit` could not neutralize because it
+/// lives in this repository's main worktree: removal has to happen there.
+/// Silent for every other location.
+fn hint_hooks_owned_by_main_worktree(loc: &HooksLocation) {
+    if let HooksLocation::MainWorktree { main_worktree, .. } = loc {
+        eprintln!(
+            "hint: this worktree's core.hooksPath points at the main worktree ({}); \
+             run 'portool unhook' (or 'portool deinit') there to remove the hook",
+            crate::display::path(main_worktree)
+        );
     }
 }
 
@@ -373,6 +461,7 @@ pub fn unhook() -> Result<()> {
     if residue.is_empty() {
         Ok(())
     } else {
+        hint_hooks_owned_by_main_worktree(&loc);
         println!(
             "{{\"partial_unhook\":{{\"residue\":{}}}}}",
             serde_json::to_string(&residue).expect("residue serializes")
@@ -425,9 +514,26 @@ fn remove_hooks(ctx: &GitCtx) -> Result<Vec<(&'static str, HookOutcome)>> {
     let mut results = Vec::new();
     for name in ["post-checkout", "post-merge"] {
         if let Some(path) = loc.hook_file(name) {
-            // Without a boundary the location is never one portool installs
-            // into, so there is nothing of portool's to remove there.
+            // A readable hook with no boundary to write within: the effective
+            // hooks belong to the main worktree (`MainWorktree` -- the only
+            // location that yields a hook file but no boundary). It may well
+            // still invoke portool, so it must be *reported*, not silently
+            // skipped, or the summary would claim nothing was found while
+            // `unneutralized_hooks` lists it as residue two lines later.
             let Some(boundary) = boundary.as_deref() else {
+                if hook_is_neutralized(&loc, name) {
+                    continue;
+                }
+                results.push((
+                    name,
+                    HookOutcome::ManualRequired {
+                        reason: format!(
+                            "{} belongs to another worktree of this repository and was left \
+                             untouched",
+                            path.display()
+                        ),
+                    },
+                ));
                 continue;
             };
             results.push((name, deinit_hook(boundary, &path)?));
@@ -438,14 +544,21 @@ fn remove_hooks(ctx: &GitCtx) -> Result<Vec<(&'static str, HookOutcome)>> {
 
 /// Prints a summary of `results` (from [`remove_hooks`]) that matches what
 /// actually happened: "removed" only when at least one hook's content was
-/// actually removed, "no portool hooks found" when every hook had nothing of
-/// portool's to remove, plus a warning per hook that needs manual attention.
+/// actually removed, "left in place" when portool content was found but
+/// couldn't be removed from here, "no portool hooks found" only when every
+/// hook genuinely had nothing of portool's, plus a warning per hook that needs
+/// manual attention.
 fn report_hook_removal(results: &[(&'static str, HookOutcome)]) {
-    if results
+    let removed = results
         .iter()
-        .any(|(_, outcome)| matches!(outcome, HookOutcome::Removed))
-    {
+        .any(|(_, outcome)| matches!(outcome, HookOutcome::Removed));
+    let left_in_place = results
+        .iter()
+        .any(|(_, outcome)| matches!(outcome, HookOutcome::ManualRequired { .. }));
+    if removed {
         println!("portool: removed portool's hooks");
+    } else if left_in_place {
+        println!("portool: portool's hooks were left in place; see the warnings below");
     } else {
         println!("portool: no portool hooks found");
     }
@@ -493,6 +606,9 @@ pub fn deinit(keep_allocations: bool) -> Result<()> {
 
     // 2. Verify each hook is actually neutralized before touching allocations.
     let hooks_neutralized = unneutralized_hooks(&loc);
+    if !hooks_neutralized.is_empty() {
+        hint_hooks_owned_by_main_worktree(&loc);
+    }
     residue.extend(hooks_neutralized.iter().cloned());
 
     if !keep_allocations {
