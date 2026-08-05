@@ -63,4 +63,12 @@ jobs:
       - name: Attach to release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" --clobber
+        run: |
+          set -euo pipefail
+          # A tag push can outrun the release that `gh release create` is about
+          # to make for it. Wait for the release instead of failing the build.
+          for _ in $(seq 1 30); do
+            gh release view "$TAG" >/dev/null 2>&1 && break
+            sleep 10
+          done
+          gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" --clobber
