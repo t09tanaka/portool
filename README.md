@@ -56,7 +56,7 @@ tarballs are published for macOS (Apple Silicon / Intel) and Linux
 (x86_64 / arm64), each with a `.sha256` next to it:
 
 ```sh
-tar -xzf portool-v0.10.1-aarch64-apple-darwin.tar.gz
+tar -xzf portool-v0.10.2-aarch64-apple-darwin.tar.gz
 install -m 755 portool /usr/local/bin/
 ```
 
