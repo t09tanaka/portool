@@ -46,14 +46,91 @@ pub fn parse_env_file(path: &Path) -> Result<Vec<(String, FileValue)>> {
     let source = match std::fs::read_to_string(path) {
         Ok(source) => source,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Err(Error::General(format!(
-                "env file not found: {}",
-                path.display()
-            )));
+            let message = match std::env::current_dir() {
+                Ok(cwd) => missing_env_file_message(path, &cwd),
+                Err(_) => format!("env file not found: {}", path.display()),
+            };
+            return Err(Error::General(message));
         }
         Err(err) => return Err(err.into()),
     };
     parse_env_str(&source, &path.display().to_string())
+}
+
+/// How many `.env*` candidates a missing-file error lists at most.
+const MAX_CANDIDATES: usize = 5;
+
+/// Builds the error for an `-e` path that does not exist. Agents and
+/// humans alike pass a profile name (`-e dev`) or a file that is not there
+/// (`-e .env`), so beyond the path itself the message says what `-e`
+/// expects and lists the `.env*` files that *are* in `cwd`. Only file
+/// names are shown, never contents. `.env.portool` is left out: portool
+/// injects its variables anyway, so pointing at it would not help.
+fn missing_env_file_message(path: &Path, cwd: &Path) -> String {
+    let mut message = format!(
+        "env file not found: {}\n  -e/--env-file takes the path of an env file, relative to the \
+         current directory ({}) or absolute",
+        path.display(),
+        cwd.display()
+    );
+
+    let candidates = env_file_candidates(cwd);
+
+    // A bare word such as `dev` or `test` is almost certainly meant as a
+    // profile name; portool has no profiles, so point at a matching file.
+    let raw = path.to_string_lossy();
+    let looks_like_profile =
+        !raw.is_empty() && !raw.contains(['/', '\\', '.']) && path.components().count() == 1;
+    if looks_like_profile {
+        let guess = format!(".env.{raw}");
+        if candidates.contains(&guess) {
+            message.push_str(&format!(
+                "\n  '{raw}' looks like a profile name; did you mean -e {guess}?"
+            ));
+        } else {
+            message.push_str(&format!(
+                "\n  '{raw}' looks like a profile name, but -e takes a file path, not a name"
+            ));
+        }
+    }
+
+    if candidates.is_empty() {
+        message.push_str("\n  no .env* files in the current directory");
+    } else {
+        let shown: Vec<&str> = candidates
+            .iter()
+            .take(MAX_CANDIDATES)
+            .map(String::as_str)
+            .collect();
+        message.push_str(&format!(
+            "\n  env files in the current directory: {}",
+            shown.join(", ")
+        ));
+        if candidates.len() > MAX_CANDIDATES {
+            message.push_str(&format!(
+                " (and {} more)",
+                candidates.len() - MAX_CANDIDATES
+            ));
+        }
+    }
+    message
+}
+
+/// Regular files in `dir` whose names start with `.env`, sorted by name,
+/// excluding portool's generated `.env.portool`. Unreadable directories
+/// and non-UTF-8 names are skipped silently: this only feeds a hint.
+fn env_file_candidates(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_file())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.starts_with(".env") && name != ".env.portool")
+        .collect();
+    names.sort();
+    names
 }
 
 /// Parses env file source text. Lines are split on `\n` with a trailing
@@ -467,10 +544,96 @@ mod tests {
     #[test]
     fn parse_env_file_not_found() {
         let err = parse_env_file(Path::new("/nonexistent/portool-test.env")).unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "env file not found: /nonexistent/portool-test.env"
+        assert!(
+            err.to_string()
+                .starts_with("env file not found: /nonexistent/portool-test.env\n"),
+            "message was: {err}"
         );
+    }
+
+    fn touch(dir: &Path, name: &str) {
+        std::fs::write(dir.join(name), "").unwrap();
+    }
+
+    #[test]
+    fn missing_message_explains_path_and_lists_sorted_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), ".env.test");
+        touch(dir.path(), ".env");
+        touch(dir.path(), ".env.portool");
+        touch(dir.path(), "README.md");
+        std::fs::create_dir(dir.path().join(".env.d")).unwrap();
+
+        let msg = missing_env_file_message(Path::new(".env.local"), dir.path());
+        let lines: Vec<&str> = msg.lines().collect();
+        assert_eq!(lines[0], "env file not found: .env.local");
+        assert_eq!(
+            lines[1],
+            format!(
+                "  -e/--env-file takes the path of an env file, relative to the current \
+                 directory ({}) or absolute",
+                dir.path().display()
+            )
+        );
+        assert_eq!(
+            lines[2],
+            "  env files in the current directory: .env, .env.test"
+        );
+        assert_eq!(lines.len(), 3, "a dotted path is not a profile name: {msg}");
+    }
+
+    #[test]
+    fn missing_message_caps_candidates_at_five() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            ".env", ".env.a", ".env.b", ".env.c", ".env.d", ".env.e", ".env.f",
+        ] {
+            touch(dir.path(), name);
+        }
+        let msg = missing_env_file_message(Path::new("missing.env"), dir.path());
+        assert!(
+            msg.ends_with(
+                "env files in the current directory: .env, .env.a, .env.b, .env.c, .env.d \
+                 (and 2 more)"
+            ),
+            "message was: {msg}"
+        );
+    }
+
+    #[test]
+    fn missing_message_without_candidates_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let msg = missing_env_file_message(Path::new("/abs/missing.env"), dir.path());
+        assert!(
+            msg.ends_with("\n  no .env* files in the current directory"),
+            "message was: {msg}"
+        );
+        assert!(!msg.contains("profile"), "message was: {msg}");
+    }
+
+    #[test]
+    fn profile_name_points_at_matching_env_file() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), ".env.dev");
+        let msg = missing_env_file_message(Path::new("dev"), dir.path());
+        assert!(
+            msg.contains("\n  'dev' looks like a profile name; did you mean -e .env.dev?\n"),
+            "message was: {msg}"
+        );
+    }
+
+    #[test]
+    fn profile_name_without_matching_file_says_e_takes_a_path() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), ".env");
+        let msg = missing_env_file_message(Path::new("test"), dir.path());
+        assert!(
+            msg.contains(
+                "\n  'test' looks like a profile name, but -e takes a file path, not a name\n"
+            ),
+            "message was: {msg}"
+        );
+        assert!(!msg.contains("did you mean"), "message was: {msg}");
     }
 
     // --- expansion ---

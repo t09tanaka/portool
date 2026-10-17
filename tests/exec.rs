@@ -896,6 +896,38 @@ fn exec_missing_env_file_exits_1() {
     );
 }
 
+/// A bare profile-like value (`-e dev`) gets a hint: what `-e` expects and
+/// the `.env*` files actually present in the cwd. Only names are shown.
+#[test]
+fn exec_missing_env_file_hints_at_path_and_candidates() {
+    let env = TestEnv::new();
+    let repo = env.path("repo");
+    init_repo(&repo);
+    fs::write(repo.join(".env"), "SECRET_VALUE=hunter2\n").unwrap();
+    fs::write(repo.join(".env.test"), "A=1\n").unwrap();
+
+    let output = env.run(&repo, &["exec", "-e", "dev", "--", "touch", "marker"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for expected in [
+        "env file not found: dev",
+        "-e/--env-file takes the path of an env file, relative to the current directory",
+        "'dev' looks like a profile name, but -e takes a file path, not a name",
+        "env files in the current directory: .env, .env.test",
+    ] {
+        assert!(
+            stderr.contains(expected),
+            "missing {expected:?} in: {stderr}"
+        );
+    }
+    assert!(
+        !stderr.contains("hunter2"),
+        "file contents must not leak: {stderr}"
+    );
+    assert!(!repo.join("marker").exists());
+}
+
 // --- 25. missing command is a usage error ------------------------------------------------------------------------
 
 /// Spec §4: `--` is mandatory and a command must follow it; both omissions
