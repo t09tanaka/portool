@@ -896,6 +896,91 @@ fn exec_missing_env_file_exits_1() {
     );
 }
 
+/// A bare profile-like value (`-e dev`) gets a hint: what `-e` expects and
+/// the `.env*` files actually present in the cwd. Only names are shown.
+#[test]
+fn exec_missing_env_file_hints_at_path_and_candidates() {
+    let env = TestEnv::new();
+    let repo = env.path("repo");
+    init_repo(&repo);
+    fs::write(repo.join(".env"), "SECRET_VALUE=hunter2\n").unwrap();
+    fs::write(repo.join(".env.test"), "A=1\n").unwrap();
+
+    let output = env.run(&repo, &["exec", "-e", "dev", "--", "touch", "marker"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for expected in [
+        "env file not found: dev",
+        "-e/--env-file takes the path of an env file, relative to the current directory",
+        "'dev' looks like a profile name, but -e takes a file path, not a name",
+        "env files in the current directory: .env, .env.test",
+    ] {
+        assert!(
+            stderr.contains(expected),
+            "missing {expected:?} in: {stderr}"
+        );
+    }
+    assert!(
+        !stderr.contains("hunter2"),
+        "file contents must not leak: {stderr}"
+    );
+    assert!(!repo.join("marker").exists());
+}
+
+/// `--env-file-overrides` takes no value. Passing a file after it is clap's
+/// generic "unexpected argument" usage error (exit 64); portool appends a
+/// hint pointing at `-e` only when the stray value looks like an env file.
+#[test]
+fn exec_env_file_overrides_with_a_value_hints_at_e() {
+    let env = TestEnv::new();
+    let repo = env.path("repo");
+    init_repo(&repo);
+    fs::write(repo.join("vars.env"), "A=1\n").unwrap();
+
+    let hint = "hint: --env-file-overrides takes no value; pass env files with -e";
+    for value in [".env.test", "vars.env"] {
+        let output = env.run(
+            &repo,
+            &[
+                "exec",
+                "--env-file-overrides",
+                value,
+                "--",
+                "touch",
+                "marker",
+            ],
+        );
+        assert_eq!(output.status.code(), Some(64));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!("unexpected argument '{value}' found")),
+            "clap's own error must stay: {stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("{hint}: -e {value} --env-file-overrides")),
+            "missing hint for {value}: {stderr}"
+        );
+        assert!(!repo.join("marker").exists());
+    }
+
+    // A stray value that is neither `.env*` nor an existing file, or one
+    // that doesn't follow the flag, gets clap's error alone.
+    for args in [
+        &["exec", "--env-file-overrides", "nonsense", "--", "true"][..],
+        &["exec", "--check-ports", ".env.test", "--", "true"][..],
+    ] {
+        let output = env.run(&repo, args);
+        assert_eq!(output.status.code(), Some(64));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("unexpected argument"), "stderr: {stderr}");
+        assert!(
+            !stderr.contains("hint:"),
+            "no hint expected for {args:?}: {stderr}"
+        );
+    }
+}
+
 // --- 25. missing command is a usage error ------------------------------------------------------------------------
 
 /// Spec §4: `--` is mandatory and a command must follow it; both omissions

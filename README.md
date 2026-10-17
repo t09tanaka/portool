@@ -215,7 +215,9 @@ Expansion rules:
 [Quick start](#quick-start)); without one you get a single `PORT`
 variable, same as `sync`. Env-file paths are resolved relative to the
 current working directory, and a missing file is an error — nothing
-(`.env`, `.env.test`, …) is ever read implicitly.
+(`.env`, `.env.test`, …) is ever read implicitly. `-e` takes a file path,
+not a profile name: `-e dev` fails, and the error lists the `.env*` files
+in the current directory (pointing at `.env.dev` if it exists).
 
 **Execution-boundary check (opt-in).** `exec` can bind-check the allocated
 block on `127.0.0.1` right after syncing — the one moment it's worth

@@ -72,6 +72,8 @@ enum Command {
     /// Run a command with the worktree's allocated ports in its environment.
     Exec {
         /// Env file(s) to load, in order; later files override earlier ones.
+        /// Each is a file path (relative to the current directory, or
+        /// absolute), not a profile name.
         #[arg(short = 'e', long = "env-file", value_name = "PATH")]
         env_file: Vec<std::path::PathBuf>,
         /// Warn if the allocated block's ports are already in use (advisory
@@ -89,7 +91,8 @@ enum Command {
         #[arg(long)]
         reallocate_on_conflict: bool,
         /// Let the given env files override inherited environment variables
-        /// (default: the parent environment wins over env files).
+        /// (default: the parent environment wins over env files). A plain
+        /// flag that takes no value; name the files with -e <PATH>.
         #[arg(long)]
         env_file_overrides: bool,
         /// The command to run (everything after `--`).
@@ -161,6 +164,34 @@ enum Command {
     Unpin,
 }
 
+/// `--env-file-overrides` is a plain flag, but it reads like it names a
+/// file: `--env-file-overrides .env.test -- cmd` leaves `.env.test` over and
+/// clap reports only a generic "unexpected argument". When the stray value
+/// directly follows the flag and looks like an env file (starts with `.env`
+/// or exists), add a hint pointing at `-e`. Every other error is untouched.
+fn env_file_overrides_value_hint(err: &clap::Error) -> Option<String> {
+    use clap::error::{ContextKind, ContextValue};
+
+    if err.kind() != clap::error::ErrorKind::UnknownArgument {
+        return None;
+    }
+    let Some(ContextValue::String(stray)) = err.get(ContextKind::InvalidArg) else {
+        return None;
+    };
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let follows_flag = args
+        .windows(2)
+        .take_while(|pair| pair[0] != "--")
+        .any(|pair| pair[0] == "--env-file-overrides" && pair[1] == stray.as_str());
+    let looks_like_env_file = stray.starts_with(".env") || std::path::Path::new(stray).is_file();
+    (follows_flag && looks_like_env_file).then(|| {
+        format!(
+            "hint: --env-file-overrides takes no value; pass env files with -e: \
+             -e {stray} --env-file-overrides"
+        )
+    })
+}
+
 fn main() {
     // Keep clap's usage errors off portool's semantic exit codes (batch B
     // #15): a usage error exits 64 (EX_USAGE) rather than clap's default 2,
@@ -170,6 +201,9 @@ fn main() {
         Ok(cli) => cli,
         Err(err) => {
             let _ = err.print();
+            if let Some(hint) = env_file_overrides_value_hint(&err) {
+                eprintln!("{hint}");
+            }
             let code = match err.kind() {
                 clap::error::ErrorKind::DisplayHelp
                 | clap::error::ErrorKind::DisplayVersion

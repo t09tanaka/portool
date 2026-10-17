@@ -5,6 +5,28 @@ All notable changes to portool are documented here. The format is based on
 [Semantic Versioning](https://semver.org/) (pre-1.0: a breaking change bumps
 the minor version).
 
+## [Unreleased]
+
+### Changed
+
+- **`portool exec -e <PATH>` explains a missing env file instead of only
+  naming it.** `-e` takes a file path, but it was easy to pass a profile
+  name (`-e dev`) or a file that isn't there (`-e .env`) and get nothing
+  more than `env file not found: dev`. The error now also says that `-e`
+  takes a path relative to the current directory (shown) or an absolute
+  one, lists up to five `.env*` files that *are* in the current directory
+  (names only, never contents; the generated `.env.portool` is left out),
+  and, for a bare word like `dev` or `test`, says it looks like a profile
+  name and points at `.env.<name>` when that file exists. The exit code is
+  unchanged (1).
+- **`--env-file-overrides <file>` now points at `-e`.** The flag takes no
+  value, so `--env-file-overrides .env.test -- cmd` is still a usage error
+  (exit 64) with clap's own "unexpected argument" message, but when the
+  stray value follows the flag and looks like an env file (starts with
+  `.env` or exists), a `hint:` line suggests `-e .env.test` instead.
+- `--help` for `exec` now says that `-e` takes a file path and that
+  `--env-file-overrides` is a plain flag that takes no value.
+
 ## [0.10.1] - 2026-08-04
 
 A detection fix for agent-created worktrees. No schema, file-format, or CLI
