@@ -5,7 +5,16 @@ All notable changes to portool are documented here. The format is based on
 [Semantic Versioning](https://semver.org/) (pre-1.0: a breaking change bumps
 the minor version).
 
-## [Unreleased]
+## [0.10.2] - 2026-10-17
+
+Clearer errors and help for `exec`'s env-file flags. Messages only — no
+schema, file-format, flag, or exit-code changes.
+
+### Added
+
+- Prebuilt binaries for macOS (Apple Silicon / Intel) and Linux
+  (x86_64 / arm64), each with a `.sha256`, are attached to every tagged
+  GitHub release. See [Install](README.md#install).
 
 ### Changed
 
