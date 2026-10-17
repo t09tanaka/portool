@@ -19,6 +19,11 @@ the minor version).
   and, for a bare word like `dev` or `test`, says it looks like a profile
   name and points at `.env.<name>` when that file exists. The exit code is
   unchanged (1).
+- **`--env-file-overrides <file>` now points at `-e`.** The flag takes no
+  value, so `--env-file-overrides .env.test -- cmd` is still a usage error
+  (exit 64) with clap's own "unexpected argument" message, but when the
+  stray value follows the flag and looks like an env file (starts with
+  `.env` or exists), a `hint:` line suggests `-e .env.test` instead.
 - `--help` for `exec` now says that `-e` takes a file path and that
   `--env-file-overrides` is a plain flag that takes no value.
 
