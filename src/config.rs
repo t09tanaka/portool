@@ -8,6 +8,7 @@ use serde::Deserialize;
 /// All fields are optional in the TOML source; any field left unspecified
 /// falls back to [`Config::default`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Config {
     /// The full port pool, inclusive on both ends. Worktree blocks are
     /// allocated directly from this pool (hardening batch C: the old
@@ -56,16 +57,16 @@ impl Config {
         let default = Config::default();
 
         if raw.subrange_size.is_some() {
-            eprintln!(
+            crate::warn::emit(format_args!(
                 "portool: warning: config `subrange_size` is deprecated and ignored \
                  (blocks are now allocated directly from `range`)"
-            );
+            ));
         }
         if raw.gc_days.is_some() {
-            eprintln!(
+            crate::warn::emit(format_args!(
                 "portool: warning: config `gc_days` is deprecated and ignored \
                  (GC is condition-based: gone directory + free ports)"
-            );
+            ));
         }
 
         let range = raw.range.unwrap_or(default.range);
@@ -107,7 +108,7 @@ impl Config {
         Ok(Config { range, block_align })
     }
 
-    /// Loads the global config from [`crate::paths::config_path`].
+    /// Loads the global config from `$XDG_CONFIG_HOME/portool/config.toml`.
     ///
     /// A missing file means [`Config::default`] (that is intentional, not a
     /// failure). Every other outcome is **fail-closed**: a read error, a

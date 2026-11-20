@@ -405,10 +405,10 @@ pub fn save(path: &Path, registry: &mut Registry) -> Result<()> {
 
     let bak = backup_path(path);
     if let Err(err) = write_atomic_impl(&bak, json.as_bytes(), Some("during_backup")) {
-        eprintln!(
+        crate::warn::emit(format_args!(
             "portool: warning: failed to update backup {}: {err}",
             bak.display()
-        );
+        ));
     }
     Ok(())
 }
@@ -447,10 +447,10 @@ fn write_atomic_impl(
 fn fsync_dir(dir: &Path) {
     if let Ok(handle) = fs::File::open(dir) {
         if let Err(err) = handle.sync_all() {
-            eprintln!(
+            crate::warn::emit(format_args!(
                 "portool: warning: failed to fsync directory {}: {err}",
                 dir.display()
-            );
+            ));
         }
     }
 }

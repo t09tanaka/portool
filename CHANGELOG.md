@@ -5,6 +5,30 @@ All notable changes to portool are documented here. The format is based on
 [Semantic Versioning](https://semver.org/) (pre-1.0: a breaking change bumps
 the minor version).
 
+## [0.11.0] - 2026-11-20
+
+portool is now a library plus a thin CLI. **The CLI is unchanged**: commands,
+output, exit codes, defaults, env-file handling, and the registry / store /
+lock file locations and formats are identical to 0.10.2.
+
+### Added
+
+- A small public library API for embedding portool: `Worktree`
+  (`open`, `allocate`, `reallocate`, `exec_env`, `release`, `manifest`),
+  `release_removed` (release a worktree already deleted from disk),
+  `load_config`, `read_manifest`, and the typed `Error`. Library and CLI
+  share the same ledger and locks, so concurrent allocations from both
+  never collide. The library never prints to stderr; advisory warnings are
+  returned as `warnings: Vec<Warning>`. See [Library usage](README.md#library-usage).
+- A test that allocates concurrently through the library and the CLI
+  against one state directory and checks for duplicate ports.
+
+### Changed
+
+- The crate is no longer binary-only (reverses the 0.9.0 change). Only the
+  items re-exported from the crate root are public; all modules stay
+  private.
+
 ## [0.10.2] - 2026-10-17
 
 Clearer errors and help for `exec`'s env-file flags. Messages only — no

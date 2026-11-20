@@ -60,6 +60,11 @@ struct ManifestState {
     hash: Option<String>,
 }
 
+/// Reads and parses `<worktree_root>/.portool.toml`; `None` when absent.
+pub(crate) fn load_manifest(worktree_root: &Path) -> Result<Option<Manifest>> {
+    Ok(load_manifest_state(worktree_root)?.manifest)
+}
+
 fn load_manifest_state(worktree_root: &Path) -> Result<ManifestState> {
     let path = worktree_root.join(".portool.toml");
     match std::fs::read(&path) {
@@ -611,13 +616,15 @@ fn warn_if_hook_missing(ctx: &GitCtx) {
     match content {
         Some(c) if crate::hooks::contains_portool_invocation(&c) => {
             if crate::cmd::init::contains_unsafe_portool_form(&c) {
-                eprintln!(
+                crate::warn::emit(format_args!(
                     "portool: your post-checkout hook uses an old form that can fail \
                      'git checkout'; run 'portool init' to update it"
-                );
+                ));
             }
         }
-        _ => eprintln!("hint: run 'portool init' to install the post-checkout hook"),
+        _ => crate::warn::emit(format_args!(
+            "hint: run 'portool init' to install the post-checkout hook"
+        )),
     }
 }
 

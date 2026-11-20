@@ -6,6 +6,7 @@ use std::fmt;
 /// resolves to one of these variants, which map directly to process exit
 /// codes via [`Error::exit_code`].
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// A general, unstructured error (exit code 1).
     General(String),

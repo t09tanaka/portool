@@ -53,8 +53,38 @@ pub fn run(
     let cwd = std::env::current_dir()?;
     let ctx = GitCtx::discover(&cwd)?;
 
+    let resolved = build_env(
+        &ctx,
+        env_files,
+        check_ports,
+        strict,
+        reallocate_on_conflict,
+        env_file_overrides,
+        None,
+    )?;
+
+    exec_command(command, &resolved)
+}
+
+/// Everything `portool exec` does before launching the child: sync, the
+/// optional bind check, env-file loading, precedence composition, and
+/// `${NAME}` expansion. Returns the variables to *set* on the child on top
+/// of its inherited environment (file and portool winners only).
+///
+/// `parent` is the inherited environment used for precedence and
+/// expansion; `None` means this process's own environment (what the CLI
+/// uses).
+pub(crate) fn build_env(
+    ctx: &GitCtx,
+    env_files: &[PathBuf],
+    check_ports: bool,
+    strict: bool,
+    reallocate_on_conflict: bool,
+    env_file_overrides: bool,
+    parent: Option<Vec<(String, String)>>,
+) -> Result<BTreeMap<String, String>> {
     // Spec §5 step 3: sync first; if it fails the child is never started.
-    let outcome = sync::ensure(&ctx, true)?;
+    let outcome = sync::ensure(ctx, true)?;
 
     // v0.8.0 (external review 3rd round P1-2): the bind check is opt-in. A
     // worktree's own dev servers legitimately occupy the block, so a
@@ -64,19 +94,19 @@ pub fn run(
     let outcome = if !check || ports::block_free(outcome.block) {
         outcome
     } else if reallocate_on_conflict {
-        eprintln!(
+        crate::warn::emit(format_args!(
             "portool: ports {}-{} are in use; moving to a fresh block -- processes \
              already running keep the old ports, so this worktree may end up split \
              across old and new blocks until they are restarted",
             outcome.block.0, outcome.block.1
-        );
-        sync::reallocate(&ctx, true)?
+        ));
+        sync::reallocate(ctx, true)?
     } else {
-        eprintln!(
+        crate::warn::emit(format_args!(
             "portool: ports {}-{} are in use -- this may be this worktree's own \
              running processes (pass --reallocate-on-conflict to move, --strict to fail)",
             outcome.block.0, outcome.block.1
-        );
+        ));
         if strict {
             return Err(Error::General(format!(
                 "ports {}-{} are in use and --strict was given",
@@ -105,22 +135,23 @@ pub fn run(
     // non-UTF-8 *value* is lossily decoded for `${NAME}` expansion only —
     // the child still inherits its exact bytes, because parent-sourced
     // winners are never re-set on the child (see `compose`).
-    let parent: Vec<(String, String)> = std::env::vars_os()
-        .filter_map(|(name, value)| {
-            let name = name.into_string().ok()?;
-            let value = match value.into_string() {
-                Ok(value) => value,
-                Err(raw) => raw.to_string_lossy().into_owned(),
-            };
-            Some((name, value))
-        })
-        .collect();
+    let parent: Vec<(String, String)> = parent.unwrap_or_else(|| {
+        std::env::vars_os()
+            .filter_map(|(name, value)| {
+                let name = name.into_string().ok()?;
+                let value = match value.into_string() {
+                    Ok(value) => value,
+                    Err(raw) => raw.to_string_lossy().into_owned(),
+                };
+                Some((name, value))
+            })
+            .collect()
+    });
 
     let (map, to_set) = compose(file_entries, parent, portool_vars, env_file_overrides);
     let mut resolved = envread::resolve(&map)?;
     resolved.retain(|name, _| to_set.contains(name));
-
-    exec_command(command, &resolved)
+    Ok(resolved)
 }
 
 /// Merges the three variable sources into one map. Default precedence
