@@ -18,7 +18,8 @@ lock file locations and formats are identical to 0.10.2.
   `release_removed` (release a worktree already deleted from disk),
   `load_config`, `read_manifest`, and the typed `Error`. Library and CLI
   share the same ledger and locks, so concurrent allocations from both
-  never collide. See [Library usage](README.md#library-usage).
+  never collide. The library never prints to stderr; advisory warnings are
+  returned as `warnings: Vec<Warning>`. See [Library usage](README.md#library-usage).
 - A test that allocates concurrently through the library and the CLI
   against one state directory and checks for duplicate ports.
 

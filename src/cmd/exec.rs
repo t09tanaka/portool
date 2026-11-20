@@ -94,19 +94,19 @@ pub(crate) fn build_env(
     let outcome = if !check || ports::block_free(outcome.block) {
         outcome
     } else if reallocate_on_conflict {
-        eprintln!(
+        crate::warn::emit(format_args!(
             "portool: ports {}-{} are in use; moving to a fresh block -- processes \
              already running keep the old ports, so this worktree may end up split \
              across old and new blocks until they are restarted",
             outcome.block.0, outcome.block.1
-        );
+        ));
         sync::reallocate(ctx, true)?
     } else {
-        eprintln!(
+        crate::warn::emit(format_args!(
             "portool: ports {}-{} are in use -- this may be this worktree's own \
              running processes (pass --reallocate-on-conflict to move, --strict to fail)",
             outcome.block.0, outcome.block.1
-        );
+        ));
         if strict {
             return Err(Error::General(format!(
                 "ports {}-{} are in use and --strict was given",

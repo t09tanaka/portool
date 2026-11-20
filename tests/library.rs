@@ -171,20 +171,23 @@ fn library_and_cli_share_one_ledger_safely() {
 
     // exec_env produces the same ports as the allocation.
     let first = Worktree::open(&trees[0]).unwrap();
-    let env = first.exec_env(&ExecEnv::default()).unwrap();
+    let env = first.exec_env(&ExecEnv::default()).unwrap().vars;
     assert_eq!(env["WEB_PORT"], lib_allocs[0].block.0.to_string());
     assert_eq!(env["PORTOOL_WORKTREE_ID"], first.worktree_id());
 
     // Release through the library is visible to the CLI ...
     let key = |p: &Path| fs::canonicalize(p).unwrap().to_string_lossy().into_owned();
-    assert_eq!(first.release().unwrap(), Released::Freed);
+    assert_eq!(first.release().unwrap().released, Released::Freed);
     assert!(!registry_worktrees(&state).contains_key(&key(&trees[0])));
     let ls = cli(&trees[1], &["ls", "--json"]).output().unwrap();
     assert!(ls.status.success());
     // Exact (quoted) match: the project's common dir merely starts with
     // the main worktree's path.
     assert!(!String::from_utf8_lossy(&ls.stdout).contains(&format!("\"{}\"", key(&trees[0]))));
-    assert_eq!(first.release().unwrap(), Released::NothingToRelease);
+    assert_eq!(
+        first.release().unwrap().released,
+        Released::NothingToRelease
+    );
 
     // ... and release through the CLI is visible to the library.
     assert!(cli(&trees[2], &["release"])
@@ -193,7 +196,10 @@ fn library_and_cli_share_one_ledger_safely() {
         .status
         .success());
     let second = Worktree::open(&trees[2]).unwrap();
-    assert_eq!(second.release().unwrap(), Released::NothingToRelease);
+    assert_eq!(
+        second.release().unwrap().released,
+        Released::NothingToRelease
+    );
     assert!(!registry_worktrees(&state).contains_key(&key(&trees[2])));
 
     // Allocation by the CLI is visible to a library release, and a worktree
@@ -212,12 +218,12 @@ fn library_and_cli_share_one_ledger_safely() {
     .status
     .success());
     assert_eq!(
-        portool::release_removed(&repo, &trees[3]).unwrap(),
+        portool::release_removed(&repo, &trees[3]).unwrap().released,
         Released::Freed
     );
     assert!(!registry_worktrees(&state).contains_key(&doomed));
     assert_eq!(
-        portool::release_removed(&repo, &trees[3]).unwrap(),
+        portool::release_removed(&repo, &trees[3]).unwrap().released,
         Released::NothingToRelease
     );
 

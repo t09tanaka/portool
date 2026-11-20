@@ -57,16 +57,16 @@ impl Config {
         let default = Config::default();
 
         if raw.subrange_size.is_some() {
-            eprintln!(
+            crate::warn::emit(format_args!(
                 "portool: warning: config `subrange_size` is deprecated and ignored \
                  (blocks are now allocated directly from `range`)"
-            );
+            ));
         }
         if raw.gc_days.is_some() {
-            eprintln!(
+            crate::warn::emit(format_args!(
                 "portool: warning: config `gc_days` is deprecated and ignored \
                  (GC is condition-based: gone directory + free ports)"
-            );
+            ));
         }
 
         let range = raw.range.unwrap_or(default.range);

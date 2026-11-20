@@ -906,7 +906,7 @@ use portool::{ExecEnv, Worktree};
 let wt = Worktree::open("/path/to/a/worktree")?;
 let alloc = wt.allocate()?;                       // like `portool sync`
 println!("{:?} {:?}", alloc.block, alloc.vars);   // PORT / <KEY>_PORT, PORTOOL_*_ID
-let env = wt.exec_env(&ExecEnv::default())?;      // the env `portool exec` would set
+let env = wt.exec_env(&ExecEnv::default())?.vars; // the env `portool exec` would set
 wt.release()?;                                    // like `portool release`
 
 // After the worktree directory is already gone:
@@ -919,8 +919,9 @@ callers on one host never receive the same port. Other entry points:
 `Worktree::reallocate`, `portool::load_config` (the global `config.toml`),
 and `portool::read_manifest` / `Worktree::manifest` (`.portool.toml`).
 Errors are the typed [`portool::Error`](https://docs.rs/portool). Everything
-not re-exported at the crate root is private. Like the CLI, some operations
-print advisory warnings to stderr.
+not re-exported at the crate root is private. The library never writes to
+stderr: the advisory warnings and hints the CLI prints come back as
+`warnings: Vec<Warning>` on each result.
 
 ## Platform support
 

@@ -52,10 +52,10 @@ fn xdg_dir(xdg_var: &str, home_suffix: &str) -> Result<PathBuf> {
             return Ok(candidate);
         }
         if !value.is_empty() {
-            eprintln!(
+            crate::warn::emit(format_args!(
                 "portool: warning: ignoring non-absolute {xdg_var}={value:?} \
                  (the XDG Base Directory spec requires an absolute path)"
-            );
+            ));
         }
     }
 

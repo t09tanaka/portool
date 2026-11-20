@@ -33,7 +33,12 @@
 //!
 //! // The environment `portool exec` would give a command.
 //! let env = wt.exec_env(&portool::ExecEnv::default())?;
-//! # let _ = env;
+//! # let _ = env.vars;
+//!
+//! // Warnings come back as data (nothing is printed to stderr).
+//! for w in &alloc.warnings {
+//!     eprintln!("{w}");
+//! }
 //!
 //! // Free the allocation again.
 //! wt.release()?;
@@ -43,8 +48,14 @@
 //! # Stability
 //!
 //! Only the items re-exported below are public API (semver applies);
-//! everything else is a crate-private implementation detail. Like the CLI,
-//! some operations print advisory warnings and hints to standard error.
+//! everything else is a crate-private implementation detail.
+//!
+//! # Warnings
+//!
+//! The library never writes to standard error. Advisory warnings and hints
+//! that the CLI prints (a missing `post-checkout` hook, a deprecated config
+//! key, a failed backup refresh, ports in use, ...) are returned to the
+//! caller as [`Warning`] values on the result of each call.
 
 mod alloc;
 mod cli;
@@ -65,6 +76,7 @@ mod paths;
 mod ports;
 mod registry;
 mod store;
+mod warn;
 
 pub use config::Config;
 pub use error::{Error, Result};
@@ -81,11 +93,47 @@ pub fn __run_cli() -> i32 {
     cli::run()
 }
 
+/// An advisory, non-fatal message the CLI would print to standard error
+/// (including any `portool: warning:` or `hint:` prefix).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Warning {
+    /// The full message line, without a trailing newline.
+    pub message: String,
+}
+
+impl std::fmt::Display for Warning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+fn warnings(lines: Vec<String>) -> Vec<Warning> {
+    lines
+        .into_iter()
+        .map(|message| Warning { message })
+        .collect()
+}
+
+/// The global configuration plus any warnings raised while reading it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ConfigLoad {
+    /// The configuration.
+    pub config: Config,
+    /// For example deprecation notices for ignored keys.
+    pub warnings: Vec<Warning>,
+}
+
 /// Reads the global configuration (`config.toml`): the port pool and block
 /// alignment. A missing file yields [`Config::default`]; a malformed one is
 /// an error, exactly as for the CLI.
-pub fn load_config() -> Result<Config> {
-    Config::load()
+pub fn load_config() -> Result<ConfigLoad> {
+    let (result, lines) = warn::collect(Config::load);
+    Ok(ConfigLoad {
+        config: result?,
+        warnings: warnings(lines),
+    })
 }
 
 /// Reads and parses `<worktree>/.portool.toml`. Returns `Ok(None)` when the
@@ -111,6 +159,28 @@ pub struct Allocation {
     pub vars: Vec<(String, String)>,
     /// The worktree's `.env.portool` file, which holds the same variables.
     pub env_file: PathBuf,
+    /// Advisory warnings raised while allocating.
+    pub warnings: Vec<Warning>,
+}
+
+/// The result of [`Worktree::exec_env`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ExecOutput {
+    /// The variables to set on top of the command's inherited environment.
+    pub vars: BTreeMap<String, String>,
+    /// Advisory warnings (for example "ports are in use").
+    pub warnings: Vec<Warning>,
+}
+
+/// The result of releasing a worktree's allocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ReleaseOutcome {
+    /// What happened.
+    pub released: Released,
+    /// Advisory warnings raised while releasing.
+    pub warnings: Vec<Warning>,
 }
 
 /// Whether and how [`Worktree::exec_env`] checks that the block's ports are
@@ -150,7 +220,7 @@ pub struct ExecEnv {
     pub inherited: Option<Vec<(String, String)>>,
 }
 
-/// What [`Worktree::release`] did.
+/// What a release did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Released {
@@ -200,15 +270,15 @@ impl Worktree {
     /// `.env.portool`, like `portool sync --quiet`. Idempotent: an existing
     /// up-to-date allocation is returned unchanged.
     pub fn allocate(&self) -> Result<Allocation> {
-        let outcome = cmd::sync::ensure(&self.ctx, true)?;
-        self.allocation(outcome)
+        let (outcome, lines) = warn::collect(|| cmd::sync::ensure(&self.ctx, true));
+        self.allocation(outcome?, lines)
     }
 
     /// Forces this worktree onto a fresh, different block, like
     /// `portool reallocate --quiet`. Errors if it has no allocation yet.
     pub fn reallocate(&self) -> Result<Allocation> {
-        let outcome = cmd::sync::reallocate(&self.ctx, true)?;
-        self.allocation(outcome)
+        let (outcome, lines) = warn::collect(|| cmd::sync::reallocate(&self.ctx, true));
+        self.allocation(outcome?, lines)
     }
 
     /// Composes the environment `portool exec` would give a command:
@@ -216,32 +286,42 @@ impl Worktree {
     /// expands `${NAME}` references. Returns the variables to **set on top
     /// of** the command's inherited environment (env-file and
     /// portool-managed winners only).
-    pub fn exec_env(&self, options: &ExecEnv) -> Result<BTreeMap<String, String>> {
+    pub fn exec_env(&self, options: &ExecEnv) -> Result<ExecOutput> {
         let (check, strict, reallocate) = match options.port_check {
             PortCheck::Off => (false, false, false),
             PortCheck::Warn => (true, false, false),
             PortCheck::Strict => (false, true, false),
             PortCheck::Reallocate => (false, false, true),
         };
-        cmd::exec::build_env(
-            &self.ctx,
-            &options.env_files,
-            check,
-            strict,
-            reallocate,
-            options.env_file_overrides,
-            options.inherited.clone(),
-        )
+        let (vars, lines) = warn::collect(|| {
+            cmd::exec::build_env(
+                &self.ctx,
+                &options.env_files,
+                check,
+                strict,
+                reallocate,
+                options.env_file_overrides,
+                options.inherited.clone(),
+            )
+        });
+        Ok(ExecOutput {
+            vars: vars?,
+            warnings: warnings(lines),
+        })
     }
 
     /// Frees this worktree's allocation and removes its `.env.portool`,
     /// like `portool release`. Having no allocation is success
     /// ([`Released::NothingToRelease`]).
-    pub fn release(&self) -> Result<Released> {
-        released(cmd::release::release_worktree(&self.ctx)?)
+    pub fn release(&self) -> Result<ReleaseOutcome> {
+        release_ctx(&self.ctx)
     }
 
-    fn allocation(&self, outcome: cmd::sync::SyncOutcome) -> Result<Allocation> {
+    fn allocation(
+        &self,
+        outcome: cmd::sync::SyncOutcome,
+        lines: Vec<String>,
+    ) -> Result<Allocation> {
         let vars = envfile::variables(
             outcome.block,
             outcome.manifest.as_ref(),
@@ -259,6 +339,7 @@ impl Worktree {
             ports,
             vars,
             env_file: self.ctx.worktree_root.join(".env.portool"),
+            warnings: warnings(lines),
         })
     }
 }
@@ -267,15 +348,22 @@ impl Worktree {
 /// deleted from disk. `repo` is any live worktree of the same project
 /// (typically the main checkout); `worktree` is the removed worktree's
 /// path. Use [`Worktree::release`] while the worktree still exists.
-pub fn release_removed(repo: impl AsRef<Path>, worktree: impl AsRef<Path>) -> Result<Released> {
+pub fn release_removed(
+    repo: impl AsRef<Path>,
+    worktree: impl AsRef<Path>,
+) -> Result<ReleaseOutcome> {
     let ctx = GitCtx::for_worktree_path(repo.as_ref(), worktree.as_ref())?;
-    released(cmd::release::release_worktree(&ctx)?)
+    release_ctx(&ctx)
 }
 
-fn released(freed: bool) -> Result<Released> {
-    Ok(if freed {
-        Released::Freed
-    } else {
-        Released::NothingToRelease
+fn release_ctx(ctx: &GitCtx) -> Result<ReleaseOutcome> {
+    let (freed, lines) = warn::collect(|| cmd::release::release_worktree(ctx));
+    Ok(ReleaseOutcome {
+        released: if freed? {
+            Released::Freed
+        } else {
+            Released::NothingToRelease
+        },
+        warnings: warnings(lines),
     })
 }
