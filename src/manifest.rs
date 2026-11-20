@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, HashSet};
 /// A parsed `.portool.toml` manifest: the declared `(key, offset)` pairs,
 /// normalized to ascending offset order.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Manifest {
     pub ports: Vec<(String, u16)>,
 }

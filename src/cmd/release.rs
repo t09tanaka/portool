@@ -10,51 +10,12 @@ use std::time::Duration;
 
 const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Runs `portool release`. Removes this worktree's `.env.portool` first,
-/// then its ledger entry under the lock -- in that order, so a failed env
-/// removal keeps the block reserved (external review P1 #2: the unsafe
-/// inconsistency would be "block freed in the ledger but the old env still
-/// hands out its ports"; the safe one is "env gone but block still
-/// reserved"). A worktree that had no allocation is reported and treated as
-/// success (the desired end state -- no allocation -- already holds).
+/// Runs `portool release`. See [`release_worktree`] for the ordering and
+/// idempotence rules; this only adds the CLI's stdout reporting.
 pub fn run() -> Result<()> {
     let cwd = std::env::current_dir()?;
     let ctx = GitCtx::discover(&cwd)?;
-    let common_dir_key = ctx.common_dir.to_string_lossy().into_owned();
-    let worktree_key = ctx.worktree_root.to_string_lossy().into_owned();
-
-    let _lock = lock::acquire(&paths::lock_path()?, LOCK_TIMEOUT)?;
-    let registry_path = paths::registry_path()?;
-    let mut registry = match store::load_strict(&registry_path)? {
-        Some(registry) => registry,
-        None => {
-            // No ledger at all: there is nothing to free. Still remove a
-            // stray env file so the end state is consistent.
-            remove_env_file(&ctx)?;
-            println!(
-                "portool: {} had no allocation to release",
-                crate::display::path(&ctx.worktree_root)
-            );
-            return Ok(());
-        }
-    };
-
-    let has_entry = registry
-        .find_project(&common_dir_key)
-        .map(|project| project.worktrees.contains_key(&worktree_key))
-        .unwrap_or(false);
-
-    // Env file first: if this fails, the ledger entry is left in place and
-    // the block stays reserved.
-    remove_env_file(&ctx)?;
-
-    if has_entry {
-        registry
-            .find_project_mut(&common_dir_key)
-            .expect("has_entry checked above")
-            .worktrees
-            .remove(&worktree_key);
-        store::save(&registry_path, &mut registry)?;
+    if release_worktree(&ctx)? {
         println!(
             "portool: released {}",
             crate::display::path(&ctx.worktree_root)
@@ -66,6 +27,49 @@ pub fn run() -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Removes the worktree's `.env.portool` first, then its ledger entry under
+/// the lock -- in that order, so a failed env removal keeps the block
+/// reserved (external review P1 #2: the unsafe inconsistency would be
+/// "block freed in the ledger but the old env still hands out its ports";
+/// the safe one is "env gone but block still reserved"). A worktree that
+/// had no allocation is success (the desired end state -- no allocation --
+/// already holds); the return value says whether an entry was freed.
+pub(crate) fn release_worktree(ctx: &GitCtx) -> Result<bool> {
+    let common_dir_key = ctx.common_dir.to_string_lossy().into_owned();
+    let worktree_key = ctx.worktree_root.to_string_lossy().into_owned();
+
+    let _lock = lock::acquire(&paths::lock_path()?, LOCK_TIMEOUT)?;
+    let registry_path = paths::registry_path()?;
+    let mut registry = match store::load_strict(&registry_path)? {
+        Some(registry) => registry,
+        None => {
+            // No ledger at all: there is nothing to free. Still remove a
+            // stray env file so the end state is consistent.
+            remove_env_file(ctx)?;
+            return Ok(false);
+        }
+    };
+
+    let has_entry = registry
+        .find_project(&common_dir_key)
+        .map(|project| project.worktrees.contains_key(&worktree_key))
+        .unwrap_or(false);
+
+    // Env file first: if this fails, the ledger entry is left in place and
+    // the block stays reserved.
+    remove_env_file(ctx)?;
+
+    if has_entry {
+        registry
+            .find_project_mut(&common_dir_key)
+            .expect("has_entry checked above")
+            .worktrees
+            .remove(&worktree_key);
+        store::save(&registry_path, &mut registry)?;
+    }
+    Ok(has_entry)
 }
 
 /// Removes the worktree's `.env.portool`. Absence is success (it is the

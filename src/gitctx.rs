@@ -60,6 +60,37 @@ impl GitCtx {
         })
     }
 
+    /// Builds the identity of a worktree that may already have been deleted
+    /// from disk, for releasing its allocation. `repo_dir` is any live
+    /// worktree of the same project (typically the main checkout) and
+    /// supplies the project identity; `worktree` is the removed (or still
+    /// present) worktree path. The path is keyed exactly as it was when it
+    /// existed: canonicalized if it is still there, otherwise its parent
+    /// directory canonicalized plus its final component.
+    pub fn for_worktree_path(repo_dir: &Path, worktree: &Path) -> Result<GitCtx> {
+        let mut ctx = GitCtx::discover(repo_dir)?;
+        let worktree_root = match std::fs::canonicalize(worktree) {
+            Ok(path) => path,
+            Err(_) => {
+                let name = worktree.file_name().ok_or_else(|| {
+                    Error::General(format!(
+                        "{} has no final path component",
+                        worktree.display()
+                    ))
+                })?;
+                let parent = match worktree.parent() {
+                    Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+                    _ => PathBuf::from("."),
+                };
+                canonicalize(&parent)?.join(name)
+            }
+        };
+        require_utf8(&worktree_root)?;
+        ctx.worktree_root = worktree_root;
+        ctx.branch = None;
+        Ok(ctx)
+    }
+
     /// Lists every worktree (main and linked) belonging to this project, by
     /// parsing `worktree ` lines out of `git worktree list --porcelain`.
     /// Each path is canonicalized when possible; a worktree whose directory

@@ -8,6 +8,7 @@ use serde::Deserialize;
 /// All fields are optional in the TOML source; any field left unspecified
 /// falls back to [`Config::default`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Config {
     /// The full port pool, inclusive on both ends. Worktree blocks are
     /// allocated directly from this pool (hardening batch C: the old
@@ -107,7 +108,7 @@ impl Config {
         Ok(Config { range, block_align })
     }
 
-    /// Loads the global config from [`crate::paths::config_path`].
+    /// Loads the global config from `$XDG_CONFIG_HOME/portool/config.toml`.
     ///
     /// A missing file means [`Config::default`] (that is intentional, not a
     /// failure). Every other outcome is **fail-closed**: a read error, a

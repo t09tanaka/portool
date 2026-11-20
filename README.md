@@ -890,6 +890,38 @@ claims the hook is missing. It still never writes into the main worktree's
 files from a linked one — install (and `unhook`) the hook in the main
 worktree, and git shares it with every worktree of the repository.
 
+## Library usage
+
+Since 0.11.0 the crate is a library plus a thin CLI, so another Rust program
+can allocate, use, and release a worktree's ports in-process:
+
+```toml
+[dependencies]
+portool = "0.11"
+```
+
+```rust
+use portool::{ExecEnv, Worktree};
+
+let wt = Worktree::open("/path/to/a/worktree")?;
+let alloc = wt.allocate()?;                       // like `portool sync`
+println!("{:?} {:?}", alloc.block, alloc.vars);   // PORT / <KEY>_PORT, PORTOOL_*_ID
+let env = wt.exec_env(&ExecEnv::default())?;      // the env `portool exec` would set
+wt.release()?;                                    // like `portool release`
+
+// After the worktree directory is already gone:
+portool::release_removed("/path/to/main/checkout", "/path/to/removed/worktree")?;
+```
+
+The library uses the **same registry, store, and lock files** as the CLI
+(resolved from `XDG_STATE_HOME` / `HOME` on every call), so library and CLI
+callers on one host never receive the same port. Other entry points:
+`Worktree::reallocate`, `portool::load_config` (the global `config.toml`),
+and `portool::read_manifest` / `Worktree::manifest` (`.portool.toml`).
+Errors are the typed [`portool::Error`](https://docs.rs/portool). Everything
+not re-exported at the crate root is private. Like the CLI, some operations
+print advisory warnings to stderr.
+
 ## Platform support
 
 `portool` targets **macOS and Linux only**. `portool` relies on `flock` and
@@ -901,9 +933,8 @@ is conservatively refused). Repository and worktree paths must be valid
 UTF-8 — a non-UTF-8 path (possible on Linux only) is a hard error rather
 than a lossy ledger key that could collide.
 
-`portool` is a CLI, not a library: the crate ships a binary only (no `lib`
-target), so there is no Rust API to depend on. The stable interface is the
-documented commands, exit codes, and file formats.
+The CLI remains the primary interface; see [Library usage](#library-usage)
+for the small embeddable Rust API.
 
 ## License
 
