@@ -923,6 +923,19 @@ not re-exported at the crate root is private. The library never writes to
 stderr: the advisory warnings and hints the CLI prints come back as
 `warnings: Vec<Warning>` on each result.
 
+To run the whole command line in-process -- for example from a multi-call
+binary that is invoked through a `portool` link -- call
+`portool::run_cli(args)`. It takes the arguments including the program name
+(whose value is ignored) and returns the exit code; output, exit codes, and
+defaults are those of the `portool` binary of the same version, which is
+itself just this call. Like the binary, it prints to stdout/stderr, uses the
+current directory and environment, and `portool exec` replaces the calling
+process with the command.
+
+```rust
+std::process::exit(portool::run_cli(std::env::args_os()));
+```
+
 ## Platform support
 
 `portool` targets **macOS and Linux only**. `portool` relies on `flock` and
