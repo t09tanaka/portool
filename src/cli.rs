@@ -1,5 +1,6 @@
 //! The `clap` command line: parsing, dispatch to [`crate::cmd`], and
-//! exit-code mapping. `src/main.rs` only calls [`run`].
+//! exit-code mapping. The binary and embedders reach [`run`] through
+//! [`crate::run_cli`].
 
 use clap::{Parser, Subcommand};
 
@@ -141,7 +142,7 @@ enum Command {
 /// clap reports only a generic "unexpected argument". When the stray value
 /// directly follows the flag and looks like an env file (starts with `.env`
 /// or exists), add a hint pointing at `-e`. Every other error is untouched.
-fn env_file_overrides_value_hint(err: &clap::Error) -> Option<String> {
+fn env_file_overrides_value_hint(err: &clap::Error, args: &[std::ffi::OsString]) -> Option<String> {
     use clap::error::{ContextKind, ContextValue};
 
     if err.kind() != clap::error::ErrorKind::UnknownArgument {
@@ -150,7 +151,6 @@ fn env_file_overrides_value_hint(err: &clap::Error) -> Option<String> {
     let Some(ContextValue::String(stray)) = err.get(ContextKind::InvalidArg) else {
         return None;
     };
-    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
     let follows_flag = args
         .windows(2)
         .take_while(|pair| pair[0] != "--")
@@ -164,19 +164,19 @@ fn env_file_overrides_value_hint(err: &clap::Error) -> Option<String> {
     })
 }
 
-/// Parses the process arguments, runs the command, and returns the process
-/// exit code (0 on success).
-pub(crate) fn run() -> i32 {
+/// Parses `args` (including the program name), runs the command, and
+/// returns the process exit code (0 on success).
+pub(crate) fn run(args: Vec<std::ffi::OsString>) -> i32 {
     use crate::cmd;
     // Keep clap's usage errors off portool's semantic exit codes (batch B
     // #15): a usage error exits 64 (EX_USAGE) rather than clap's default 2,
     // which used to collide with a real allocation error. `--help` /
     // `--version` still print to stdout and exit 0.
-    let cli = match Cli::try_parse() {
+    let cli = match Cli::try_parse_from(&args) {
         Ok(cli) => cli,
         Err(err) => {
             let _ = err.print();
-            if let Some(hint) = env_file_overrides_value_hint(&err) {
+            if let Some(hint) = env_file_overrides_value_hint(&err, &args) {
                 eprintln!("{hint}");
             }
             let code = match err.kind() {

@@ -86,11 +86,38 @@ use gitctx::GitCtx;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// Entry point of the `portool` binary. Not part of the library API: it is
-/// exempt from semver and may change or disappear in any release.
-#[doc(hidden)]
-pub fn __run_cli() -> i32 {
-    cli::run()
+/// Runs the `portool` command line in this process with `args` and returns
+/// its exit code. This is exactly what the standalone `portool` binary does:
+/// its `main` only calls `portool::run_cli(std::env::args_os())` and exits
+/// with the result.
+///
+/// `args` starts with the program name, as from [`std::env::args_os`]; its
+/// value is ignored (help and errors always say `portool`). A multi-call
+/// binary invoked through a `portool` link can therefore forward its own
+/// arguments unchanged.
+///
+/// Behaviour, output, and exit codes are identical to the binary of the same
+/// version, including that it:
+///
+/// - writes to standard output and standard error;
+/// - reads the current directory and the process environment (`HOME`,
+///   `XDG_STATE_HOME`, `XDG_CONFIG_HOME`, ...);
+/// - for `portool exec`, **replaces the current process** with the command
+///   (`execvp`) on success, so the call does not return.
+///
+/// Call it only where the process acts as the `portool` command. For
+/// in-process allocation use [`Worktree`] and [`release_removed`] instead.
+///
+/// ```no_run
+/// let code = portool::run_cli(std::env::args_os());
+/// std::process::exit(code);
+/// ```
+pub fn run_cli<I, T>(args: I) -> i32
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString>,
+{
+    cli::run(args.into_iter().map(Into::into).collect())
 }
 
 /// An advisory, non-fatal message the CLI would print to standard error

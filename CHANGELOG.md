@@ -5,6 +5,24 @@ All notable changes to portool are documented here. The format is based on
 [Semantic Versioning](https://semver.org/) (pre-1.0: a breaking change bumps
 the minor version).
 
+## [0.12.0] - 2026-11-21
+
+A public entry point for running the CLI in-process. **The CLI is
+unchanged**: commands, output, exit codes, defaults, and file locations and
+formats are identical to 0.11.0.
+
+### Added
+
+- `portool::run_cli(args) -> i32` runs the `portool` command line with the
+  given arguments (program name first, its value ignored) and returns the
+  exit code, so a multi-call binary invoked through a `portool` link can
+  run the CLI in-process. The `portool` binary itself is now only this call.
+
+### Removed
+
+- The doc-hidden `portool::__run_cli()`, which was exempt from semver. Use
+  `portool::run_cli(std::env::args_os())`.
+
 ## [0.11.0] - 2026-11-20
 
 portool is now a library plus a thin CLI. **The CLI is unchanged**: commands,

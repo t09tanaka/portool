@@ -2,7 +2,7 @@
 //! binary only maps the CLI's exit code onto the process.
 
 fn main() {
-    let code = portool::__run_cli();
+    let code = portool::run_cli(std::env::args_os());
     if code != 0 {
         std::process::exit(code);
     }
