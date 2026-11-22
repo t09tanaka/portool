@@ -69,22 +69,19 @@ impl GitCtx {
     /// directory canonicalized plus its final component.
     pub fn for_worktree_path(repo_dir: &Path, worktree: &Path) -> Result<GitCtx> {
         let mut ctx = GitCtx::discover(repo_dir)?;
-        let worktree_root = match std::fs::canonicalize(worktree) {
-            Ok(path) => path,
-            Err(_) => {
-                let name = worktree.file_name().ok_or_else(|| {
-                    Error::General(format!(
-                        "{} has no final path component",
-                        worktree.display()
-                    ))
-                })?;
-                let parent = match worktree.parent() {
-                    Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-                    _ => PathBuf::from("."),
-                };
-                canonicalize(&parent)?.join(name)
-            }
-        };
+        // Keep the final component's identity. A teardown hook can replace
+        // the worktree with a symlink; it must not redirect ledger cleanup.
+        let name = worktree.file_name().ok_or_else(|| {
+            Error::General(format!(
+                "{} has no final path component",
+                worktree.display()
+            ))
+        })?;
+        let parent = worktree
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let worktree_root = canonicalize(parent)?.join(name);
         require_utf8(&worktree_root)?;
         ctx.worktree_root = worktree_root;
         ctx.branch = None;

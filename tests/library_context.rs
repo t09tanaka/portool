@@ -145,6 +145,16 @@ fn explicit_context_selects_the_ledger_and_config() {
         .allocate()
         .unwrap();
     fs::remove_dir_all(&wt_path).unwrap();
+    let unrelated = repo.parent().unwrap().join("unrelated");
+    fs::create_dir(&unrelated).unwrap();
+    fs::write(unrelated.join(".env.portool"), "keep").unwrap();
+    std::os::unix::fs::symlink(&unrelated, &wt_path).unwrap();
+    assert!(portool::release_removed_in(&ctx, &repo, &wt_path).is_err());
+    assert_eq!(
+        fs::read_to_string(unrelated.join(".env.portool")).unwrap(),
+        "keep"
+    );
+    fs::remove_file(&wt_path).unwrap();
     let outcome = portool::release_removed_in(&ctx, &repo, &wt_path).unwrap();
     assert_eq!(outcome.released, Released::Freed);
 
