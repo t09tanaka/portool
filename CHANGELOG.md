@@ -30,8 +30,10 @@ the minor version).
     needs its own directory gone, so renaming or re-cloning the main clone
     keeps the allocations of linked worktrees that still exist;
   - a worktree on a volume that is not mounted, wherever it is mounted, is
-    kept; so is the last worktree removed from a directory that is left
-    empty, until that directory is removed or used again;
+    kept. A worktree removed with `rm -rf` (git still lists it, as
+    `prunable`) whose parent directory is left empty looks the same and is
+    kept until `git worktree prune` or `git worktree remove`; one that git
+    no longer lists at all is released, empty parent or not;
   - `prune --all` no longer drops entries it cannot verify. The new
     `prune --forget-unverifiable` does, listing each with the reason it had
     been kept; `prune` prints the entries it keeps although their directory
@@ -46,9 +48,18 @@ the minor version).
   and release now sees a listener on any address: `0.0.0.0` (published
   container ports), `::` and `::1`, not only `127.0.0.1`. A block something
   listens on is no longer handed out or released on macOS because the
-  listener was bound to another address. `sync` refuses to move a worktree
-  whose block cannot grow in place while anything listens on it in any of
-  these forms (before: only if it was visible from `127.0.0.1`). The
+  listener was bound to another address.
+- **Behaviour change on macOS:** when a manifest grows beyond the
+  worktree's block and the block cannot grow in place, `sync` refuses to
+  move it while anything listens on it. It now also sees a stack published
+  on `0.0.0.0` or `::` (a container's published ports); 0.13 on macOS did
+  not and moved the block under the running stack. `sync` fails with
+  "the manifest now needs N ports but block A-B cannot grow in place, and
+  something is still listening on it; stop those processes and re-run
+  'portool sync', or run 'portool reallocate' to move this worktree
+  explicitly". Do one of the two: stop the stack and run `portool sync`,
+  or run `portool reallocate` and restart the stack on the new ports. On
+  Linux this was already the behaviour for IPv4 listeners. The
   opt-in check of a worktree's own block (`exec --check-ports`, `--strict`,
   `--reallocate-on-conflict`) and `doctor`'s "ports in use" report are
   unchanged and still look from `127.0.0.1`.

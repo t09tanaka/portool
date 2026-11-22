@@ -241,6 +241,11 @@ mod tests {
             checked.push(name);
         }
         assert!(checked.len() >= 2, "IPv4 forms not checked: {checked:?}");
+        // No silent skip: where the IPv6 loopback can be bound at all, all
+        // five forms must have been exercised.
+        if std::net::TcpListener::bind("[::1]:0").is_ok() {
+            assert_eq!(checked.len(), 5, "IPv6 forms skipped: {checked:?}");
+        }
     }
 
     #[test]

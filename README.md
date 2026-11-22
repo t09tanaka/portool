@@ -579,10 +579,14 @@ two worktrees, so an entry is released only when **all** of this holds:
    and not `/Volumes`, `/mnt`, `/media`, `/net`, `/Network`, `/run/media`,
    `/run/media/<user>` or a directory directly below one of these (macOS
    keeps `/Volumes` on the root device, so only the name identifies it).
-   Anything else may be a volume that is only
-   unmounted, and the entry is kept. (So is the last worktree removed from
-   a directory that is now empty, until that directory is removed or used
-   again: an empty directory is what an unmounted mount point looks like.)
+   Anything else may be a volume that is only unmounted, and the entry is
+   kept. One exception, so that removing the last worktree of a worktrees
+   directory frees its ports: when the repository is alive and git does not
+   list the worktree at all (`git worktree remove`, or a prune, took its
+   registration away -- an unmounted volume alone never does, git then says
+   `prunable`), an *empty* nearest directory or one that is a mount point
+   does not count against it. The named mount directories and a directory
+   holding other mounts still do.
 3. Git agrees: the worktree is no longer listed by `git worktree list`, or
    is listed as `prunable` (what `rm -rf` of a worktree leaves; needs git
    2.31 or later -- an older git keeps listing it until `git worktree

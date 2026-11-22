@@ -360,6 +360,81 @@ fn removed_with_rm_is_released_by_a_sync_in_its_own_project() {
     assert!(block_of(&env, &a).is_some());
 }
 
+/// `a` with a synced linked worktree that is the only thing in its
+/// directory (`wts/only`), and a synced `b`.
+fn lone_worktree(env: &TestEnv) -> (PathBuf, PathBuf, PathBuf) {
+    let (a, b, only) = (env.path("a"), env.path("b"), env.path("wts").join("only"));
+    init_repo(&a);
+    init_repo(&b);
+    std::fs::create_dir_all(only.parent().unwrap()).unwrap();
+    add_worktree(&a, &only, "feat");
+    ok(env.run(&only, &["sync"]));
+    ok(env.run(&b, &["sync"]));
+    (a, b, only)
+}
+
+#[test]
+fn the_last_worktree_of_a_directory_removed_through_git_is_released() {
+    // By another project's command.
+    let env = TestEnv::new();
+    env.write_config("range = [18350, 18399]\n");
+    let (a, b, only) = lone_worktree(&env);
+    git(
+        &a,
+        &["worktree", "remove", "--force", only.to_str().unwrap()],
+    );
+    assert_eq!(names(only.parent().unwrap()), Vec::<String>::new());
+    ok(env.run(&b, &["pin"]));
+    assert!(block_of(&env, &only).is_none(), "{:?}", allocations(&env));
+
+    // By a sync in its own project.
+    let env = TestEnv::new();
+    env.write_config("range = [18400, 18449]\n");
+    let (a, _b, only) = lone_worktree(&env);
+    git(
+        &a,
+        &["worktree", "remove", "--force", only.to_str().unwrap()],
+    );
+    ok(env.run(&a, &["sync"]));
+    assert!(block_of(&env, &only).is_none(), "{:?}", allocations(&env));
+    assert!(block_of(&env, &a).is_some());
+}
+
+#[test]
+fn the_same_emptied_directory_keeps_a_worktree_git_still_registers() {
+    let env = TestEnv::new();
+    env.write_config("range = [18450, 18499]\n");
+    let (a, b, only) = lone_worktree(&env);
+    // Gone without git knowing: listed as prunable, exactly as it would be
+    // if `wts` were the mount point of a volume that is not mounted.
+    std::fs::remove_dir_all(&only).unwrap();
+    ok(env.run(&b, &["pin"]));
+    ok(env.run(&a, &["sync"]));
+    assert!(block_of(&env, &only).is_some(), "{:?}", allocations(&env));
+    let out = ok(env.run(&b, &["prune", "--all"]));
+    assert!(stderr(&out).contains("is empty"), "{}", stderr(&out));
+
+    // Once git drops the registration, it is released.
+    git(&a, &["worktree", "prune"]);
+    ok(env.run(&b, &["unpin"]));
+    assert!(block_of(&env, &only).is_none());
+}
+
+#[test]
+fn an_unregistered_worktree_of_an_unreadable_repository_is_kept() {
+    let env = TestEnv::new();
+    env.write_config("range = [18500, 18549]\n");
+    let (a, b, only) = lone_worktree(&env);
+    git(
+        &a,
+        &["worktree", "remove", "--force", only.to_str().unwrap()],
+    );
+    std::fs::write(a.join(".git").join("HEAD"), "garbage\n").unwrap();
+    ok(env.run(&b, &["pin"]));
+    ok(env.run(&b, &["prune", "--all"]));
+    assert!(block_of(&env, &only).is_some(), "{:?}", allocations(&env));
+}
+
 #[test]
 fn a_locked_worktree_is_kept_even_when_its_directory_is_missing() {
     let env = TestEnv::new();

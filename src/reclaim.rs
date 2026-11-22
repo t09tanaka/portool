@@ -15,6 +15,20 @@
 //!    longer lists the worktree, or lists it as `prunable` and not `locked`;
 //! 4. its ports are unused right now (checked last, under the ledger lock).
 //!
+//! One relaxation of rule 2. When the repository is alive and git does not
+//! list the worktree at all, its registration was removed on purpose (`git
+//! worktree remove`, or a prune): an unmounted volume only makes git report
+//! `prunable`, it never removes the registration. Then the two doubts that
+//! come from the mere shape of the surroundings -- an empty nearest
+//! directory, a nearest directory that is a mount point -- are not held
+//! against the entry; otherwise the last worktree removed from a worktrees
+//! directory would keep its ports for ever. The doubts that point at a
+//! place volumes are mounted in (a mount directory by name, a directory
+//! holding other mounts) and unreadable surroundings still keep it: a
+//! `git worktree prune` run while a volume is unmounted also removes the
+//! registration, and the worktree's `.env.portool` is back when the volume
+//! is.
+//!
 //! Free ports alone never release anything, and neither does a missing
 //! repository: each entry needs its own directory gone.
 //!
@@ -291,6 +305,13 @@ pub fn judge(pinned: bool, presence: Presence, git: GitView, force: bool) -> Ver
         Presence::Exists => return Verdict::Keep(Why::Exists),
         Presence::Unreadable => return Verdict::Keep(Why::Unreadable),
         Presence::Gone => None,
+        // A live repository that no longer has the worktree registered
+        // outweighs a doubt that rests on the shape of the directory alone.
+        Presence::Unverifiable(Doubt::EmptyDirectory | Doubt::MountPoint)
+            if git == GitView::NotListed =>
+        {
+            None
+        }
         Presence::Unverifiable(doubt) => Some(Why::Doubt(doubt)),
     };
     let git_doubt = match git {
@@ -432,8 +453,13 @@ pub fn gather(projects: &[ProjectIn], world: &World, force: bool) -> Gathered {
     out
 }
 
+/// What git's listing says about the worktree at `path`. A listed path that
+/// differs only in letter case counts as the same worktree (it is, on a
+/// case-insensitive filesystem): "not listed" has to be certain.
 fn view(listing: &[Listed], path: &str) -> GitView {
-    match listing.iter().find(|w| w.path.as_path() == Path::new(path)) {
+    let same = |w: &&Listed| w.path.as_path() == Path::new(path);
+    let alike = |w: &&Listed| w.path.to_string_lossy().to_lowercase() == path.to_lowercase();
+    match listing.iter().find(same).or(listing.iter().find(alike)) {
         None => GitView::NotListed,
         Some(w) if w.locked => GitView::Locked,
         Some(w) if w.prunable => GitView::Prunable,
@@ -611,7 +637,7 @@ pub fn plan(ledger: &Path, scope: Scope) -> Plan {
         return Plan::default();
     }
     let mut problems: Vec<String> = Vec::new();
-    let gathered = match run_bounded(projects, false, GIT_TIMEOUT, Some(BUDGET)) {
+    let gathered = match run_bounded(projects, false, GIT_TIMEOUT, Some(BUDGET), Box::new(RealFs)) {
         Bounded::Done(gathered) => gathered,
         Bounded::Skipped => Gathered::default(),
         Bounded::Stuck(key) => {
@@ -655,7 +681,7 @@ pub fn plan(ledger: &Path, scope: Scope) -> Plan {
 /// under the ledger lock either.
 pub fn plan_manual(registry: &Registry, force: bool) -> Plan {
     let projects = candidates(registry, Scope::All);
-    let gathered = match run_bounded(projects, force, MANUAL_GIT_TIMEOUT, None) {
+    let gathered = match run_bounded(projects, force, MANUAL_GIT_TIMEOUT, None, Box::new(RealFs)) {
         Bounded::Done(gathered) => gathered,
         Bounded::Skipped | Bounded::Stuck(_) => Gathered::default(),
     };
@@ -693,6 +719,7 @@ fn run_bounded(
     force: bool,
     git_timeout: Duration,
     budget: Option<Duration>,
+    fs: Box<dyn Fs + Send>,
 ) -> Bounded {
     if HELPERS.fetch_add(1, Ordering::SeqCst) >= MAX_HELPERS {
         HELPERS.fetch_sub(1, Ordering::SeqCst);
@@ -725,7 +752,7 @@ fn run_bounded(
             let gathered = gather(
                 &projects,
                 &World {
-                    fs: &RealFs,
+                    fs: fs.as_ref(),
                     list: &list,
                     enter: &enter,
                 },
@@ -1061,6 +1088,148 @@ mod tests {
             judge(false, Presence::Exists, GitView::NotListed, false),
             Verdict::Keep(Why::Exists)
         );
+    }
+
+    #[test]
+    fn an_unregistered_worktree_is_not_held_by_the_shape_of_its_surroundings() {
+        let release = Verdict::Release { forced: None };
+        // Removed on purpose from a live repository: an empty worktrees
+        // directory, or one directly below a mount root, is no obstacle.
+        for doubt in [Doubt::EmptyDirectory, Doubt::MountPoint] {
+            let missing = Presence::Unverifiable(doubt);
+            assert_eq!(judge(false, missing, GitView::NotListed, false), release);
+            // Still registered (prunable), or nobody to ask: the doubt holds.
+            for git in [GitView::Prunable, GitView::RepoGone] {
+                assert_eq!(
+                    judge(false, missing, git, false),
+                    Verdict::Keep(Why::Doubt(doubt)),
+                    "{doubt:?} {git:?}"
+                );
+            }
+            assert_eq!(
+                judge(false, missing, GitView::Failed, false),
+                Verdict::Keep(Why::Doubt(doubt))
+            );
+            assert_eq!(
+                judge(true, missing, GitView::NotListed, false),
+                Verdict::Keep(Why::Pinned)
+            );
+        }
+        // Where volumes are mounted, a prune while unmounted also removes
+        // the registration: those doubts hold even when git lists nothing.
+        for doubt in [
+            Doubt::MountDirectory,
+            Doubt::HoldsMounts,
+            Doubt::Unreadable,
+            Doubt::NotADirectory,
+            Doubt::NoAncestor,
+        ] {
+            assert_eq!(
+                judge(
+                    false,
+                    Presence::Unverifiable(doubt),
+                    GitView::NotListed,
+                    false
+                ),
+                Verdict::Keep(Why::Doubt(doubt))
+            );
+        }
+    }
+
+    #[test]
+    fn last_worktree_of_an_emptied_directory_is_released_only_when_unregistered() {
+        // `/w` held only this worktree and is empty now.
+        let f = fs(&["/", "/src", "/src/r1", "/src/keep", "/w"]);
+        let make = || {
+            registry(vec![(
+                "/src/r1",
+                vec![("/w/only", entry((3000, 3004), false))],
+            )])
+        };
+        let mut r = make();
+        let main = listed("/src/r1", false, false);
+        let ev = run(&mut r, &f, Ok(vec![main.clone()]), true, false);
+        assert_eq!(ev, vec![released("/w/only", (3000, 3004))]);
+        // Listed as prunable (rm -rf, or an unmounted mount point): kept.
+        let mut r = make();
+        let ev = run(
+            &mut r,
+            &f,
+            Ok(vec![main, listed("/w/only", true, false)]),
+            true,
+            false,
+        );
+        assert_eq!(
+            ev,
+            vec![Event::Kept {
+                path: "/w/only".into(),
+                block: (3000, 3004),
+                why: Why::Doubt(Doubt::EmptyDirectory)
+            }]
+        );
+        // Repository unreadable: nothing is known, kept.
+        let mut r = make();
+        let ev = run(&mut r, &f, Err("broken".into()), true, false);
+        assert!(matches!(ev.as_slice(), [Event::Kept { .. }]), "{ev:?}");
+        assert_eq!(r.projects["/src/r1"].worktrees.len(), 1);
+    }
+
+    #[test]
+    fn a_listed_path_differing_only_in_case_is_not_unlisted() {
+        let listing = [
+            listed("/W/Only", true, false),
+            listed("/w/locked", false, true),
+        ];
+        assert_eq!(view(&listing, "/w/only"), GitView::Prunable);
+        assert_eq!(view(&listing, "/w/LOCKED"), GitView::Locked);
+        assert_eq!(view(&listing, "/w/other"), GitView::NotListed);
+    }
+
+    /// A filesystem whose every answer waits until the test lets it go.
+    struct BlockedFs(std::sync::Mutex<std::sync::mpsc::Receiver<()>>);
+
+    impl Fs for BlockedFs {
+        fn stat(&self, _: &Path) -> Stat {
+            let _ = self.0.lock().unwrap().recv();
+            Stat::Unknown
+        }
+        fn children(&self, _: &Path) -> Option<Children> {
+            None
+        }
+    }
+
+    #[test]
+    fn a_filesystem_that_does_not_answer_is_abandoned_within_the_budget() {
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let r = registry(vec![(
+            "/dead/repo",
+            vec![("/dead/wt", entry((3000, 3004), false))],
+        )]);
+        let started = Instant::now();
+        let out = run_bounded(
+            candidates(&r, Scope::All),
+            false,
+            Duration::from_millis(50),
+            Some(Duration::from_millis(100)),
+            Box::new(BlockedFs(std::sync::Mutex::new(blocked))),
+        );
+        let took = started.elapsed();
+        match out {
+            Bounded::Stuck(key) => assert_eq!(key.as_deref(), Some("/dead/repo")),
+            _ => panic!("the blocked lstat was not abandoned"),
+        }
+        assert!(took < Duration::from_secs(5), "waited {took:?}");
+        // The helper is still parked in its `lstat`; let it finish, and see
+        // that it gives its slot back.
+        assert!(HELPERS.load(Ordering::SeqCst) >= 1);
+        drop(release);
+        for _ in 0..200 {
+            if HELPERS.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the released helper never finished");
     }
 
     #[test]
