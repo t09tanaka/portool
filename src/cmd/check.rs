@@ -23,7 +23,11 @@ pub fn run() -> Result<()> {
             return Err(Error::General(format!("registry is corrupt: {reason}")));
         }
         store::LedgerLoad::UnsupportedVersion { found, supported } => {
-            return Err(Error::UnsupportedRegistryVersion { found, supported });
+            return Err(Error::UnsupportedRegistryVersion {
+                found,
+                supported,
+                path: None,
+            });
         }
         store::LedgerLoad::ReadError { reason } => {
             return Err(Error::General(format!("registry is unreadable: {reason}")));

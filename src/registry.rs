@@ -125,6 +125,7 @@ impl Registry {
             other => Err(Error::UnsupportedRegistryVersion {
                 found: other,
                 supported: Self::CURRENT_VERSION,
+                path: None,
             }),
         }
     }
@@ -146,6 +147,7 @@ impl Registry {
             return Err(Error::UnsupportedRegistryVersion {
                 found: self.version,
                 supported: Self::CURRENT_VERSION,
+                path: None,
             });
         }
         if self.range.0 > self.range.1 {

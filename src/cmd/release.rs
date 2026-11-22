@@ -76,13 +76,33 @@ pub(crate) fn release_worktree(ctx: &GitCtx) -> Result<bool> {
 /// desired end state); any other failure is a hard error so the caller
 /// never frees the ledger entry while the env file still exists.
 fn remove_env_file(ctx: &GitCtx) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
     let env_path = ctx.worktree_root.join(".env.portool");
-    match std::fs::remove_file(&env_path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(Error::General(format!(
-            "failed to remove {}: {err}; the ledger entry was left in place",
-            env_path.display()
-        ))),
+    let dir = match std::fs::File::options()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(&ctx.worktree_root)
+    {
+        Ok(dir) => dir,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(Error::General(format!(
+                "cannot open {} for release: {err}",
+                ctx.worktree_root.display()
+            )))
+        }
+    };
+    // SAFETY: dir remains open and the nul-terminated filename is fixed.
+    if unsafe { libc::unlinkat(dir.as_raw_fd(), c".env.portool".as_ptr(), 0) } == 0 {
+        return Ok(());
     }
+    let err = std::io::Error::last_os_error();
+    if err.kind() == std::io::ErrorKind::NotFound {
+        return Ok(());
+    }
+    Err(Error::General(format!(
+        "failed to remove {}: {err}; the ledger entry was left in place",
+        env_path.display()
+    )))
 }

@@ -319,9 +319,9 @@ pub fn load(path: &Path) -> LedgerLoad {
     });
     match result {
         Ok(registry) => LedgerLoad::Loaded(registry),
-        Err(Error::UnsupportedRegistryVersion { found, supported }) => {
-            LedgerLoad::UnsupportedVersion { found, supported }
-        }
+        Err(Error::UnsupportedRegistryVersion {
+            found, supported, ..
+        }) => LedgerLoad::UnsupportedVersion { found, supported },
         Err(err) => LedgerLoad::Corrupt {
             reason: err.to_string(),
         },
@@ -342,11 +342,13 @@ pub fn load_strict(path: &Path) -> Result<Option<Registry>> {
              to restore it from backup and rebuild this project's entries",
             path.display()
         ))),
-        LedgerLoad::UnsupportedVersion { found, supported } => Err(Error::General(format!(
-            "{} uses registry schema version {found}, but this build understands version \
-             {supported}; upgrade portool instead of modifying the ledger",
-            path.display()
-        ))),
+        LedgerLoad::UnsupportedVersion { found, supported } => {
+            Err(Error::UnsupportedRegistryVersion {
+                found,
+                supported,
+                path: Some(path.to_path_buf()),
+            })
+        }
         LedgerLoad::ReadError { reason } => Err(Error::General(format!(
             "failed to read {} ({reason}); aborting without writing to avoid clobbering an \
              intact ledger",
