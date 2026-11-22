@@ -11,10 +11,26 @@
 //! `$XDG_STATE_HOME/portool/registry.json` (fallback
 //! `$HOME/.local/state/portool`), guarded by an exclusive `flock` on
 //! `registry.json.lock` next to it, and the global
-//! `$XDG_CONFIG_HOME/portool/config.toml`. Those locations come from the
-//! process environment on every call. Library and CLI calls -- in the same
-//! process, in different processes, or both -- therefore serialize on the
-//! same lock and can never be handed the same port block.
+//! `$XDG_CONFIG_HOME/portool/config.toml`. By default those locations come
+//! from the process environment on every call. Library and CLI calls -- in
+//! the same process, in different processes, or both -- therefore serialize
+//! on the same lock and can never be handed the same port block.
+//!
+//! A caller that runs commands with an environment other than its own
+//! (a different `HOME` or `XDG_STATE_HOME`) passes that environment as a
+//! [`Context`] to [`Worktree::open_in`], [`release_removed_in`], or
+//! [`load_config_in`], so it uses the same ledger and config as those
+//! commands:
+//!
+//! ```no_run
+//! # fn main() -> Result<(), portool::Error> {
+//! let env = [("HOME", "/home/worker"), ("XDG_STATE_HOME", "/srv/state")];
+//! let ctx = portool::Context::from_env(env);
+//! let wt = portool::Worktree::open_in(&ctx, "/path/to/a/worktree")?;
+//! wt.allocate()?; // uses /srv/state/portool/registry.json
+//! portool::release_removed_in(&ctx, "/path/to/main/checkout", "/path/to/removed")?;
+//! # Ok(()) }
+//! ```
 //!
 //! # Example
 //!
@@ -81,6 +97,7 @@ mod warn;
 pub use config::Config;
 pub use error::{Error, Result};
 pub use manifest::Manifest;
+pub use paths::Context;
 
 use gitctx::GitCtx;
 use std::collections::BTreeMap;
@@ -156,7 +173,12 @@ pub struct ConfigLoad {
 /// alignment. A missing file yields [`Config::default`]; a malformed one is
 /// an error, exactly as for the CLI.
 pub fn load_config() -> Result<ConfigLoad> {
-    let (result, lines) = warn::collect(Config::load);
+    load_config_in(&Context::process())
+}
+
+/// [`load_config`] with the config location taken from `context`.
+pub fn load_config_in(context: &Context) -> Result<ConfigLoad> {
+    let (result, lines) = warn::collect(|| paths::scoped(context, Config::load));
     Ok(ConfigLoad {
         config: result?,
         warnings: warnings(lines),
@@ -261,15 +283,25 @@ pub enum Released {
 #[derive(Debug, Clone)]
 pub struct Worktree {
     ctx: GitCtx,
+    context: Context,
 }
 
 impl Worktree {
-    /// Opens the worktree containing `path` (any path inside it).
+    /// Opens the worktree containing `path` (any path inside it). Its
+    /// methods find the ledger and config from the process environment at
+    /// the time of each call ([`Context::process`]).
     ///
     /// Fails if `path` is not inside a git repository.
     pub fn open(path: impl AsRef<Path>) -> Result<Worktree> {
+        Worktree::open_in(&Context::process(), path)
+    }
+
+    /// [`Worktree::open`] with the ledger and config locations taken from
+    /// `context`; every method of the returned handle uses them.
+    pub fn open_in(context: &Context, path: impl AsRef<Path>) -> Result<Worktree> {
         Ok(Worktree {
             ctx: GitCtx::discover(path.as_ref())?,
+            context: context.clone(),
         })
     }
 
@@ -297,14 +329,17 @@ impl Worktree {
     /// `.env.portool`, like `portool sync --quiet`. Idempotent: an existing
     /// up-to-date allocation is returned unchanged.
     pub fn allocate(&self) -> Result<Allocation> {
-        let (outcome, lines) = warn::collect(|| cmd::sync::ensure(&self.ctx, true));
+        let (outcome, lines) =
+            warn::collect(|| paths::scoped(&self.context, || cmd::sync::ensure(&self.ctx, true)));
         self.allocation(outcome?, lines)
     }
 
     /// Forces this worktree onto a fresh, different block, like
     /// `portool reallocate --quiet`. Errors if it has no allocation yet.
     pub fn reallocate(&self) -> Result<Allocation> {
-        let (outcome, lines) = warn::collect(|| cmd::sync::reallocate(&self.ctx, true));
+        let (outcome, lines) = warn::collect(|| {
+            paths::scoped(&self.context, || cmd::sync::reallocate(&self.ctx, true))
+        });
         self.allocation(outcome?, lines)
     }
 
@@ -321,15 +356,17 @@ impl Worktree {
             PortCheck::Reallocate => (false, false, true),
         };
         let (vars, lines) = warn::collect(|| {
-            cmd::exec::build_env(
-                &self.ctx,
-                &options.env_files,
-                check,
-                strict,
-                reallocate,
-                options.env_file_overrides,
-                options.inherited.clone(),
-            )
+            paths::scoped(&self.context, || {
+                cmd::exec::build_env(
+                    &self.ctx,
+                    &options.env_files,
+                    check,
+                    strict,
+                    reallocate,
+                    options.env_file_overrides,
+                    options.inherited.clone(),
+                )
+            })
         });
         Ok(ExecOutput {
             vars: vars?,
@@ -341,7 +378,7 @@ impl Worktree {
     /// like `portool release`. Having no allocation is success
     /// ([`Released::NothingToRelease`]).
     pub fn release(&self) -> Result<ReleaseOutcome> {
-        release_ctx(&self.ctx)
+        release_ctx(&self.context, &self.ctx)
     }
 
     fn allocation(
@@ -375,16 +412,29 @@ impl Worktree {
 /// deleted from disk. `repo` is any live worktree of the same project
 /// (typically the main checkout); `worktree` is the removed worktree's
 /// path. Use [`Worktree::release`] while the worktree still exists.
+///
+/// The ledger is found from the process environment
+/// ([`Context::process`]); see [`release_removed_in`].
 pub fn release_removed(
     repo: impl AsRef<Path>,
     worktree: impl AsRef<Path>,
 ) -> Result<ReleaseOutcome> {
-    let ctx = GitCtx::for_worktree_path(repo.as_ref(), worktree.as_ref())?;
-    release_ctx(&ctx)
+    release_removed_in(&Context::process(), repo, worktree)
 }
 
-fn release_ctx(ctx: &GitCtx) -> Result<ReleaseOutcome> {
-    let (freed, lines) = warn::collect(|| cmd::release::release_worktree(ctx));
+/// [`release_removed`] with the ledger location taken from `context`.
+pub fn release_removed_in(
+    context: &Context,
+    repo: impl AsRef<Path>,
+    worktree: impl AsRef<Path>,
+) -> Result<ReleaseOutcome> {
+    let ctx = GitCtx::for_worktree_path(repo.as_ref(), worktree.as_ref())?;
+    release_ctx(context, &ctx)
+}
+
+fn release_ctx(context: &Context, ctx: &GitCtx) -> Result<ReleaseOutcome> {
+    let (freed, lines) =
+        warn::collect(|| paths::scoped(context, || cmd::release::release_worktree(ctx)));
     Ok(ReleaseOutcome {
         released: if freed? {
             Released::Freed

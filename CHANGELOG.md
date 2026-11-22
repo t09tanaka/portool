@@ -5,6 +5,10 @@ All notable changes to portool are documented here. The format is based on
 [Semantic Versioning](https://semver.org/) (pre-1.0: a breaking change bumps
 the minor version).
 
+## [0.13.0] - 2026-11-22
+
+Library callers can use `Context::from_env` to select the same registry and configuration as a child process. Unsupported registry versions include the affected path and leave the registry intact.
+
 ## [0.12.0] - 2026-11-21
 
 A public entry point for running the CLI in-process. **The CLI is

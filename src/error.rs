@@ -11,10 +11,19 @@ pub enum Error {
     /// A general, unstructured error (exit code 1).
     General(String),
     /// The on-disk ledger uses a schema version this build does not
-    /// understand (exit code 1). Kept distinct from generic corruption so
-    /// callers never treat a ledger written by a *newer* portool as
-    /// something to repair or reset.
-    UnsupportedRegistryVersion { found: u32, supported: u32 },
+    /// understand (exit code 1), typically because a *newer* portool wrote
+    /// it. Kept distinct from generic corruption so callers never treat
+    /// such a ledger as something to repair or reset; upgrade portool
+    /// instead. Every operation that reads the ledger before using it
+    /// (allocating, releasing, `exec_env`, ...) fails with this variant.
+    UnsupportedRegistryVersion {
+        /// The schema version in the file.
+        found: u32,
+        /// The newest schema version this build understands.
+        supported: u32,
+        /// The ledger file, when known.
+        path: Option<std::path::PathBuf>,
+    },
     /// The configured pool has no room left for a block anywhere in the
     /// range (exit code 3). Exit code 2 is retired along with the old
     /// per-project subrange model (hardening batch C).
@@ -47,9 +56,23 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::General(msg) => write!(f, "{msg}"),
-            Error::UnsupportedRegistryVersion { found, supported } => write!(
+            Error::UnsupportedRegistryVersion {
+                found,
+                supported,
+                path: None,
+            } => write!(
                 f,
                 "unsupported registry version {found} (this build understands version {supported})"
+            ),
+            Error::UnsupportedRegistryVersion {
+                found,
+                supported,
+                path: Some(path),
+            } => write!(
+                f,
+                "{} uses registry schema version {found}, but this build understands version \
+                 {supported}; upgrade portool instead of modifying the ledger",
+                path.display()
             ),
             Error::PoolExhausted => write!(f, "pool exhausted"),
             Error::LockTimeout => write!(f, "lock timeout"),
