@@ -228,11 +228,10 @@ fn slow_path(ctx: &GitCtx, config: &Config, quiet: bool) -> Result<SyncOutcome> 
     // freeing this project's stale entries first lets a re-created worktree
     // on the same branch reclaim its just-freed block instead of forcing a
     // fresh one that only becomes free after the fact.
-    if let Some(project) = registry.projects.get_mut(&common_dir_key) {
-        let live_worktrees = ctx.worktree_list()?;
-        let dir_exists = |p: &Path| p.exists();
-        let block_unused = |b: (u16, u16)| ports::block_free(b);
-        crate::gc::collect(project, &live_worktrees, &dir_exists, &block_unused);
+    // The sweep covers every project, not just this one: a vanished worktree
+    // anywhere frees its ports at the next allocation.
+    if crate::reclaim::auto(&mut registry) {
+        store::save(&registry_path, &mut registry)?;
     }
 
     let manifest_state = load_manifest_state(&ctx.worktree_root)?;
@@ -502,6 +501,7 @@ pub fn reallocate(ctx: &GitCtx, quiet: bool) -> Result<SyncOutcome> {
     let registry_path = paths::registry_path()?;
     let mut registry =
         store::load_strict(&registry_path)?.unwrap_or_else(|| Registry::empty(config.range));
+    crate::reclaim::auto_and_save(&mut registry, &registry_path)?;
 
     let common_dir_key = key(&ctx.common_dir);
     let worktree_key = key(&ctx.worktree_root);

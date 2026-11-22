@@ -5,6 +5,25 @@ All notable changes to portool are documented here. The format is based on
 [Semantic Versioning](https://semver.org/) (pre-1.0: a breaking change bumps
 the minor version).
 
+## [Unreleased]
+
+### Changed
+
+- Allocations whose worktree directory is gone are released by every command
+  that writes the ledger, for all projects, not only by `portool prune --all`
+  or `sync` for the current project. The rule is the one `prune --all` uses;
+  `prune` and the automatic sweep now share one implementation. A path on an
+  unmounted volume (nearest existing ancestor is `/Volumes`, `/mnt`, `/media`
+  or `/run/media/...`, or an empty mount point below one) is no longer treated
+  as gone by `prune` either.
+- Only the newest `registry.json.corrupt-*` copy is kept, and it is removed
+  after 7 days, at the next ledger save.
+- Temp files of atomic writes are named `.portool-tmp-<pid>-<random>` (they
+  were `.tmpXXXXXX`), and a crash leftover whose owner is dead and that is 10
+  minutes old is removed by the next write to the same directory.
+- The registry file format is unchanged; 0.13.0 and this version read each
+  other's ledgers.
+
 ## [0.13.0] - 2026-11-22
 
 Library callers can select the registry and the config a child process

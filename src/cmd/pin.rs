@@ -29,6 +29,7 @@ fn set_pinned(pinned: bool, label: Option<String>) -> Result<()> {
     let registry_path = paths::registry_path()?;
     let mut registry =
         store::load_strict(&registry_path)?.ok_or_else(|| no_allocation(&worktree_key))?;
+    crate::reclaim::auto_and_save(&mut registry, &registry_path)?;
     let entry = registry
         .find_project_mut(&common_dir_key)
         .and_then(|p| p.worktrees.get_mut(&worktree_key))

@@ -564,9 +564,15 @@ when the dir/env is gone); `state` is one of `ok`, `pending_move`,
 
 ### `portool prune`
 
-Explicitly reclaims stale worktree entries (the same check `sync` runs
-implicitly, on demand). A whole project's entry is reclaimed only once its
-entire repository clone (`common_dir`) is gone.
+Reclaims stale worktree entries on demand. Nothing needs it: every command
+that writes the ledger runs the same reclamation for **all** projects
+(see [What portool leaves on disk](#what-portool-leaves-on-disk)), so `prune`
+only reports what it removes, or with `--dry-run` what it would. A whole
+project's entry is reclaimed only once its entire repository clone
+(`common_dir`) is gone. A path on an unmounted volume is never "gone": if
+the nearest existing ancestor is a mount-parent directory (`/Volumes`,
+`/mnt`, `/media`, `/run/media/<user>`) or an empty mount point below one,
+the entry is kept.
 
 | Flag | Effect |
 |---|---|
@@ -599,8 +605,8 @@ and show up in `portool ls`'s table footer and `--json` output.
 
 ### `portool pin` / `portool unpin`
 
-Exempts the current worktree's allocation from every GC path (implicit
-`sync` GC, `prune`) until unpinned:
+Exempts the current worktree's allocation from every GC path (the
+automatic reclamation, `prune`) until unpinned:
 
 ```sh
 portool pin --label "long-lived staging"
@@ -730,6 +736,22 @@ rename, not an in-place copy — so a crash mid-backup can't leave it
 half-overwritten either. This is the standard POSIX `fsync`/`rename`
 durability guarantee; portool does not additionally issue macOS's stronger
 `F_FULLFSYNC`.
+
+### What portool leaves on disk
+
+Everything portool writes that outlives the command, and what removes it.
+No manual command is needed for any row; the sweeps run inside commands
+that already write the same place.
+
+| What | Where | Kept how long / how much | Removed by |
+|---|---|---|---|
+| Ledger `registry.json`, lock `registry.json.lock` | state dir | one each, for as long as the ledger is used (every command reads them) | never; the ledger is the product, the empty lock file is its fixed-size companion |
+| Allocation entries | in the ledger | until the worktree directory is gone (a repository that is gone drops all its entries); pinned entries and entries whose ports are in use are exempt | every command that writes the ledger (`sync` slow path, `reallocate`, `release`, `pin`, `unpin`, `reserve`, `unreserve`), for **all** projects, one `stat` per entry (git is asked only for a project that has a vanished worktree); also `prune` |
+| `registry.json.bak` | state dir | one; the last saved ledger, read by `doctor --repair` | overwritten by every save |
+| `registry.json.corrupt-<nanos>-<pid>` | state dir | at most one (the newest), read by a human right after `doctor --repair`; at most 7 days | the next ledger save |
+| Crash temp files `.portool-tmp-<pid>-*` | next to the file being written: state dir, worktree root (`.env.portool`), hook directories | none in normal operation; after a crash until the next write to the same directory, and only if the owner pid is dead and the file is 10 minutes old | the next write to that directory; the state dir also clears pre-0.14 `.tmpXXXXXX` files (every writer there holds the lock). Pre-0.14 `.tmpXXXXXX` files left in a worktree root are not portool-only names and are never touched |
+| `.env.portool` | worktree root | one per worktree, while the worktree has an allocation | `release`, `init --uninstall`, or deleting the worktree |
+| Hook content | `post-checkout` / `post-merge` | one managed block per hook | `unhook`, `init --uninstall` |
 
 ### `post-checkout` hook
 

@@ -67,7 +67,13 @@ pub(crate) fn release_worktree(ctx: &GitCtx) -> Result<bool> {
             .expect("has_entry checked above")
             .worktrees
             .remove(&worktree_key);
+        // After the removal above, so a vanished worktree still reports
+        // `Freed` here rather than being swept first; then the sweep for
+        // every other project rides on the same save.
+        crate::reclaim::auto(&mut registry);
         store::save(&registry_path, &mut registry)?;
+    } else {
+        crate::reclaim::auto_and_save(&mut registry, &registry_path)?;
     }
     Ok(has_entry)
 }

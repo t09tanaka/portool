@@ -19,6 +19,7 @@ pub fn reserve(spec: &str, label: Option<String>) -> Result<()> {
     let registry_path = paths::registry_path()?;
     let mut registry =
         store::load_strict(&registry_path)?.unwrap_or_else(|| Registry::empty(config.range));
+    crate::reclaim::auto_and_save(&mut registry, &registry_path)?;
 
     if let Some(existing) = registry.reservations.iter_mut().find(|r| r.block == block) {
         if label.is_some() && label != existing.label {
@@ -63,6 +64,7 @@ pub fn unreserve(spec: &str) -> Result<()> {
     let registry_path = paths::registry_path()?;
     let mut registry = store::load_strict(&registry_path)?
         .ok_or_else(|| Error::General("no registry exists; nothing is reserved".to_string()))?;
+    crate::reclaim::auto_and_save(&mut registry, &registry_path)?;
 
     let index = registry.reservations.iter().position(|r| {
         if single_port {
