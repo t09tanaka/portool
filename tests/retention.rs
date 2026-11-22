@@ -827,6 +827,65 @@ fn own_stack_manifest_growth_extends_in_place() {
     assert_eq!(grown.1, block.0 + width * 2 - 1);
 }
 
+/// The one place where the wider probe changes what a worktree with its
+/// stack up sees: growth that cannot happen in place. `sync` has always
+/// refused to move a block something listens on; it now also sees a stack
+/// published on `0.0.0.0`, which the old probe missed on macOS (and moved).
+#[test]
+fn own_stack_blocked_growth_is_refused_and_nothing_moves() {
+    let env = TestEnv::new();
+    env.write_config("range = [18250, 18299]\n");
+    let repo = env.path("own-blocked");
+    init_repo(&repo);
+    ok(env.run(&repo, &["sync"]));
+    let first = block_of(&env, &repo).unwrap();
+    let width = first.1 - first.0 + 1;
+    let block = (18250, 18250 + width - 1);
+    set_block(&env, &repo, block);
+    // The neighbour is reserved, so the block cannot grow in place.
+    let neighbour = format!("{}-{}", block.1 + 1, block.1 + width);
+    ok(env.run(&repo, &["reserve", &neighbour]));
+    let _stack = std::net::TcpListener::bind(("0.0.0.0", block.0)).unwrap();
+
+    std::fs::write(
+        repo.join(".portool.toml"),
+        format!("[ports]\nweb = 0\nworker = {}\n", width * 2 - 1),
+    )
+    .unwrap();
+    let out = env.run(&repo, &["sync"]);
+    assert!(!out.status.success(), "a move under a running stack");
+    assert!(
+        stderr(&out).contains("portool reallocate"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(block_of(&env, &repo), Some(block), "no port may move");
+}
+
+#[test]
+fn a_failed_check_writes_nothing_on_a_path_that_does_not_save() {
+    let env = TestEnv::new();
+    env.write_config("range = [18300, 18349]\n");
+    let (a, b, a_wt) = two_projects(&env);
+    let c = env.path("c");
+    init_repo(&c);
+    std::fs::remove_dir_all(&a_wt).unwrap();
+    std::fs::write(a.join(".git").join("HEAD"), "garbage\n").unwrap();
+    let state = env.state.join("portool");
+    let before = (names(&state), std::fs::read(env.registry_path()).unwrap());
+
+    // `release` in a worktree without an allocation saves nothing.
+    let out = ok(env.run(&c, &["release"]));
+    assert_eq!(stderr(&out).matches("could not check").count(), 1);
+    assert_eq!(
+        (names(&state), std::fs::read(env.registry_path()).unwrap()),
+        before
+    );
+    // A command that saves remembers the failure.
+    ok(env.run(&b, &["pin"]));
+    assert!(state.join("stale-check-failed.json").exists());
+}
+
 #[test]
 fn own_stack_exec_and_doctor_report_what_they_always_did() {
     let env = TestEnv::new();

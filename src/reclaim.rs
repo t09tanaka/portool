@@ -553,17 +553,25 @@ pub fn sweep_project(
 }
 
 /// Evidence gathered before the ledger lock, to apply under it.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct Plan {
     gathered: Gathered,
+    /// Failed checks to remember, written only by [`Plan::apply`].
+    memory: Option<Memory>,
 }
 
 impl Plan {
     /// Automatic use: applies silently, right before the save the command
-    /// makes anyway. Never fails and never writes.
+    /// makes anyway. Never fails and never touches the ledger file. This is
+    /// also the only place the failed-check memory is written: a command
+    /// path that does not save the ledger never calls it, and so writes
+    /// nothing at all (the price: such a path asks a failing project again).
     pub fn apply(&self, registry: &mut Registry) {
         if !self.gathered.findings.is_empty() || !self.gathered.droppable.is_empty() {
             self.gathered.apply(registry, &ports::block_free);
+        }
+        if let Some(memory) = &self.memory {
+            memory.store();
         }
     }
 
@@ -586,6 +594,8 @@ impl Plan {
 /// Cost when every worktree directory exists: one read of the ledger, one
 /// failed `open` of [`MEMORY_FILE`], one helper thread and one `lstat` per
 /// unpinned entry. With no unpinned entry in scope: only the ledger read.
+/// It writes nothing itself; what it learned about failing projects is
+/// written by [`Plan::apply`].
 pub fn plan(ledger: &Path, scope: Scope) -> Plan {
     let registry = match crate::store::load(ledger) {
         crate::store::LedgerLoad::Loaded(registry) => registry,
@@ -617,10 +627,13 @@ pub fn plan(ledger: &Path, scope: Scope) -> Plan {
         }
     };
     for (key, reason) in &gathered.git_failed {
-        memory.note(key);
-        problems.push(format!("{}: {reason}", crate::display::text(key)));
+        // A project that was merely not reached in time is neither broken
+        // nor worth a warning: the next command checks it.
+        if reason != OUT_OF_TIME {
+            memory.note(key);
+            problems.push(format!("{}: {reason}", crate::display::text(key)));
+        }
     }
-    memory.store();
     if !problems.is_empty() {
         crate::warn::emit(format_args!(
             "portool: warning: could not check {} project(s) for stale allocations ({}); \
@@ -631,7 +644,10 @@ pub fn plan(ledger: &Path, scope: Scope) -> Plan {
             RETRY_AFTER.as_secs() / 60
         ));
     }
-    Plan { gathered }
+    Plan {
+        gathered,
+        memory: Some(memory),
+    }
 }
 
 /// `portool prune --all`: the same evidence, for every project, without the
@@ -643,8 +659,14 @@ pub fn plan_manual(registry: &Registry, force: bool) -> Plan {
         Bounded::Done(gathered) => gathered,
         Bounded::Skipped | Bounded::Stuck(_) => Gathered::default(),
     };
-    Plan { gathered }
+    Plan {
+        gathered,
+        memory: None,
+    }
 }
+
+/// The reason given for a project the time budget did not reach.
+const OUT_OF_TIME: &str = "no time left in this command";
 
 enum Bounded {
     Done(Gathered),
@@ -691,7 +713,7 @@ fn run_bounded(
                     None => git_timeout,
                 };
                 if allowed.is_zero() {
-                    return Err("no time left in this command".to_string());
+                    return Err(OUT_OF_TIME.to_string());
                 }
                 gitctx::worktree_listing_bounded(dir, allowed)
             };

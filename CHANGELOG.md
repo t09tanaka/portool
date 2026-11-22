@@ -20,7 +20,8 @@ the minor version).
   `prune --all` and the automatic check: the worktree directory must not
   exist; the nearest existing directory above it must be an ordinary,
   non-empty directory (not a mount point, not holding mount points, not
-  `/Volumes`, `/mnt`, `/media`, `/net`, `/run/media` or directly below one);
+  `/Volumes`, `/mnt`, `/media`, `/net`, `/Network`, `/run/media`,
+  `/run/media/<user>` or directly below one of these);
   git must no longer list the worktree, or list it as `prunable` and not
   `locked`; and its ports must be unused. Consequences:
   - a worktree removed with `rm -rf` is released without `git worktree
