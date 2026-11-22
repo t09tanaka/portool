@@ -279,6 +279,14 @@ pub enum Released {
     NothingToRelease,
 }
 
+/// Check whether this version can read the selected registry without creating,
+/// repairing, or updating the ledger. A missing registry is valid.
+pub fn check_registry_in(context: &Context) -> Result<()> {
+    paths::scoped(context, || {
+        store::load_strict(&paths::registry_path()?).map(|_| ())
+    })
+}
+
 /// A git worktree that portool can allocate ports for.
 #[derive(Debug, Clone)]
 pub struct Worktree {

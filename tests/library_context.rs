@@ -157,6 +157,10 @@ fn explicit_context_selects_the_ledger_and_config() {
     // A ledger from a newer portool: typed error, file left as it was.
     let future = br#"{"version":999,"range":[3000,9999],"projects":{},"reservations":[]}"#;
     fs::write(&registry, future).unwrap();
+    assert!(matches!(
+        portool::check_registry_in(&ctx),
+        Err(Error::UnsupportedRegistryVersion { found: 999, .. })
+    ));
     match main.allocate() {
         Err(Error::UnsupportedRegistryVersion {
             found: 999, path, ..
