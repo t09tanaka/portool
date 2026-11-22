@@ -29,6 +29,16 @@ pub fn block_free(block: (u16, u16)) -> bool {
     (block.0..=block.1).all(port_free)
 }
 
+/// Whether something listens on `block` as seen from `127.0.0.1` alone, the
+/// way every release up to 0.13 probed. For the places that look at a
+/// worktree's *own* block (`exec --check-ports`, `doctor`'s report): there
+/// the listener is normally the worktree's own stack, and what those
+/// commands warn about or move on must not change. Never use it to decide
+/// that a block can be handed out or released -- that is [`block_free`].
+pub fn loopback_block_free(block: (u16, u16)) -> bool {
+    (block.0..=block.1).all(|port| std::net::TcpListener::bind(("127.0.0.1", port)).is_ok())
+}
+
 /// Binds `ip:port` on a fresh socket with no `SO_REUSEADDR` (and, for IPv6,
 /// `IPV6_V6ONLY` so the two probes cover disjoint address spaces).
 ///

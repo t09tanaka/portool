@@ -410,7 +410,19 @@ pub fn move_aside(path: &Path) -> Result<PathBuf> {
             corrupt_path.display()
         ))
     })?;
+    stamp_now(&corrupt_path);
     Ok(corrupt_path)
+}
+
+/// Sets a file's modification time to now. A set-aside copy keeps the
+/// ledger's own modification time when renamed (and when cloned by
+/// `fs::copy` on APFS); its retention counts from the repair, not from the
+/// ledger's last write. Best effort: the command that made the copy never
+/// deletes it either way.
+fn stamp_now(path: &Path) {
+    if let Ok(file) = fs::File::options().write(true).open(path) {
+        let _ = file.set_modified(SystemTime::now());
+    }
 }
 
 /// Copies the (bad) ledger to a `.corrupt-<nanos>-<pid>` sibling without
@@ -428,6 +440,7 @@ pub fn copy_aside(path: &Path) -> Result<PathBuf> {
             corrupt_path.display()
         ))
     })?;
+    stamp_now(&corrupt_path);
     Ok(corrupt_path)
 }
 

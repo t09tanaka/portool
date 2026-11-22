@@ -82,7 +82,6 @@ mod envfile;
 mod envread;
 mod error;
 mod fault;
-mod gc;
 mod gitctx;
 mod hooks;
 mod identity;

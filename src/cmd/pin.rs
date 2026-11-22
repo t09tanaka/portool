@@ -25,11 +25,11 @@ fn set_pinned(pinned: bool, label: Option<String>) -> Result<()> {
     let common_dir_key = ctx.common_dir.to_string_lossy().into_owned();
     let worktree_key = ctx.worktree_root.to_string_lossy().into_owned();
 
-    let _lock = lock::acquire(&paths::lock_path()?, LOCK_TIMEOUT)?;
     let registry_path = paths::registry_path()?;
+    let sweep = crate::reclaim::plan(&registry_path, crate::reclaim::Scope::All);
+    let _lock = lock::acquire(&paths::lock_path()?, LOCK_TIMEOUT)?;
     let mut registry =
         store::load_strict(&registry_path)?.ok_or_else(|| no_allocation(&worktree_key))?;
-    crate::reclaim::auto_and_save(&mut registry, &registry_path)?;
     let entry = registry
         .find_project_mut(&common_dir_key)
         .and_then(|p| p.worktrees.get_mut(&worktree_key))
@@ -45,6 +45,7 @@ fn set_pinned(pinned: bool, label: Option<String>) -> Result<()> {
         // later label-less pin does not resurrect a stale name.
         entry.label = None;
     }
+    sweep.apply(&mut registry);
     store::save(&registry_path, &mut registry)?;
     println!(
         "portool: {} {}",

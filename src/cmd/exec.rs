@@ -91,7 +91,7 @@ pub(crate) fn build_env(
     // default-on check made every second `portool exec` noisy. --strict
     // and --reallocate-on-conflict imply the check.
     let check = check_ports || strict || reallocate_on_conflict;
-    let outcome = if !check || ports::block_free(outcome.block) {
+    let outcome = if !check || ports::loopback_block_free(outcome.block) {
         outcome
     } else if reallocate_on_conflict {
         crate::warn::emit(format_args!(

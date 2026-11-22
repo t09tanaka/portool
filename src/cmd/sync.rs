@@ -188,9 +188,16 @@ fn try_fast_path(ctx: &GitCtx) -> Result<Option<SyncOutcome>> {
 /// reset (external review P1 #1); `doctor --repair` is the explicit
 /// recovery path.
 fn slow_path(ctx: &GitCtx, config: &Config, quiet: bool) -> Result<SyncOutcome> {
+    let registry_path = paths::registry_path()?;
+    // Evidence about every OTHER project's vanished worktrees, gathered
+    // before the lock (it may wait on their filesystems and git); applied
+    // below, in memory, ahead of the save this path always makes.
+    let sweep = crate::reclaim::plan(
+        &registry_path,
+        crate::reclaim::Scope::Except(&key(&ctx.common_dir)),
+    );
     let _lock = lock::acquire(&paths::lock_path()?, LOCK_TIMEOUT)?;
 
-    let registry_path = paths::registry_path()?;
     // Frozen decision 14: a freshly created ledger records the live pool at
     // creation time; it is never updated after that.
     let mut registry =
@@ -228,11 +235,17 @@ fn slow_path(ctx: &GitCtx, config: &Config, quiet: bool) -> Result<SyncOutcome> 
     // freeing this project's stale entries first lets a re-created worktree
     // on the same branch reclaim its just-freed block instead of forcing a
     // fresh one that only becomes free after the fact.
-    // The sweep covers every project, not just this one: a vanished worktree
-    // anywhere frees its ports at the next allocation.
-    if crate::reclaim::auto(&mut registry) {
-        store::save(&registry_path, &mut registry)?;
-    }
+    // This project is examined here, under the lock, with the git and the
+    // files this command works on anyway (git runs only if a directory is
+    // missing). Nothing is saved here: the removals ride on the save below.
+    crate::reclaim::sweep_project(
+        &mut registry,
+        &common_dir_key,
+        &|| crate::gitctx::worktree_listing_at(&ctx.worktree_root).map_err(|e| e.to_string()),
+        false,
+    )
+    .map_err(Error::General)?;
+    sweep.apply(&mut registry);
 
     let manifest_state = load_manifest_state(&ctx.worktree_root)?;
     let block_size = manifest_state
@@ -495,13 +508,13 @@ pub fn reallocate_cmd(quiet: bool) -> Result<()> {
 /// has no ledger entry yet (run `sync` first), and with `PoolExhausted`
 /// when no other block fits.
 pub fn reallocate(ctx: &GitCtx, quiet: bool) -> Result<SyncOutcome> {
+    let registry_path = paths::registry_path()?;
+    let sweep = crate::reclaim::plan(&registry_path, crate::reclaim::Scope::All);
     let _lock = lock::acquire(&paths::lock_path()?, LOCK_TIMEOUT)?;
 
     let config = Config::load()?;
-    let registry_path = paths::registry_path()?;
     let mut registry =
         store::load_strict(&registry_path)?.unwrap_or_else(|| Registry::empty(config.range));
-    crate::reclaim::auto_and_save(&mut registry, &registry_path)?;
 
     let common_dir_key = key(&ctx.common_dir);
     let worktree_key = key(&ctx.worktree_root);
@@ -564,6 +577,7 @@ pub fn reallocate(ctx: &GitCtx, quiet: bool) -> Result<SyncOutcome> {
             .expect("entry existed above");
         entry.pending_block = Some(new_block);
     }
+    sweep.apply(&mut registry);
     store::save(&registry_path, &mut registry)?;
     crate::fault::point("after_pending_save");
 
