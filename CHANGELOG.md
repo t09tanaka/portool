@@ -7,7 +7,39 @@ the minor version).
 
 ## [0.13.0] - 2026-11-22
 
-Library callers can use `Context::from_env` to select the same registry and configuration as a child process. Unsupported registry versions include the affected path and leave the registry intact.
+Library callers can select the registry and the config a child process
+sees. **The CLI is unchanged**, except for the wording of one error (below).
+
+### Added
+
+- `portool::Context` names where portool keeps its registry, its lock and
+  its global config. `Context::process()` reads `HOME`, `XDG_STATE_HOME` and
+  `XDG_CONFIG_HOME` from the process on every call, as before.
+  `Context::from_env(vars)` takes them from the given name/value pairs and
+  never consults the process environment. Use it when the caller runs
+  commands with an environment different from its own.
+- `Worktree::open_in`, `release_removed_in` and `load_config_in` are the
+  existing functions with the locations taken from a `Context`.
+- `check_registry_in(context)` reports whether this version can read the
+  selected registry. It does not create, repair or update the registry, and
+  a missing registry is valid.
+
+### Changed
+
+- **Breaking (library):** `Error::UnsupportedRegistryVersion` has a new
+  field `path: Option<PathBuf>`, the registry file when it is known. Code
+  that constructs the variant or matches it without `..` needs the field.
+- With a path, the message of that error is now `<path> uses registry
+  schema version <found>, but this build understands version <supported>;
+  upgrade portool instead of modifying the ledger`. The exit code is still 1.
+- `release_removed` no longer resolves a symlink in the last component of
+  the worktree path. It canonicalizes the parent directory and keeps the
+  last component as given, so a teardown hook that replaces the worktree
+  with a symlink cannot redirect the cleanup. Pass the path the worktree
+  was created at: for a path whose last component is a symlink to the
+  worktree, the result is `NothingToRelease`.
+- Releasing removes `.env.portool` relative to the opened worktree
+  directory, and does not follow a symlink at the worktree path.
 
 ## [0.12.0] - 2026-11-21
 
