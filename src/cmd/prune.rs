@@ -28,14 +28,10 @@ pub fn run(all: bool, dry_run: bool, forget_unverifiable: bool) -> Result<()> {
 
     // Other projects' files and git are examined before the lock is taken:
     // a dead network mount must not stall every other portool command.
-    let plan = if all {
-        match store::load_strict(&registry_path)? {
-            Some(snapshot) => Some(reclaim::plan_manual(&snapshot, forget_unverifiable)),
-            None => return Ok(()), // no ledger -> nothing to prune
-        }
-    } else {
-        None
+    let Some(snapshot) = store::load_strict(&registry_path)? else {
+        return Ok(()); // no ledger -> nothing to prune
     };
+    let plan = all.then(|| reclaim::plan_manual(&snapshot, forget_unverifiable));
     let ctx = match plan {
         Some(_) => None,
         None => Some(GitCtx::discover(&cwd)?),

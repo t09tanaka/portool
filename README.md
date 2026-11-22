@@ -319,7 +319,7 @@ portool exec       [-e <PATH>]... [--check-ports] [--strict] [--reallocate-on-co
                    [--env-file-overrides] -- <COMMAND> [ARGS...]
 portool reallocate [--quiet]
 portool ls         [--json] [--all]
-portool prune      [--all] [--dry-run]
+portool prune      [--all] [--dry-run] [--forget-unverifiable]
 portool check
 portool doctor     [--repair] [--abandon-other-projects]
 portool release
@@ -564,20 +564,43 @@ when the dir/env is gone); `state` is one of `ok`, `pending_move`,
 
 ### `portool prune`
 
-Reclaims stale worktree entries on demand. Nothing needs it: every command
-that writes the ledger runs the same reclamation for **all** projects
-(see [What portool leaves on disk](#what-portool-leaves-on-disk)), so `prune`
-only reports what it removes, or with `--dry-run` what it would. A whole
-project's entry is reclaimed only once its entire repository clone
-(`common_dir`) is gone. A path on an unmounted volume is never "gone": if
-the nearest existing ancestor is a mount-parent directory (`/Volumes`,
-`/mnt`, `/media`, `/run/media/<user>`) or an empty mount point below one,
-the entry is kept.
+Reclaims stale worktree entries on demand and reports them. The commands
+that save the ledger apply the same rule on their own (see
+[What portool leaves on disk](#what-portool-leaves-on-disk)); `prune` adds
+the report, `--dry-run`, and the override below.
+
+Releasing an allocation that is still in use would hand the same ports to
+two worktrees, so an entry is released only when **all** of this holds:
+
+1. It is not pinned.
+2. Its worktree directory is verifiably gone: it does not exist, and the
+   nearest directory above it that does exist is an ordinary, non-empty
+   directory -- not a mount point, not a directory that holds mount points,
+   and not `/Volumes`, `/mnt`, `/media`, `/net`, `/run/media` or a directory
+   directly below one. Anything else may be a volume that is only
+   unmounted, and the entry is kept. (So is the last worktree removed from
+   a directory that is now empty, until that directory is removed or used
+   again: an empty directory is what an unmounted mount point looks like.)
+3. Git agrees: the worktree is no longer listed by `git worktree list`, or
+   is listed as `prunable` (what `rm -rf` of a worktree leaves; needs git
+   2.31 or later -- an older git keeps listing it until `git worktree
+   prune`) and is not `locked`. If the repository itself is verifiably gone
+   there is no git to ask, and rule 2 decides for each entry on its own: a
+   repository that was renamed or re-cloned does not release worktrees that
+   still exist.
+4. None of its ports is in use.
+
+A project's entry is dropped when its repository is gone and its last
+worktree entry has been released.
+
+`prune` prints each entry it keeps although its directory is missing, with
+the reason, on stderr.
 
 | Flag | Effect |
 |---|---|
-| `--all` | Operate across every project instead of just the current one. |
+| `--all` | Operate across every project instead of just the current one. Other projects are examined before the ledger lock is taken; a project whose git does not answer within 10 seconds is skipped and reported. |
 | `--dry-run` | Print what would be reclaimed without touching the ledger. |
+| `--forget-unverifiable` | Also drop entries that fail only rule 2's "verifiably" or rule 3's "git agrees" because nothing can be verified: a volume that will never be mounted again, a repository git can no longer read. The directory must still be missing, the entry unpinned, the worktree not listed as live or locked, and its ports unused. Each dropped entry is printed with the reason it had been kept; combine with `--dry-run` to see the list first. Only this flag does this; nothing automatic ever does. |
 
 ### `portool reserve` / `portool unreserve`
 
@@ -684,8 +707,10 @@ across the pool instead of piling onto one hotspot. If the preferred slot
 is taken (or reserved — see
 [`portool reserve`](#portool-reserve--portool-unreserve) — or something
 outside the ledger is already listening on it), `portool` scans forward,
-wrapping, for the next free and bindable slot. Whether a block's ports are
-actually free is only checked when you opt in at
+wrapping, for the next free and bindable slot. "Bindable" means nothing
+listens on the port on any address: `127.0.0.1`, `0.0.0.0` (a published
+container port), `::` or `::1`. Whether a worktree's *own* block is in use
+is only checked when you opt in at
 [`portool exec`](#portool-exec) time (`--check-ports` / `--strict` /
 `--reallocate-on-conflict`); run `portool reallocate` to move a worktree
 off a block whose ports something else now holds.
@@ -746,9 +771,10 @@ that already write the same place.
 | What | Where | Kept how long / how much | Removed by |
 |---|---|---|---|
 | Ledger `registry.json`, lock `registry.json.lock` | state dir | one each, for as long as the ledger is used (every command reads them) | never; the ledger is the product, the empty lock file is its fixed-size companion |
-| Allocation entries | in the ledger | until the worktree directory is gone (a repository that is gone drops all its entries); pinned entries and entries whose ports are in use are exempt | every command that writes the ledger (`sync` slow path, `reallocate`, `release`, `pin`, `unpin`, `reserve`, `unreserve`), for **all** projects, one `stat` per entry (git is asked only for a project that has a vanished worktree); also `prune` |
+| Allocation entries | in the ledger | until the worktree is verifiably gone and its ports are unused -- the four rules under [`portool prune`](#portool-prune); pinned entries are exempt. An entry that can never be verified (its volume never returns, its repository is unreadable) stays until `prune --forget-unverifiable` | the commands that save the ledger, when they save it: `sync` slow path, `reallocate`, `release` of an existing allocation, `pin`, `unpin`, `reserve`, `unreserve` -- for **all** projects; also `prune`. Cost per command: one read of the ledger and one `lstat` per unpinned entry, before the lock is taken; git is asked only for a project with a missing directory, and for another project it is killed after 2 seconds. The whole check gives up after 3 seconds; a command that does not save the ledger does not write because of it |
+| `stale-check-failed.json` | state dir | exists only while some project could not be checked (git failed or did not answer, its filesystem did not answer): one entry per such project, so that it is not asked again by every command. Each entry counts for 1 hour, then the project is checked (and, on failure, reported) again | rewritten or removed by the next check once entries expire; removed by the next ledger save once the file is 1 hour old |
 | `registry.json.bak` | state dir | one; the last saved ledger, read by `doctor --repair` | overwritten by every save |
-| `registry.json.corrupt-<nanos>-<pid>` | state dir | at most one (the newest), read by a human right after `doctor --repair`; at most 7 days | the next ledger save |
+| `registry.json.corrupt-<nanos>-<pid>` | state dir | one per `doctor --repair` that set a ledger aside, for 7 days from that repair (so: as many as there were repairs in the last 7 days). Read by a human; after `--abandon-other-projects` it is the only copy of the other projects' allocations, so copies are never removed by count, nor by the command that made them | the first ledger save after the copy is 7 days old |
 | Crash temp files `.portool-tmp-<pid>-*` | next to the file being written: state dir, worktree root (`.env.portool`), hook directories | none in normal operation; after a crash until the next write to the same directory, and only if the owner pid is dead and the file is 10 minutes old | the next write to that directory; the state dir also clears pre-0.14 `.tmpXXXXXX` files (every writer there holds the lock). Pre-0.14 `.tmpXXXXXX` files left in a worktree root are not portool-only names and are never touched |
 | `.env.portool` | worktree root | one per worktree, while the worktree has an allocation | `release`, `init --uninstall`, or deleting the worktree |
 | Hook content | `post-checkout` / `post-merge` | one managed block per hook | `unhook`, `init --uninstall` |

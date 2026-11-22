@@ -9,15 +9,53 @@ the minor version).
 
 ### Changed
 
-- Allocations whose worktree directory is gone are released by every command
-  that writes the ledger, for all projects, not only by `portool prune --all`
-  or `sync` for the current project. The rule is the one `prune --all` uses;
-  `prune` and the automatic sweep now share one implementation. A path on an
-  unmounted volume (nearest existing ancestor is `/Volumes`, `/mnt`, `/media`
-  or `/run/media/...`, or an empty mount point below one) is no longer treated
-  as gone by `prune` either.
-- Only the newest `registry.json.corrupt-*` copy is kept, and it is removed
-  after 7 days, at the next ledger save.
+- Allocations of worktrees that are gone are released, for all projects, by
+  the commands that save the ledger (`sync` slow path, `reallocate`,
+  `release` of an existing allocation, `pin`, `unpin`, `reserve`,
+  `unreserve`), not only by `portool prune --all` or by `sync` for the
+  current project. A command path that did not write the ledger before still
+  does not, and a problem in this check is one warning line, never the
+  command's failure.
+- The rule for "gone" is stricter, and the same in `sync`, `prune`,
+  `prune --all` and the automatic check: the worktree directory must not
+  exist; the nearest existing directory above it must be an ordinary,
+  non-empty directory (not a mount point, not holding mount points, not
+  `/Volumes`, `/mnt`, `/media`, `/net`, `/run/media` or directly below one);
+  git must no longer list the worktree, or list it as `prunable` and not
+  `locked`; and its ports must be unused. Consequences:
+  - a worktree removed with `rm -rf` is released without `git worktree
+    prune` (git 2.31 or later);
+  - a repository that is gone no longer drops all of its entries: each one
+    needs its own directory gone, so renaming or re-cloning the main clone
+    keeps the allocations of linked worktrees that still exist;
+  - a worktree on a volume that is not mounted, wherever it is mounted, is
+    kept; so is the last worktree removed from a directory that is left
+    empty, until that directory is removed or used again;
+  - `prune --all` no longer drops entries it cannot verify. The new
+    `prune --forget-unverifiable` does, listing each with the reason it had
+    been kept; `prune` prints the entries it keeps although their directory
+    is missing.
+- Other projects are examined before the ledger lock is taken, with limits:
+  `git worktree list` for another project is killed after 2 seconds (10 for
+  `prune --all`), the whole check gives up after 3 seconds, and a project
+  that could not be checked is reported once and not asked again for an
+  hour (remembered in `stale-check-failed.json` in the state directory,
+  which is removed when it expires).
+- The "is this port unused" probe that guards allocation, in-place growth
+  and release now sees a listener on any address: `0.0.0.0` (published
+  container ports), `::` and `::1`, not only `127.0.0.1`. A block something
+  listens on is no longer handed out or released on macOS because the
+  listener was bound to another address. `sync` refuses to move a worktree
+  whose block cannot grow in place while anything listens on it in any of
+  these forms (before: only if it was visible from `127.0.0.1`). The
+  opt-in check of a worktree's own block (`exec --check-ports`, `--strict`,
+  `--reallocate-on-conflict`) and `doctor`'s "ports in use" report are
+  unchanged and still look from `127.0.0.1`.
+- `registry.json.corrupt-*` copies are removed 7 days after the repair that
+  made them, at the next ledger save; never by count and never by the
+  command that made them (before: every repair deleted all but the newest
+  copy, which could be the one it had just printed, or the only copy of the
+  other projects' allocations after `--abandon-other-projects`).
 - Temp files of atomic writes are named `.portool-tmp-<pid>-<random>` (they
   were `.tmpXXXXXX`), and a crash leftover whose owner is dead and that is 10
   minutes old is removed by the next write to the same directory.

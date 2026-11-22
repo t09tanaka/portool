@@ -1,7 +1,8 @@
 //! Thin `git` command-line wrapper: project/worktree identity discovery
 //! and `git worktree list` parsing (spec §6.1). The only external
 //! processes this crate spawns are `git rev-parse`, `git symbolic-ref
-//! --short -q HEAD`, `git worktree list --porcelain`, and `git config
+//! --short -q HEAD`, `git worktree list --porcelain` (for another project: with a
+//! time limit, see [`worktree_listing_bounded`]), and `git config
 //! --type=path --get`.
 
 use crate::error::{Error, Result};
