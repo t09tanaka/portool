@@ -65,6 +65,8 @@ enum Bind {
     InUse,
     /// This host has no usable address of the family.
     NoFamily,
+    /// The particular address is not available on this host.
+    NoAddress,
     /// Anything else (`EACCES` for a privileged port ...).
     Failed,
 }
@@ -82,7 +84,7 @@ fn family_free(v6: bool, port: u16) -> bool {
     let (addr, len) = sockaddr(wildcard, port);
     match bind(v6, &addr, len, false) {
         Bind::Bound => return true,
-        Bind::NoFamily => return v6,
+        Bind::NoFamily | Bind::NoAddress => return v6,
         Bind::Failed => return false,
         Bind::InUse => {}
     }
@@ -94,7 +96,7 @@ fn family_free(v6: bool, port: u16) -> bool {
     };
     locals
         .iter()
-        .all(|(addr, len)| bind(v6, addr, *len, true) != Bind::InUse)
+        .all(|(addr, len)| matches!(bind(v6, addr, *len, true), Bind::Bound | Bind::NoAddress))
 }
 
 /// A fresh stream socket of the family, close-on-exec from the moment it
@@ -151,7 +153,11 @@ fn bind(v6: bool, addr: &libc::sockaddr_storage, len: libc::socklen_t, reuse: bo
     if unsafe { libc::bind(raw, std::ptr::from_ref(addr).cast(), len) } == 0 {
         return Bind::Bound;
     }
-    failure(v6)
+    if std::io::Error::last_os_error().raw_os_error() == Some(libc::EADDRNOTAVAIL) {
+        Bind::NoAddress
+    } else {
+        failure(v6)
+    }
 }
 
 /// Classifies the error of the socket call that just failed.

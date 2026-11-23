@@ -105,6 +105,7 @@ pub enum Stat {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Children {
     pub count: usize,
+    pub has_non_git: bool,
     /// The device of every child that is a directory.
     pub dir_devices: Vec<u64>,
 }
@@ -133,11 +134,13 @@ impl Fs for RealFs {
         use std::os::unix::fs::MetadataExt;
         let mut out = Children {
             count: 0,
+            has_non_git: false,
             dir_devices: Vec::new(),
         };
         for entry in std::fs::read_dir(dir).ok()? {
             let entry = entry.ok()?;
             out.count += 1;
+            out.has_non_git |= entry.file_name() != ".git";
             // Only a directory can be a mount point; `file_type` comes with
             // the directory entry, so files cost no `lstat`.
             if entry.file_type().ok()?.is_dir() {
@@ -386,13 +389,19 @@ pub fn judge(pinned: bool, presence: Presence, git: GitView, force: bool) -> Ver
 /// real main checkout never appears. So this holds only when
 /// - `core.worktree` is unset, and
 /// - either the first entry is the parent of a common directory named
-///   `.git` and nothing says bare (ordinary: the main checkout is listed),
+///   `.git`, nothing says bare, and ledger or directory evidence confirms
+///   the parent is a checkout rather than just a git-directory container,
 /// - or the first entry is the common directory, git marks it `bare` and
 ///   `core.bare` is true (no main checkout exists; the `bare` mark alone is
 ///   not trusted, git before 2.22 printed it for any separate git dir).
 ///
 /// Anything else, an unreadable configuration included, is `false`.
-pub fn all_checkouts_listed(listing: &[Listed], key: &Path, config: Option<MainConfig>) -> bool {
+pub fn all_checkouts_listed(
+    listing: &[Listed],
+    key: &Path,
+    config: Option<MainConfig>,
+    main_evidence: impl FnOnce(&Path) -> bool,
+) -> bool {
     let (Some(config), Some(main)) = (config, listing.first()) else {
         return false;
     };
@@ -406,6 +415,7 @@ pub fn all_checkouts_listed(listing: &[Listed], key: &Path, config: Option<MainC
         && !config.bare
         && key.file_name() == Some(std::ffi::OsStr::new(".git"))
         && key.parent() == Some(main.path.as_path())
+        && main_evidence(&main.path)
 }
 
 /// Which projects a sweep looks at.
@@ -419,6 +429,8 @@ pub enum Scope<'a> {
 #[derive(Debug, Clone)]
 pub struct ProjectIn {
     pub key: String,
+    /// All ledger paths, including pinned entries, for main-checkout evidence.
+    pub ledger_paths: Vec<PathBuf>,
     pub entries: Vec<(String, WorktreeEntry)>,
     /// The project has no entries at all (pinned included).
     pub empty: bool,
@@ -436,6 +448,7 @@ pub fn candidates(registry: &Registry, scope: Scope) -> Vec<ProjectIn> {
         })
         .map(|(key, project)| ProjectIn {
             key: key.clone(),
+            ledger_paths: project.worktrees.keys().map(PathBuf::from).collect(),
             entries: project
                 .worktrees
                 .iter()
@@ -601,12 +614,20 @@ pub fn examine(project: &ProjectIn, world: &World, force: bool) -> ProjectOut {
         let git = match (repo, &listing) {
             (Presence::Gone, _) => GitView::RepoGone,
             (Presence::Exists, _) if !ask => GitView::NotAsked,
-            (Presence::Exists, None) => GitView::Failed,
+            (Presence::Exists, None) => match out.failure.as_ref() {
+                Some(Failure::NotReached | Failure::Local(_)) => GitView::NotAsked,
+                _ => GitView::Failed,
+            },
             (Presence::Exists, Some(listing)) => match view(listing, path) {
                 // Only here does it matter whether "not listed" is certain.
                 GitView::MaybeUnlistedMain if shape_only(here) && !force => {
                     let all = *every_checkout_listed.get_or_insert_with(|| {
-                        all_checkouts_listed(listing, key, (world.config)(key))
+                        all_checkouts_listed(listing, key, (world.config)(key), |main| {
+                            project.ledger_paths.iter().any(|path| path == main)
+                                || fs
+                                    .children(main)
+                                    .is_some_and(|children| children.has_non_git)
+                        })
                     });
                     match all {
                         true => GitView::NotListed,
@@ -886,6 +907,8 @@ pub fn plan(ledger: &Path, current: Option<&str>) -> Plan {
     if projects.is_empty() {
         return Plan::default();
     }
+    // Stable ordering keeps all other projects in ledger order.
+    projects.sort_by_key(|project| current != Some(project.key.as_str()));
     let outcome = run_bounded(projects, false, GIT_TIMEOUT, BUDGET, Box::new(RealFs));
     if outcome.skipped {
         crate::warn::emit(format_args!(
@@ -1253,6 +1276,12 @@ mod tests {
                 .collect();
             Some(Children {
                 count: dir_devices.len() + self.files.iter().filter(|p| is_child(p)).count(),
+                has_non_git: self
+                    .dirs
+                    .keys()
+                    .copied()
+                    .chain(self.files.iter().copied())
+                    .any(|p| is_child(p) && Path::new(p).file_name().is_some_and(|n| n != ".git")),
                 dir_devices,
             })
         }
@@ -1508,7 +1537,16 @@ mod tests {
     #[test]
     fn last_worktree_of_an_emptied_directory_is_released_only_when_unregistered() {
         // `/w` held only this worktree and is empty now.
-        let f = fs(&["/", "/src", "/src/r1", "/src/r1/.git", "/src/keep", "/w"]);
+        // `/src/r1/src`: the main checkout holds more than `.git`.
+        let f = fs(&[
+            "/",
+            "/src",
+            "/src/r1",
+            "/src/r1/.git",
+            "/src/r1/src",
+            "/src/keep",
+            "/w",
+        ]);
         let make = || {
             registry(vec![(
                 "/src/r1/.git",
@@ -2099,6 +2137,42 @@ mod tests {
         assert_eq!(g, Gathered::default());
     }
 
+    #[test]
+    fn local_and_budget_failures_keep_entries_even_when_forced() {
+        let f = fs(&["/", "/r1", "/r1/objects", "/w"]);
+        let r = registry(vec![("/r1", vec![("/w/gone", entry((3000, 3004), false))])]);
+        for failure in [
+            Failure::NotReached,
+            Failure::Local("no temporary file".into()),
+            Failure::Git("failed".into()),
+            Failure::TimedOut(Duration::from_secs(2)),
+        ] {
+            let out = examine(
+                &candidates(&r, Scope::All)[0],
+                &World {
+                    fs: &f,
+                    list: &|_| Err(failure.clone()),
+                    config: &|_| panic!("config called"),
+                },
+                true,
+            );
+            assert_eq!(out.failure, Some(failure.clone()));
+            assert_eq!(
+                out.findings[0].verdict,
+                judge(
+                    false,
+                    presence(&f, Path::new("/w/gone")),
+                    if failure.of_the_project() {
+                        GitView::Failed
+                    } else {
+                        GitView::NotAsked
+                    },
+                    true
+                ),
+            );
+        }
+    }
+
     /// Counts the questions a fake filesystem is asked.
     struct Counting<'a> {
         fs: &'a FakeFs,
@@ -2129,35 +2203,62 @@ mod tests {
         };
         let ordinary = [entry_at("/src/r", false), entry_at("/w/x", false)];
         let key = Path::new("/src/r/.git");
-        assert!(all_checkouts_listed(&ordinary, key, ORDINARY));
+        assert!(all_checkouts_listed(&ordinary, key, ORDINARY, |_| true));
+        assert!(!all_checkouts_listed(&ordinary, key, ORDINARY, |_| false));
         // `core.worktree` moves the main checkout somewhere git never lists.
-        assert!(!all_checkouts_listed(&ordinary, key, config(false, true)));
+        assert!(!all_checkouts_listed(
+            &ordinary,
+            key,
+            config(false, true),
+            |_| true
+        ));
         // The configuration could not be read, or contradicts the listing.
-        assert!(!all_checkouts_listed(&ordinary, key, None));
-        assert!(!all_checkouts_listed(&ordinary, key, config(true, false)));
-        assert!(!all_checkouts_listed(&[], key, ORDINARY));
+        assert!(!all_checkouts_listed(&ordinary, key, None, |_| true));
+        assert!(!all_checkouts_listed(
+            &ordinary,
+            key,
+            config(true, false),
+            |_| true
+        ));
+        assert!(!all_checkouts_listed(&[], key, ORDINARY, |_| true));
         // `--separate-git-dir`, a `.git` file, a submodule: the first entry
         // is the common directory itself and the checkout is not listed.
         let separate = [entry_at("/gd/a.git", false), entry_at("/w/x", false)];
         let gd = Path::new("/gd/a.git");
-        assert!(!all_checkouts_listed(&separate, gd, ORDINARY));
-        assert!(!all_checkouts_listed(&separate, gd, config(false, true)));
+        assert!(!all_checkouts_listed(&separate, gd, ORDINARY, |_| true));
+        assert!(!all_checkouts_listed(
+            &separate,
+            gd,
+            config(false, true),
+            |_| true
+        ));
         // A bare repository has no main checkout -- when git's mark and
         // the configuration agree (old git marks any separate git dir).
         let bare = [entry_at("/gd/a.git", true), entry_at("/w/x", false)];
-        assert!(all_checkouts_listed(&bare, gd, config(true, false)));
-        assert!(!all_checkouts_listed(&bare, gd, config(false, false)));
-        assert!(!all_checkouts_listed(&bare, gd, config(true, true)));
+        assert!(all_checkouts_listed(&bare, gd, config(true, false), |_| {
+            true
+        }));
+        assert!(!all_checkouts_listed(
+            &bare,
+            gd,
+            config(false, false),
+            |_| true
+        ));
+        assert!(!all_checkouts_listed(&bare, gd, config(true, true), |_| {
+            true
+        }));
         // A first entry that is neither: nothing is known.
         assert!(!all_checkouts_listed(
             &ordinary,
             Path::new("/else/.git"),
-            ORDINARY
+            ORDINARY,
+            |_| true
         ));
         assert!(!all_checkouts_listed(
             &ordinary,
             Path::new("/src/r/git"),
-            ORDINARY
+            ORDINARY,
+            |_| true
         ));
     }
 
@@ -2448,7 +2549,15 @@ mod tests {
         go(&populated, vec![main.clone()]);
         assert_eq!(cfg_asked.get(), 0);
         // Emptied directory, both still listed as prunable: no question.
-        let emptied = fs(&["/", "/src", "/src/r1", "/src/r1/.git", "/src/x", "/w"]);
+        let emptied = fs(&[
+            "/",
+            "/src",
+            "/src/r1",
+            "/src/r1/.git",
+            "/src/r1/src",
+            "/src/x",
+            "/w",
+        ]);
         go(
             &emptied,
             vec![

@@ -1056,10 +1056,14 @@ fn own_stack_reallocate_moves_only_because_it_was_asked_to() {
 /// `git init --separate-git-dir gd/a.git vol/a`, synced, next to a synced
 /// `b`. Git never lists `vol/a`: it lists `gd/a.git` in its place.
 fn separate_git_dir(env: &TestEnv) -> (PathBuf, PathBuf, PathBuf) {
+    separate_git_dir_named(env, "a.git")
+}
+
+fn separate_git_dir_named(env: &TestEnv, name: &str) -> (PathBuf, PathBuf, PathBuf) {
     let (gd, a, b) = (env.path("gd"), env.path("vol").join("a"), env.path("b"));
     std::fs::create_dir_all(&gd).unwrap();
     std::fs::create_dir_all(&a).unwrap();
-    let git_dir = gd.join("a.git");
+    let git_dir = gd.join(name);
     git(
         &a,
         &[
@@ -1103,6 +1107,22 @@ fn a_main_checkout_git_never_lists_is_kept_while_its_volume_is_away() {
     // The volume is back: the checkout still has its ports.
     std::fs::rename(&offline, &a).unwrap();
     ok(env.run(&a, &["sync"]));
+    assert_eq!(block_of(&env, &a), Some(block));
+}
+
+#[test]
+fn separate_dot_git_keeps_an_empty_main_checkout_mount_point() {
+    let env = TestEnv::new();
+    env.write_config("range = [17950, 17999]\n");
+    let (git_dir, a, b) = separate_git_dir_named(&env, ".git");
+    let block = block_of(&env, &a).expect("synced");
+    assert_eq!(names(git_dir.parent().unwrap()), vec![".git"]);
+    std::fs::rename(&a, env.path("offline")).unwrap();
+    std::fs::create_dir(&a).unwrap();
+
+    ok(env.run(&b, &["pin"]));
+    assert_eq!(block_of(&env, &a), Some(block));
+    ok(env.run(&b, &["prune", "--all"]));
     assert_eq!(block_of(&env, &a), Some(block));
 }
 
