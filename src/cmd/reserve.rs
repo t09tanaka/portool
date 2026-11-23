@@ -16,7 +16,7 @@ pub fn reserve(spec: &str, label: Option<String>) -> Result<()> {
     let block = parse_block(spec)?;
     let config = Config::load()?;
     let registry_path = paths::registry_path()?;
-    let sweep = crate::reclaim::plan(&registry_path, crate::reclaim::Scope::All);
+    let sweep = crate::reclaim::plan(&registry_path, None);
     let _lock = lock::acquire(&paths::lock_path()?, LOCK_TIMEOUT)?;
     let mut registry =
         store::load_strict(&registry_path)?.unwrap_or_else(|| Registry::empty(config.range));
@@ -63,7 +63,7 @@ pub fn unreserve(spec: &str) -> Result<()> {
     // "19000-19009"). Only a bare PORT spec (no '-') containment-matches.
     let single_port = !spec.contains('-');
     let registry_path = paths::registry_path()?;
-    let sweep = crate::reclaim::plan(&registry_path, crate::reclaim::Scope::All);
+    let sweep = crate::reclaim::plan(&registry_path, None);
     let _lock = lock::acquire(&paths::lock_path()?, LOCK_TIMEOUT)?;
     let mut registry = store::load_strict(&registry_path)?
         .ok_or_else(|| Error::General("no registry exists; nothing is reserved".to_string()))?;

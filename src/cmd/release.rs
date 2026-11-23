@@ -43,7 +43,7 @@ pub(crate) fn release_worktree(ctx: &GitCtx) -> Result<bool> {
     let registry_path = paths::registry_path()?;
     // Evidence about other worktrees is gathered before the lock; it is
     // applied below only on the path that saves the ledger anyway.
-    let sweep = crate::reclaim::plan(&registry_path, crate::reclaim::Scope::All);
+    let sweep = crate::reclaim::plan(&registry_path, None);
     let _lock = lock::acquire(&paths::lock_path()?, LOCK_TIMEOUT)?;
     let mut registry = match store::load_strict(&registry_path)? {
         Some(registry) => registry,

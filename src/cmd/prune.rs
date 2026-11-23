@@ -7,11 +7,10 @@
 //! mounted again, a repository git can no longer read).
 
 use crate::error::{Error, Result};
-use crate::gitctx::{self, GitCtx};
+use crate::gitctx::GitCtx;
 use crate::lock;
 use crate::paths;
-use crate::reclaim::{self, Event};
-use crate::registry::Registry;
+use crate::reclaim::{self, Event, Scope};
 use crate::store;
 use std::time::Duration;
 
@@ -26,16 +25,33 @@ pub fn run(all: bool, dry_run: bool, forget_unverifiable: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let registry_path = paths::registry_path()?;
 
-    // Other projects' files and git are examined before the lock is taken:
-    // a dead network mount must not stall every other portool command.
+    // Files and git are examined before the lock is taken, for this
+    // project as for the others: a dead network mount must not stall every
+    // other portool command.
     let Some(snapshot) = store::load_strict(&registry_path)? else {
         return Ok(()); // no ledger -> nothing to prune
     };
-    let plan = all.then(|| reclaim::plan_manual(&snapshot, forget_unverifiable));
-    let ctx = match plan {
-        Some(_) => None,
-        None => Some(GitCtx::discover(&cwd)?),
+    let current = match all {
+        true => None,
+        false => Some(
+            GitCtx::discover(&cwd)?
+                .common_dir
+                .to_string_lossy()
+                .into_owned(),
+        ),
     };
+    let scope = match &current {
+        Some(key) => Scope::Only(key),
+        None => Scope::All,
+    };
+    let plan = reclaim::plan_manual(&snapshot, scope, forget_unverifiable);
+    if current.is_some() {
+        // In its own project a git that cannot list the worktrees is the
+        // command's error, `--forget-unverifiable` or not.
+        if let Some((_, reason)) = plan.git_failed().first() {
+            return Err(Error::General(reason.clone()));
+        }
+    }
 
     let _lock = if dry_run {
         None // read-only, lock-free
@@ -47,36 +63,32 @@ pub fn run(all: bool, dry_run: bool, forget_unverifiable: bool) -> Result<()> {
         None => return Ok(()),
     };
 
-    let events = match (&plan, &ctx) {
-        (Some(plan), _) => {
-            for (key, reason) in plan.git_failed() {
-                eprintln!(
-                    "portool: prune: skipping project {}: listing worktrees failed \
-                     ({reason}); its entries were kept",
-                    crate::display::text(key)
-                );
-            }
-            plan.apply_reporting(&mut registry)
-        }
-        (None, Some(ctx)) => prune_current(&mut registry, ctx, forget_unverifiable)?,
-        (None, None) => unreachable!("either a plan or a git context exists"),
-    };
+    for (key, reason) in plan.git_failed() {
+        eprintln!(
+            "portool: prune: skipping project {}: listing worktrees failed \
+             ({reason}); its entries were kept",
+            crate::display::text(key)
+        );
+    }
+    let events = plan.apply_reporting(&mut registry);
 
     if report(&events, dry_run, forget_unverifiable) && !dry_run {
         store::save(&registry_path, &mut registry)?;
     }
+    // What could not be checked at all is not "nothing to prune": say what,
+    // and fail, after what could be decided has been done.
+    let unchecked = plan.unchecked();
+    if !unchecked.is_empty() {
+        for line in unchecked {
+            eprintln!("portool: prune: could not check {line}; its entries were kept");
+        }
+        return Err(Error::General(format!(
+            "prune is incomplete: {} check(s) did not finish (limit: {}s)",
+            unchecked.len(),
+            reclaim::MANUAL_BUDGET.as_secs()
+        )));
+    }
     Ok(())
-}
-
-fn prune_current(registry: &mut Registry, ctx: &GitCtx, force: bool) -> Result<Vec<Event>> {
-    let key = ctx.common_dir.to_string_lossy().into_owned();
-    reclaim::sweep_project(
-        registry,
-        &key,
-        &|| gitctx::worktree_listing_at(&ctx.worktree_root).map_err(|e| e.to_string()),
-        force,
-    )
-    .map_err(Error::General)
 }
 
 /// Prints one line per event; returns whether the ledger changed.

@@ -189,13 +189,11 @@ fn try_fast_path(ctx: &GitCtx) -> Result<Option<SyncOutcome>> {
 /// recovery path.
 fn slow_path(ctx: &GitCtx, config: &Config, quiet: bool) -> Result<SyncOutcome> {
     let registry_path = paths::registry_path()?;
-    // Evidence about every OTHER project's vanished worktrees, gathered
-    // before the lock (it may wait on their filesystems and git); applied
-    // below, in memory, ahead of the save this path always makes.
-    let sweep = crate::reclaim::plan(
-        &registry_path,
-        crate::reclaim::Scope::Except(&key(&ctx.common_dir)),
-    );
+    // Evidence about vanished worktrees of every project, this one
+    // included, gathered before the lock (it may wait on filesystems and
+    // git); applied below, in memory, ahead of the save this path always
+    // makes.
+    let sweep = crate::reclaim::plan(&registry_path, Some(&key(&ctx.common_dir)));
     let _lock = lock::acquire(&paths::lock_path()?, LOCK_TIMEOUT)?;
 
     // Frozen decision 14: a freshly created ledger records the live pool at
@@ -235,16 +233,14 @@ fn slow_path(ctx: &GitCtx, config: &Config, quiet: bool) -> Result<SyncOutcome> 
     // freeing this project's stale entries first lets a re-created worktree
     // on the same branch reclaim its just-freed block instead of forcing a
     // fresh one that only becomes free after the fact.
-    // This project is examined here, under the lock, with the git and the
-    // files this command works on anyway (git runs only if a directory is
-    // missing). Nothing is saved here: the removals ride on the save below.
-    crate::reclaim::sweep_project(
-        &mut registry,
-        &common_dir_key,
-        &|| crate::gitctx::worktree_listing_at(&ctx.worktree_root).map_err(|e| e.to_string()),
-        false,
-    )
-    .map_err(Error::General)?;
+    // The evidence was gathered before the lock; here it is only compared
+    // with the entries as they are now (plus one `lstat` and a port probe
+    // per entry about to be released). Nothing is saved here: the removals
+    // ride on the save below. As before, a git that cannot list this
+    // project's own worktrees fails the command.
+    if let Some(reason) = sweep.current_failure() {
+        return Err(Error::General(reason.to_string()));
+    }
     sweep.apply(&mut registry);
 
     let manifest_state = load_manifest_state(&ctx.worktree_root)?;
@@ -509,7 +505,7 @@ pub fn reallocate_cmd(quiet: bool) -> Result<()> {
 /// when no other block fits.
 pub fn reallocate(ctx: &GitCtx, quiet: bool) -> Result<SyncOutcome> {
     let registry_path = paths::registry_path()?;
-    let sweep = crate::reclaim::plan(&registry_path, crate::reclaim::Scope::All);
+    let sweep = crate::reclaim::plan(&registry_path, None);
     let _lock = lock::acquire(&paths::lock_path()?, LOCK_TIMEOUT)?;
 
     let config = Config::load()?;

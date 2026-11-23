@@ -26,7 +26,7 @@ fn set_pinned(pinned: bool, label: Option<String>) -> Result<()> {
     let worktree_key = ctx.worktree_root.to_string_lossy().into_owned();
 
     let registry_path = paths::registry_path()?;
-    let sweep = crate::reclaim::plan(&registry_path, crate::reclaim::Scope::All);
+    let sweep = crate::reclaim::plan(&registry_path, None);
     let _lock = lock::acquire(&paths::lock_path()?, LOCK_TIMEOUT)?;
     let mut registry =
         store::load_strict(&registry_path)?.ok_or_else(|| no_allocation(&worktree_key))?;

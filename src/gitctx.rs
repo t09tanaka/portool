@@ -123,6 +123,10 @@ pub struct Listed {
     pub prunable: bool,
     /// Git printed a `locked` line (`git worktree lock`, also git >= 2.31).
     pub locked: bool,
+    /// Git printed a `bare` line: this entry is the repository itself, not
+    /// a checkout. (Git before 2.22 also printed it for any common
+    /// directory not named `.git`, so it is never trusted on its own.)
+    pub bare: bool,
 }
 
 /// [`worktree_list_at`] with each worktree's `prunable` / `locked` state.
@@ -145,27 +149,73 @@ pub fn worktree_listing_at(dir: &Path) -> Result<Vec<Listed>> {
 pub fn worktree_listing_bounded(
     dir: &Path,
     timeout: std::time::Duration,
-) -> std::result::Result<Vec<Listed>, String> {
+) -> std::result::Result<Vec<Listed>, Bounded> {
     let deadline = std::time::Instant::now() + timeout;
     match run_git_bounded(dir, &["worktree", "list", "--porcelain", "-z"], deadline) {
         Ok(bytes) => return Ok(parse_listing_z(&bytes)),
-        Err(Bounded::TimedOut) => return Err(timed_out(timeout)),
         Err(Bounded::Failed(_)) => {} // possibly git < 2.36: retry without -z
+        Err(other) => return Err(other),
     }
-    match run_git_bounded(dir, &["worktree", "list", "--porcelain"], deadline) {
-        Ok(bytes) => Ok(parse_listing_lines(&String::from_utf8_lossy(&bytes))),
-        Err(Bounded::TimedOut) => Err(timed_out(timeout)),
-        Err(Bounded::Failed(reason)) => Err(reason),
-    }
+    let bytes = run_git_bounded(dir, &["worktree", "list", "--porcelain"], deadline)?;
+    Ok(parse_listing_lines(&String::from_utf8_lossy(&bytes)))
 }
 
-fn timed_out(timeout: std::time::Duration) -> String {
-    format!("git did not answer within {}s", timeout.as_secs())
+/// What the repository's own configuration says about its main checkout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MainConfig {
+    /// `core.bare` is set and true: the repository has no main checkout.
+    pub bare: bool,
+    /// `core.worktree` is set: the main checkout is wherever it points,
+    /// which `git worktree list` does not show.
+    pub worktree_set: bool,
 }
 
-enum Bounded {
+/// Reads [`MainConfig`] for the repository whose common directory is `dir`,
+/// with the same time limit and kill as [`worktree_listing_bounded`].
+pub fn main_config_bounded(
+    dir: &Path,
+    timeout: std::time::Duration,
+) -> std::result::Result<MainConfig, Bounded> {
+    let deadline = std::time::Instant::now() + timeout;
+    let bytes = run_git_bounded(dir, &["config", "-z", "--list"], deadline)?;
+    Ok(parse_main_config(&bytes))
+}
+
+/// Parses `git config -z --list`: records `key\nvalue\0` (or `key\0` for a
+/// key without a value, which git reads as true); the last one wins.
+fn parse_main_config(bytes: &[u8]) -> MainConfig {
+    let mut out = MainConfig {
+        bare: false,
+        worktree_set: false,
+    };
+    for record in bytes.split(|&b| b == 0) {
+        let mut parts = record.splitn(2, |&b| b == b'\n');
+        let key = parts.next().unwrap_or_default();
+        let value = parts.next();
+        if key.eq_ignore_ascii_case(b"core.worktree") {
+            out.worktree_set = true;
+        } else if key.eq_ignore_ascii_case(b"core.bare") {
+            out.bare = match value {
+                None => true,
+                Some(v) => [&b"true"[..], b"yes", b"on", b"1"]
+                    .iter()
+                    .any(|t| v.eq_ignore_ascii_case(t)),
+            };
+        }
+    }
+    out
+}
+
+/// Why a bounded git call gave no answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Bounded {
+    /// Git was killed at the time limit.
     TimedOut,
+    /// Git ran and failed, or could not be started.
     Failed(String),
+    /// This process could not set the call up (no temp file for git's
+    /// output ...): says nothing about the repository.
+    Local(String),
 }
 
 /// Runs git with its output in anonymous temp files (no pipe, so neither a
@@ -178,7 +228,7 @@ fn run_git_bounded(
 ) -> std::result::Result<Vec<u8>, Bounded> {
     run_bounded_command(git_command(cwd, args), deadline).map_err(|e| match e {
         Bounded::Failed(reason) => Bounded::Failed(format!("git {}: {reason}", args.join(" "))),
-        timed_out => timed_out,
+        other => other,
     })
 }
 
@@ -190,12 +240,18 @@ fn run_bounded_command(
     use std::io::{Read, Seek, SeekFrom};
     use std::process::Stdio;
     let failed = |what: &str, e: &dyn std::fmt::Display| Bounded::Failed(format!("{what}: {e}"));
-    let mut out = tempfile::tempfile().map_err(|e| failed("temp file", &e))?;
-    let mut err = tempfile::tempfile().map_err(|e| failed("temp file", &e))?;
+    let local = |e: std::io::Error| {
+        Bounded::Local(format!(
+            "no temporary file for git's output in {}: {e}",
+            std::env::temp_dir().display()
+        ))
+    };
+    let mut out = tempfile::tempfile().map_err(local)?;
+    let mut err = tempfile::tempfile().map_err(local)?;
     let mut child = command
         .stdin(Stdio::null())
-        .stdout(out.try_clone().map_err(|e| failed("temp file", &e))?)
-        .stderr(err.try_clone().map_err(|e| failed("temp file", &e))?)
+        .stdout(out.try_clone().map_err(local)?)
+        .stderr(err.try_clone().map_err(local)?)
         .spawn()
         .map_err(|e| failed("could not be started", &e))?;
     let mut pause = std::time::Duration::from_millis(1);
@@ -268,12 +324,15 @@ fn listing_field(items: &mut Vec<Listed>, field: &[u8]) {
             path: ledger_form(PathBuf::from(std::ffi::OsStr::from_bytes(raw))),
             prunable: false,
             locked: false,
+            bare: false,
         });
     } else if let Some(last) = items.last_mut() {
         if is(b"prunable") {
             last.prunable = true;
         } else if is(b"locked") {
             last.locked = true;
+        } else if is(b"bare") {
+            last.bare = true;
         }
     }
 }
@@ -716,6 +775,54 @@ mod tests {
             real.join("gone").join("wt")
         );
         assert_eq!(ledger_form(real.join("link")), real);
+    }
+
+    #[test]
+    fn main_config_reads_bare_and_core_worktree() {
+        let cfg = |s: &[u8]| parse_main_config(s);
+        let plain = cfg(b"core.bare\nfalse\0core.filemode\ntrue\0");
+        assert!(!plain.bare && !plain.worktree_set);
+        assert!(cfg(b"core.bare\ntrue\0").bare);
+        assert!(cfg(b"core.bare\0").bare, "a key without a value is true");
+        assert!(
+            !cfg(b"core.bare\ntrue\0core.bare\nfalse\0").bare,
+            "last wins"
+        );
+        assert!(!cfg(b"core.bare\nmaybe\0").bare, "unknown is not bare");
+        assert!(cfg(b"core.worktree\n../../sub\0").worktree_set);
+        assert!(!cfg(b"core.worktreex\n1\0user.name\ncore.worktree\0").worktree_set);
+        assert!(!cfg(b"").bare);
+    }
+
+    #[test]
+    fn listing_marks_the_bare_entry() {
+        let got = parse_listing_z(b"worktree /a/r.git\0bare\0\0worktree /a/wt\0HEAD x\0\0");
+        assert!(got[0].bare && !got[1].bare);
+    }
+
+    #[test]
+    fn a_missing_temp_directory_is_not_reported_as_a_git_failure() {
+        // The child of this test only: TMPDIR is set on the command, and
+        // `tempfile` reads the parent's, so the parent's is what must be
+        // unusable -- done in a child process to leave this one alone.
+        let exe = std::env::current_exe().unwrap();
+        if std::env::var_os("PORTOOL_TEST_NO_TMP").is_some() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let out = run_bounded_command(Command::new("true"), deadline);
+            assert!(matches!(out, Err(Bounded::Local(_))), "{out:?}");
+            return;
+        }
+        let status = Command::new(exe)
+            .args([
+                "--exact",
+                "gitctx::tests::a_missing_temp_directory_is_not_reported_as_a_git_failure",
+                "--nocapture",
+            ])
+            .env("PORTOOL_TEST_NO_TMP", "1")
+            .env("TMPDIR", "/nonexistent-portool-test-tmp")
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 
     #[test]

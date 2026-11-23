@@ -1052,3 +1052,256 @@ fn own_stack_reallocate_moves_only_because_it_was_asked_to() {
         "reallocate always moves"
     );
 }
+
+/// `git init --separate-git-dir gd/a.git vol/a`, synced, next to a synced
+/// `b`. Git never lists `vol/a`: it lists `gd/a.git` in its place.
+fn separate_git_dir(env: &TestEnv) -> (PathBuf, PathBuf, PathBuf) {
+    let (gd, a, b) = (env.path("gd"), env.path("vol").join("a"), env.path("b"));
+    std::fs::create_dir_all(&gd).unwrap();
+    std::fs::create_dir_all(&a).unwrap();
+    let git_dir = gd.join("a.git");
+    git(
+        &a,
+        &[
+            "init",
+            "-q",
+            "-b",
+            "main",
+            "--separate-git-dir",
+            git_dir.to_str().unwrap(),
+        ],
+    );
+    git(&a, &["config", "user.email", "a@b.c"]);
+    git(&a, &["config", "user.name", "a"]);
+    std::fs::write(a.join("README.md"), "x\n").unwrap();
+    git(&a, &["add", "README.md"]);
+    git(&a, &["commit", "-q", "-m", "init"]);
+    init_repo(&b);
+    ok(env.run(&a, &["sync"]));
+    ok(env.run(&b, &["sync"]));
+    (git_dir, a, b)
+}
+
+#[test]
+fn a_main_checkout_git_never_lists_is_kept_while_its_volume_is_away() {
+    let env = TestEnv::new();
+    env.write_config("range = [17950, 17999]\n");
+    let (_git_dir, a, b) = separate_git_dir(&env);
+    let block = block_of(&env, &a).expect("synced");
+    // The volume goes away: its mount point `vol` stays behind, empty.
+    let offline = env.path("offline");
+    std::fs::rename(&a, &offline).unwrap();
+    assert_eq!(names(&env.path("vol")), Vec::<String>::new());
+
+    ok(env.run(&b, &["pin"]));
+    ok(env.run(&b, &["unpin"]));
+    assert_eq!(block_of(&env, &a), Some(block), "{:?}", allocations(&env));
+    let out = ok(env.run(&b, &["prune", "--all"]));
+    assert!(stderr(&out).contains("is empty"), "{}", stderr(&out));
+    assert_eq!(block_of(&env, &a), Some(block));
+
+    // The volume is back: the checkout still has its ports.
+    std::fs::rename(&offline, &a).unwrap();
+    ok(env.run(&a, &["sync"]));
+    assert_eq!(block_of(&env, &a), Some(block));
+}
+
+#[test]
+fn where_git_does_not_list_every_checkout_a_forgotten_worktree_waits_for_prune() {
+    // The price of the rule above, in the same kind of repository: a
+    // linked worktree removed through git from a directory it leaves empty
+    // cannot be told from the unlisted main checkout, and is kept.
+    let env = TestEnv::new();
+    env.write_config("range = [17900, 17949]\n");
+    let (_git_dir, a, b) = separate_git_dir(&env);
+    let only = env.path("wts").join("only");
+    std::fs::create_dir_all(only.parent().unwrap()).unwrap();
+    add_worktree(&a, &only, "feat");
+    ok(env.run(&only, &["sync"]));
+    git(
+        &a,
+        &["worktree", "remove", "--force", only.to_str().unwrap()],
+    );
+    ok(env.run(&b, &["pin"]));
+    assert!(block_of(&env, &only).is_some(), "{:?}", allocations(&env));
+    // The manual way out releases it.
+    ok(env.run(&b, &["prune", "--all", "--forget-unverifiable"]));
+    assert!(block_of(&env, &only).is_none());
+    assert!(block_of(&env, &a).is_some());
+
+    // `core.worktree` in an ordinary repository has the same effect: the
+    // checkout it names is not what git lists.
+    let env = TestEnv::new();
+    env.write_config("range = [17850, 17899]\n");
+    let (a, b, only) = lone_worktree(&env);
+    git(&a, &["config", "core.worktree", a.to_str().unwrap()]);
+    git(
+        &a,
+        &["worktree", "remove", "--force", only.to_str().unwrap()],
+    );
+    ok(env.run(&b, &["pin"]));
+    assert!(block_of(&env, &only).is_some(), "{:?}", allocations(&env));
+}
+
+#[test]
+fn a_bare_repositorys_forgotten_worktree_is_released_from_an_emptied_directory() {
+    let env = TestEnv::new();
+    env.write_config("range = [17800, 17849]\n");
+    let (src, bare, b) = (env.path("src"), env.path("bare.git"), env.path("b"));
+    init_repo(&src);
+    init_repo(&b);
+    let cloned = Command::new("git")
+        .args(["clone", "-q", "--bare"])
+        .arg(&src)
+        .arg(&bare)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .status()
+        .unwrap();
+    assert!(cloned.success());
+    let only = env.path("wts").join("only");
+    std::fs::create_dir_all(only.parent().unwrap()).unwrap();
+    add_worktree(&bare, &only, "feat");
+    ok(env.run(&only, &["sync"]));
+    ok(env.run(&b, &["sync"]));
+    git(
+        &bare,
+        &["worktree", "remove", "--force", only.to_str().unwrap()],
+    );
+    assert_eq!(names(only.parent().unwrap()), Vec::<String>::new());
+    ok(env.run(&b, &["pin"]));
+    assert!(block_of(&env, &only).is_none(), "{:?}", allocations(&env));
+}
+
+/// A `git` that never answers `worktree list` (for any repository) and is
+/// the real git for everything else; each listing asked appends a line to
+/// the returned log.
+fn git_deaf_to_listings(env: &TestEnv) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let real = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let dir = env.path("deaf-bin");
+    let log = env.path("deaf-git.log");
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = format!(
+        "#!/bin/sh\ncase \"$*\" in\n  *\"worktree list\"*) echo asked >> \"{}\"; exec sleep 30 ;;\nesac\nexec \"{}\" \"$@\"\n",
+        log.display(),
+        real.trim()
+    );
+    let path = dir.join("git");
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (dir, log)
+}
+
+fn lines(log: &Path) -> usize {
+    std::fs::read_to_string(log)
+        .map(|s| s.lines().count())
+        .unwrap_or(0)
+}
+
+#[test]
+fn a_git_that_never_answers_for_the_commands_own_project_cannot_stall_it() {
+    let env = TestEnv::new();
+    env.write_config("range = [17750, 17799]\n");
+    let (a, _b, a_wt) = two_projects(&env);
+    std::fs::remove_dir_all(&a_wt).unwrap(); // git is asked about `a`
+    let (fake, log) = git_deaf_to_listings(&env);
+
+    // First sync of `a`'s main checkout: the slow path, in `a` itself.
+    let started = std::time::Instant::now();
+    let out = ok(run_with_path(&env, &fake, &a, &["sync"]));
+    let took = started.elapsed();
+    assert!(
+        took < std::time::Duration::from_secs(12),
+        "sync waited {took:?} for a git that sleeps 30s"
+    );
+    assert_eq!(
+        stderr(&out).matches("could not check 1 project(s)").count(),
+        1,
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(lines(&log), 1);
+    assert!(block_of(&env, &a_wt).is_some(), "kept");
+    assert!(block_of(&env, &a).is_some(), "and the sync itself was done");
+}
+
+/// Moves a worktree's ledger entry to another path, as if it had been
+/// synced there.
+fn set_path(env: &TestEnv, worktree: &Path, to: &str) {
+    let name = worktree.file_name().unwrap().to_string_lossy().into_owned();
+    let text = std::fs::read_to_string(env.registry_path()).unwrap();
+    let mut reg: serde_json::Value = serde_json::from_str(&text).unwrap();
+    for project in reg["projects"].as_object_mut().unwrap().values_mut() {
+        let worktrees = project["worktrees"].as_object_mut().unwrap();
+        let key = worktrees
+            .keys()
+            .find(|p| Path::new(p).file_name().unwrap().to_string_lossy() == name)
+            .cloned();
+        if let Some(key) = key {
+            let entry = worktrees.remove(&key).unwrap();
+            worktrees.insert(to.to_string(), entry);
+        }
+    }
+    std::fs::write(env.registry_path(), serde_json::to_string(&reg).unwrap()).unwrap();
+}
+
+#[test]
+fn a_worktree_on_a_disk_that_is_not_plugged_in_costs_no_git() {
+    let env = TestEnv::new();
+    env.write_config("range = [17700, 17749]\n");
+    let (_a, b, a_wt) = two_projects(&env);
+    // Below a mount directory, whatever git says the entry is kept.
+    let away = if cfg!(target_os = "macos") {
+        "/Volumes/portool-test-disk-not-plugged-in/wt"
+    } else {
+        "/mnt/portool-test-disk-not-plugged-in/wt"
+    };
+    set_path(&env, &a_wt, away);
+    let (fake, log) = git_deaf_to_listings(&env);
+
+    for args in [&["pin"][..], &["unpin"], &["reserve", "17749"]] {
+        let started = std::time::Instant::now();
+        let out = ok(run_with_path(&env, &fake, &b, args));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(stderr(&out), "", "{args:?}");
+    }
+    assert_eq!(
+        lines(&log),
+        0,
+        "git was asked although no answer could matter"
+    );
+    assert!(allocations(&env).iter().any(|(path, _)| path == away));
+}
+
+#[test]
+fn an_unusable_temp_directory_is_reported_as_such_and_not_remembered() {
+    let env = TestEnv::new();
+    env.write_config("range = [17650, 17699]\n");
+    let (_a, b, a_wt) = two_projects(&env);
+    std::fs::remove_dir_all(&a_wt).unwrap();
+    let out = ok(env
+        .command()
+        .env("TMPDIR", env.path("no-such-temp-dir"))
+        .current_dir(&b)
+        .arg("pin")
+        .output()
+        .unwrap());
+    let text = stderr(&out);
+    assert!(text.contains("no temporary file"), "{text}");
+    assert!(!text.contains("git worktree list"), "{text}");
+    assert!(!text.contains("minutes"), "{text}");
+    assert!(block_of(&env, &a_wt).is_some());
+    let memory = env.state.join("portool").join("stale-check-failed.json");
+    assert!(!memory.exists(), "not a failure of the project");
+    // With a temp directory the very next command checks, and releases.
+    ok(env.run(&b, &["unpin"]));
+    assert!(block_of(&env, &a_wt).is_none());
+}
