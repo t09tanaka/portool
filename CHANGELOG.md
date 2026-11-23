@@ -7,6 +7,8 @@ the minor version).
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-11-23
+
 ### Changed
 
 - Allocations of worktrees that are gone are released, for all projects, by
