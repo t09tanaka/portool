@@ -188,9 +188,14 @@ fn try_fast_path(ctx: &GitCtx) -> Result<Option<SyncOutcome>> {
 /// reset (external review P1 #1); `doctor --repair` is the explicit
 /// recovery path.
 fn slow_path(ctx: &GitCtx, config: &Config, quiet: bool) -> Result<SyncOutcome> {
+    let registry_path = paths::registry_path()?;
+    // Evidence about vanished worktrees of every project, this one
+    // included, gathered before the lock (it may wait on filesystems and
+    // git); applied below, in memory, ahead of the save this path always
+    // makes.
+    let sweep = crate::reclaim::plan(&registry_path, Some(&key(&ctx.common_dir)));
     let _lock = lock::acquire(&paths::lock_path()?, LOCK_TIMEOUT)?;
 
-    let registry_path = paths::registry_path()?;
     // Frozen decision 14: a freshly created ledger records the live pool at
     // creation time; it is never updated after that.
     let mut registry =
@@ -228,12 +233,15 @@ fn slow_path(ctx: &GitCtx, config: &Config, quiet: bool) -> Result<SyncOutcome> 
     // freeing this project's stale entries first lets a re-created worktree
     // on the same branch reclaim its just-freed block instead of forcing a
     // fresh one that only becomes free after the fact.
-    if let Some(project) = registry.projects.get_mut(&common_dir_key) {
-        let live_worktrees = ctx.worktree_list()?;
-        let dir_exists = |p: &Path| p.exists();
-        let block_unused = |b: (u16, u16)| ports::block_free(b);
-        crate::gc::collect(project, &live_worktrees, &dir_exists, &block_unused);
+    // The evidence was gathered before the lock; here it is only compared
+    // with the entries as they are now (plus one `lstat` and a port probe
+    // per entry about to be released). Nothing is saved here: the removals
+    // ride on the save below. As before, a git that cannot list this
+    // project's own worktrees fails the command.
+    if let Some(reason) = sweep.current_failure() {
+        return Err(Error::General(reason.to_string()));
     }
+    sweep.apply(&mut registry);
 
     let manifest_state = load_manifest_state(&ctx.worktree_root)?;
     let block_size = manifest_state
@@ -284,9 +292,12 @@ fn slow_path(ctx: &GitCtx, config: &Config, quiet: bool) -> Result<SyncOutcome> 
                     if !ports::block_free(entry.block) {
                         return Err(Error::General(format!(
                             "the manifest now needs {} ports but block {}-{} cannot \
-                             grow in place, and something is still listening on it; \
-                             stop those processes and re-run 'portool sync', or run \
-                             'portool reallocate' to move this worktree explicitly",
+                             grow in place, and something is still listening on it \
+                             (on Linux a port can also read as in use for up to a \
+                             minute after a server that does not set SO_REUSEADDR \
+                             has stopped); stop those processes and re-run \
+                             'portool sync', or run 'portool reallocate' to move \
+                             this worktree explicitly",
                             block_size, entry.block.0, entry.block.1
                         )));
                     }
@@ -496,10 +507,11 @@ pub fn reallocate_cmd(quiet: bool) -> Result<()> {
 /// has no ledger entry yet (run `sync` first), and with `PoolExhausted`
 /// when no other block fits.
 pub fn reallocate(ctx: &GitCtx, quiet: bool) -> Result<SyncOutcome> {
+    let registry_path = paths::registry_path()?;
+    let sweep = crate::reclaim::plan(&registry_path, None);
     let _lock = lock::acquire(&paths::lock_path()?, LOCK_TIMEOUT)?;
 
     let config = Config::load()?;
-    let registry_path = paths::registry_path()?;
     let mut registry =
         store::load_strict(&registry_path)?.unwrap_or_else(|| Registry::empty(config.range));
 
@@ -564,6 +576,7 @@ pub fn reallocate(ctx: &GitCtx, quiet: bool) -> Result<SyncOutcome> {
             .expect("entry existed above");
         entry.pending_block = Some(new_block);
     }
+    sweep.apply(&mut registry);
     store::save(&registry_path, &mut registry)?;
     crate::fault::point("after_pending_save");
 

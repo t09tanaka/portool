@@ -188,8 +188,11 @@ pub fn atomic_write_within(
     let (dir, leaf) = open_parent_dir_fd(boundary, target)?;
     let dirfd = dir.as_raw_fd();
 
+    sweep_hook_dir(&dir, target);
+
     let tmp_name = format!(
-        ".portool-tmp-{}-{}",
+        "{}{}-{}",
+        crate::leftovers::TMP_PREFIX,
         std::process::id(),
         leaf.to_string_lossy()
     );
@@ -239,6 +242,44 @@ pub fn atomic_write_within(
             .strip_prefix(boundary)
             .expect("checked in repo_relative_components"),
     ))
+}
+
+/// Sweeps crash-leftover `.portool-tmp-<deadpid>-*` files from the verified
+/// hook directory. Unlinks relative to the verified `dir` fd, so a directory
+/// swapped for a symlink after verification cannot redirect a removal.
+fn sweep_hook_dir(dir: &fs::File, target: &Path) {
+    use std::ffi::CString;
+    let Some(parent) = target.parent() else {
+        return;
+    };
+    let dirfd = dir.as_raw_fd();
+    let age_of = |name: &str| -> Option<std::time::Duration> {
+        let c = CString::new(name).ok()?;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::fstatat(dirfd, c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
+        if rc != 0 || (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+            return None;
+        }
+        let mtime = UNIX_EPOCH + std::time::Duration::from_secs(st.st_mtime.max(0) as u64);
+        SystemTime::now().duration_since(mtime).ok()
+    };
+    let unlink = |name: &str| -> std::io::Result<()> {
+        let c = CString::new(name).map_err(|e| std::io::Error::other(e.to_string()))?;
+        if unsafe { libc::unlinkat(dirfd, c.as_ptr(), 0) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    };
+    crate::leftovers::sweep(
+        parent,
+        &crate::leftovers::Sweep {
+            legacy_temps: false,
+            ledger_name: None,
+        },
+        &age_of,
+        &unlink,
+    );
 }
 
 /// Sets `target`'s permission bits to `mode`, refusing if any component below
@@ -369,7 +410,19 @@ pub fn move_aside(path: &Path) -> Result<PathBuf> {
             corrupt_path.display()
         ))
     })?;
+    stamp_now(&corrupt_path);
     Ok(corrupt_path)
+}
+
+/// Sets a file's modification time to now. A set-aside copy keeps the
+/// ledger's own modification time when renamed (and when cloned by
+/// `fs::copy` on APFS); its retention counts from the repair, not from the
+/// ledger's last write. Best effort: the command that made the copy never
+/// deletes it either way.
+fn stamp_now(path: &Path) {
+    if let Ok(file) = fs::File::options().write(true).open(path) {
+        let _ = file.set_modified(SystemTime::now());
+    }
 }
 
 /// Copies the (bad) ledger to a `.corrupt-<nanos>-<pid>` sibling without
@@ -387,6 +440,7 @@ pub fn copy_aside(path: &Path) -> Result<PathBuf> {
             corrupt_path.display()
         ))
     })?;
+    stamp_now(&corrupt_path);
     Ok(corrupt_path)
 }
 
@@ -396,6 +450,17 @@ pub fn copy_aside(path: &Path) -> Result<PathBuf> {
 /// temp-file + rename too (external review 3rd round P1-3) -- a crash mid-
 /// backup can no longer leave a partially overwritten `.bak`.
 pub fn save(path: &Path, registry: &mut Registry) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        // Under the ledger lock, so no live writer owns any temp file here.
+        let ledger_name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+        crate::leftovers::sweep_path(
+            dir,
+            &crate::leftovers::Sweep {
+                legacy_temps: true,
+                ledger_name: ledger_name.as_deref(),
+            },
+        );
+    }
     // Bump the monotonic ledger sequence on every save (external review v0.10
     // P0-2). `save` is always called under the ledger lock, so this is the
     // single serialization point for the counter. `saturating_add` keeps a
@@ -420,6 +485,17 @@ pub fn save(path: &Path, registry: &mut Registry) -> Result<()> {
 /// of the parent directory so the rename itself survives power loss. The
 /// parent directory is created if necessary.
 pub fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        // A shared directory (the worktree root): only portool's own,
+        // pid-stamped names, with a dead owner and some age.
+        crate::leftovers::sweep_path(
+            dir,
+            &crate::leftovers::Sweep {
+                legacy_temps: false,
+                ledger_name: None,
+            },
+        );
+    }
     write_atomic_impl(path, contents, None)
 }
 
@@ -432,7 +508,11 @@ fn write_atomic_impl(
         .parent()
         .ok_or_else(|| Error::General(format!("{} has no parent directory", path.display())))?;
     fs::create_dir_all(dir)?;
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    let prefix = format!("{}{}-", crate::leftovers::TMP_PREFIX, std::process::id());
+    let mut tmp = tempfile::Builder::new()
+        .prefix(&prefix)
+        .rand_bytes(6)
+        .tempfile_in(dir)?;
     tmp.write_all(contents)?;
     tmp.as_file().sync_all()?;
     if let Some(name) = fault_before_rename {

@@ -257,7 +257,7 @@ pub fn run(repair: bool, abandon_other_projects: bool) -> Result<()> {
     let mut in_use = 0usize;
     if let Some(project) = registry.find_project(&common_dir_key) {
         for (path, entry) in &project.worktrees {
-            if !ports::block_free(entry.block) {
+            if !ports::loopback_block_free(entry.block) {
                 in_use += 1;
                 println!(
                     "portool: doctor: block {}-{} ({}) has ports in use \

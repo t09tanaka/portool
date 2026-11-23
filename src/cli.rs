@@ -86,6 +86,12 @@ enum Command {
         /// Report what would be pruned without modifying the ledger.
         #[arg(long)]
         dry_run: bool,
+        /// Also drop unpinned entries whose worktree directory is missing
+        /// but cannot be verified as deleted (its volume may only be
+        /// unmounted, or git cannot list the project), if their ports are
+        /// unused. Each one is listed with the reason it had been kept.
+        #[arg(long)]
+        forget_unverifiable: bool,
     },
     /// Validate the config and ledger; exit non-zero on any problem.
     Check,
@@ -212,7 +218,11 @@ pub(crate) fn run(args: Vec<std::ffi::OsString>) -> i32 {
             env_file_overrides,
         ),
         Command::Reallocate { quiet } => cmd::sync::reallocate_cmd(quiet),
-        Command::Prune { all, dry_run } => cmd::prune::run(all, dry_run),
+        Command::Prune {
+            all,
+            dry_run,
+            forget_unverifiable,
+        } => cmd::prune::run(all, dry_run, forget_unverifiable),
         Command::Check => cmd::check::run(),
         Command::Doctor {
             repair,

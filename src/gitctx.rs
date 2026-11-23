@@ -1,7 +1,8 @@
 //! Thin `git` command-line wrapper: project/worktree identity discovery
 //! and `git worktree list` parsing (spec §6.1). The only external
 //! processes this crate spawns are `git rev-parse`, `git symbolic-ref
-//! --short -q HEAD`, `git worktree list --porcelain`, and `git config
+//! --short -q HEAD`, `git worktree list --porcelain` (for another project: with a
+//! time limit, see [`worktree_listing_bounded`]), and `git config
 //! --type=path --get`.
 
 use crate::error::{Error, Result};
@@ -105,44 +106,260 @@ impl GitCtx {
 /// -- this is what lets [`crate::cmd::prune`] enumerate a project's
 /// worktrees without a live worktree root to run `git` from.
 pub fn worktree_list_at(dir: &Path) -> Result<Vec<PathBuf>> {
+    Ok(worktree_listing_at(dir)?
+        .into_iter()
+        .map(|w| w.path)
+        .collect())
+}
+
+/// One worktree as `git worktree list --porcelain` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listed {
+    pub path: PathBuf,
+    /// Git printed a `prunable` line: the worktree's directory no longer
+    /// holds its `.git` file (removed with `rm -rf`, or on a volume that is
+    /// not mounted -- git cannot tell these apart, and neither does this
+    /// flag). Printed by git 2.31 and later; an older git never sets it.
+    pub prunable: bool,
+    /// Git printed a `locked` line (`git worktree lock`, also git >= 2.31).
+    pub locked: bool,
+    /// Git printed a `bare` line: this entry is the repository itself, not
+    /// a checkout. (Git before 2.22 also printed it for any common
+    /// directory not named `.git`, so it is never trusted on its own.)
+    pub bare: bool,
+}
+
+/// [`worktree_list_at`] with each worktree's `prunable` / `locked` state.
+pub fn worktree_listing_at(dir: &Path) -> Result<Vec<Listed>> {
     // Prefer `-z` (git >= 2.36): its NUL-separated records safely carry
     // worktree paths that contain newlines, and preserve non-UTF-8 bytes.
     // Fall back to the newline parser on older git rather than failing the
     // whole slow path (batch D #12).
     if let Some(bytes) = run_git_bytes(dir, &["worktree", "list", "--porcelain", "-z"]) {
-        return Ok(parse_worktree_list_z(&bytes));
+        return Ok(parse_listing_z(&bytes));
     }
     let output = run_git_checked(dir, &["worktree", "list", "--porcelain"])?;
-    Ok(parse_worktree_list_lines(&output))
+    Ok(parse_listing_lines(&output))
 }
 
-/// Parses the NUL-separated records of `git worktree list --porcelain -z`,
-/// collecting each `worktree <path>` record's path (canonicalized when the
-/// directory still exists).
-fn parse_worktree_list_z(bytes: &[u8]) -> Vec<PathBuf> {
-    use std::os::unix::ffi::OsStrExt;
-    let mut paths = Vec::new();
+/// [`worktree_listing_at`] for a repository this command is not running in,
+/// which may sit on a dead network mount or be otherwise broken: git is
+/// killed (the one child spawned here, by its handle) when it has not
+/// finished within `timeout`, and a timeout is never retried.
+pub fn worktree_listing_bounded(
+    dir: &Path,
+    timeout: std::time::Duration,
+) -> std::result::Result<Vec<Listed>, Bounded> {
+    let deadline = std::time::Instant::now() + timeout;
+    match run_git_bounded(dir, &["worktree", "list", "--porcelain", "-z"], deadline) {
+        Ok(bytes) => return Ok(parse_listing_z(&bytes)),
+        Err(Bounded::Failed(_)) => {} // possibly git < 2.36: retry without -z
+        Err(other) => return Err(other),
+    }
+    let bytes = run_git_bounded(dir, &["worktree", "list", "--porcelain"], deadline)?;
+    Ok(parse_listing_lines(&String::from_utf8_lossy(&bytes)))
+}
+
+/// What the repository's own configuration says about its main checkout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MainConfig {
+    /// `core.bare` is set and true: the repository has no main checkout.
+    pub bare: bool,
+    /// `core.worktree` is set: the main checkout is wherever it points,
+    /// which `git worktree list` does not show.
+    pub worktree_set: bool,
+}
+
+/// Reads [`MainConfig`] for the repository whose common directory is `dir`,
+/// with the same time limit and kill as [`worktree_listing_bounded`].
+pub fn main_config_bounded(
+    dir: &Path,
+    timeout: std::time::Duration,
+) -> std::result::Result<MainConfig, Bounded> {
+    let deadline = std::time::Instant::now() + timeout;
+    let bytes = run_git_bounded(dir, &["config", "-z", "--list"], deadline)?;
+    Ok(parse_main_config(&bytes))
+}
+
+/// Parses `git config -z --list`: records `key\nvalue\0` (or `key\0` for a
+/// key without a value, which git reads as true); the last one wins.
+fn parse_main_config(bytes: &[u8]) -> MainConfig {
+    let mut out = MainConfig {
+        bare: false,
+        worktree_set: false,
+    };
     for record in bytes.split(|&b| b == 0) {
-        if let Some(raw) = record.strip_prefix(b"worktree ") {
-            let path = PathBuf::from(std::ffi::OsStr::from_bytes(raw));
-            paths.push(std::fs::canonicalize(&path).unwrap_or(path));
+        let mut parts = record.splitn(2, |&b| b == b'\n');
+        let key = parts.next().unwrap_or_default();
+        let value = parts.next();
+        if key.eq_ignore_ascii_case(b"core.worktree") {
+            out.worktree_set = true;
+        } else if key.eq_ignore_ascii_case(b"core.bare") {
+            out.bare = match value {
+                None => true,
+                Some(v) => [&b"true"[..], b"yes", b"on", b"1"]
+                    .iter()
+                    .any(|t| v.eq_ignore_ascii_case(t)),
+            };
         }
     }
-    paths
+    out
+}
+
+/// Why a bounded git call gave no answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Bounded {
+    /// Git was killed at the time limit.
+    TimedOut,
+    /// Git ran and failed, or could not be started.
+    Failed(String),
+    /// This process could not set the call up (no temp file for git's
+    /// output ...): says nothing about the repository.
+    Local(String),
+}
+
+/// Runs git with its output in anonymous temp files (no pipe, so neither a
+/// full pipe nor a grandchild holding one open can block this process) and
+/// polls for its exit until `deadline`.
+fn run_git_bounded(
+    cwd: &Path,
+    args: &[&str],
+    deadline: std::time::Instant,
+) -> std::result::Result<Vec<u8>, Bounded> {
+    run_bounded_command(git_command(cwd, args), deadline).map_err(|e| match e {
+        Bounded::Failed(reason) => Bounded::Failed(format!("git {}: {reason}", args.join(" "))),
+        other => other,
+    })
+}
+
+/// [`run_git_bounded`] for an already built command.
+fn run_bounded_command(
+    mut command: Command,
+    deadline: std::time::Instant,
+) -> std::result::Result<Vec<u8>, Bounded> {
+    use std::io::{Read, Seek, SeekFrom};
+    use std::process::Stdio;
+    let failed = |what: &str, e: &dyn std::fmt::Display| Bounded::Failed(format!("{what}: {e}"));
+    let local = |e: std::io::Error| {
+        Bounded::Local(format!(
+            "no temporary file for git's output in {}: {e}",
+            std::env::temp_dir().display()
+        ))
+    };
+    let mut out = tempfile::tempfile().map_err(local)?;
+    let mut err = tempfile::tempfile().map_err(local)?;
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(out.try_clone().map_err(local)?)
+        .stderr(err.try_clone().map_err(local)?)
+        .spawn()
+        .map_err(|e| failed("could not be started", &e))?;
+    let mut pause = std::time::Duration::from_millis(1);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                // `child` is the process spawned above and not yet reaped,
+                // so its pid cannot have been reused.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Bounded::TimedOut);
+            }
+            Ok(None) => {
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(std::time::Duration::from_millis(20));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(failed("could not be waited for", &e));
+            }
+        }
+    };
+    if !status.success() {
+        let mut text = String::new();
+        let _ = err.seek(SeekFrom::Start(0));
+        let _ = err.take(400).read_to_string(&mut text);
+        return Err(Bounded::Failed(format!(
+            "failed ({status}): {}",
+            text.trim()
+        )));
+    }
+    let mut bytes = Vec::new();
+    out.seek(SeekFrom::Start(0))
+        .and_then(|_| out.read_to_end(&mut bytes))
+        .map_err(|e| failed("output could not be read", &e))?;
+    Ok(bytes)
+}
+
+/// The path a ledger key for `path` would have: canonical when the
+/// directory exists; otherwise the canonical form of its nearest existing
+/// ancestor plus the missing tail (so a removed worktree under a symlinked
+/// temp directory still compares equal to its ledger key).
+fn ledger_form(path: PathBuf) -> PathBuf {
+    if let Ok(real) = std::fs::canonicalize(&path) {
+        return real;
+    }
+    let mut tail = Vec::new();
+    let mut cursor = path.as_path();
+    while let (Some(parent), Some(name)) = (cursor.parent(), cursor.file_name()) {
+        tail.push(name.to_os_string());
+        if let Ok(mut real) = std::fs::canonicalize(parent) {
+            real.extend(tail.iter().rev());
+            return real;
+        }
+        cursor = parent;
+    }
+    path
+}
+
+/// Folds one porcelain attribute line into the worktree being read.
+fn listing_field(items: &mut Vec<Listed>, field: &[u8]) {
+    use std::os::unix::ffi::OsStrExt;
+    let is = |name: &[u8]| {
+        field == name || (field.starts_with(name) && field.get(name.len()) == Some(&b' '))
+    };
+    if let Some(raw) = field.strip_prefix(b"worktree ") {
+        items.push(Listed {
+            path: ledger_form(PathBuf::from(std::ffi::OsStr::from_bytes(raw))),
+            prunable: false,
+            locked: false,
+            bare: false,
+        });
+    } else if let Some(last) = items.last_mut() {
+        if is(b"prunable") {
+            last.prunable = true;
+        } else if is(b"locked") {
+            last.locked = true;
+        } else if is(b"bare") {
+            last.bare = true;
+        }
+    }
+}
+
+/// Parses the NUL-separated records of `git worktree list --porcelain -z`.
+fn parse_listing_z(bytes: &[u8]) -> Vec<Listed> {
+    let mut items = Vec::new();
+    for field in bytes.split(|&b| b == 0) {
+        listing_field(&mut items, field);
+    }
+    items
 }
 
 /// Fallback line parser for git older than 2.36 (no `-z`). A worktree path
 /// containing a newline can't be represented faithfully here -- the reason
 /// `-z` is preferred.
-fn parse_worktree_list_lines(output: &str) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
+fn parse_listing_lines(output: &str) -> Vec<Listed> {
+    let mut items = Vec::new();
     for line in output.lines() {
-        if let Some(raw) = line.strip_prefix("worktree ") {
-            let path = PathBuf::from(raw);
-            paths.push(std::fs::canonicalize(&path).unwrap_or(path));
-        }
+        listing_field(&mut items, line.as_bytes());
     }
-    paths
+    items
+}
+
+#[cfg(test)]
+fn parse_worktree_list_z(bytes: &[u8]) -> Vec<PathBuf> {
+    parse_listing_z(bytes).into_iter().map(|w| w.path).collect()
 }
 
 /// Reads a path-valued git config key via `git config --type=path --get`
@@ -515,6 +732,109 @@ mod tests {
             paths.iter().any(|p| p == Path::new("/b/new\nline")),
             "a newline-bearing path must be preserved, got: {paths:?}"
         );
+    }
+
+    #[test]
+    fn listing_reads_prunable_and_locked_with_or_without_a_reason() {
+        let bytes = b"worktree /a/main\0HEAD abc\0branch refs/heads/main\0\0\
+            worktree /a/gone\0HEAD def\0detached\0prunable gitdir file points to non-existent location\0\0\
+            worktree /a/locked\0HEAD def\0locked\0\0\
+            worktree /a/locked-why\0HEAD def\0locked on a usb disk\0\0\
+            worktree /a/prunable-bare\0prunable\0\0\
+            worktree /a/lockedish\0branch refs/heads/locked\0\0";
+        let got: Vec<(String, bool, bool)> = parse_listing_z(bytes)
+            .into_iter()
+            .map(|w| (w.path.to_string_lossy().into_owned(), w.prunable, w.locked))
+            .collect();
+        let want = [
+            ("/a/main", false, false),
+            ("/a/gone", true, false),
+            ("/a/locked", false, true),
+            ("/a/locked-why", false, true),
+            ("/a/prunable-bare", true, false),
+            ("/a/lockedish", false, false),
+        ];
+        assert_eq!(got.len(), want.len());
+        for ((path, prunable, locked), (p, pr, lo)) in got.iter().zip(want) {
+            assert_eq!((path.as_str(), *prunable, *locked), (p, pr, lo));
+        }
+        // The line form (git < 2.36) reads the same attributes.
+        let lines = "worktree /a/main\nHEAD abc\n\nworktree /a/gone\nprunable reason\n\n";
+        let got = parse_listing_lines(lines);
+        assert_eq!(got.len(), 2);
+        assert!(!got[0].prunable && got[1].prunable);
+    }
+
+    #[test]
+    fn ledger_form_resolves_the_existing_part_of_a_missing_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = std::fs::canonicalize(tmp.path()).unwrap();
+        std::os::unix::fs::symlink(&real, real.join("link")).unwrap();
+        assert_eq!(
+            ledger_form(real.join("link").join("gone").join("wt")),
+            real.join("gone").join("wt")
+        );
+        assert_eq!(ledger_form(real.join("link")), real);
+    }
+
+    #[test]
+    fn main_config_reads_bare_and_core_worktree() {
+        let cfg = |s: &[u8]| parse_main_config(s);
+        let plain = cfg(b"core.bare\nfalse\0core.filemode\ntrue\0");
+        assert!(!plain.bare && !plain.worktree_set);
+        assert!(cfg(b"core.bare\ntrue\0").bare);
+        assert!(cfg(b"core.bare\0").bare, "a key without a value is true");
+        assert!(
+            !cfg(b"core.bare\ntrue\0core.bare\nfalse\0").bare,
+            "last wins"
+        );
+        assert!(!cfg(b"core.bare\nmaybe\0").bare, "unknown is not bare");
+        assert!(cfg(b"core.worktree\n../../sub\0").worktree_set);
+        assert!(!cfg(b"core.worktreex\n1\0user.name\ncore.worktree\0").worktree_set);
+        assert!(!cfg(b"").bare);
+    }
+
+    #[test]
+    fn listing_marks_the_bare_entry() {
+        let got = parse_listing_z(b"worktree /a/r.git\0bare\0\0worktree /a/wt\0HEAD x\0\0");
+        assert!(got[0].bare && !got[1].bare);
+    }
+
+    #[test]
+    fn a_missing_temp_directory_is_not_reported_as_a_git_failure() {
+        // The child of this test only: TMPDIR is set on the command, and
+        // `tempfile` reads the parent's, so the parent's is what must be
+        // unusable -- done in a child process to leave this one alone.
+        let exe = std::env::current_exe().unwrap();
+        if std::env::var_os("PORTOOL_TEST_NO_TMP").is_some() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let out = run_bounded_command(Command::new("true"), deadline);
+            assert!(matches!(out, Err(Bounded::Local(_))), "{out:?}");
+            return;
+        }
+        let status = Command::new(exe)
+            .args([
+                "--exact",
+                "gitctx::tests::a_missing_temp_directory_is_not_reported_as_a_git_failure",
+                "--nocapture",
+            ])
+            .env("PORTOOL_TEST_NO_TMP", "1")
+            .env("TMPDIR", "/nonexistent-portool-test-tmp")
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn bounded_listing_kills_a_git_that_does_not_answer() {
+        // A stand-in for a git that hangs: a `sleep` this test spawns.
+        let started = std::time::Instant::now();
+        let deadline = started + std::time::Duration::from_millis(300);
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let out = run_bounded_command(cmd, deadline);
+        assert!(matches!(out, Err(Bounded::TimedOut)));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[test]

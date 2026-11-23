@@ -1818,6 +1818,12 @@ fn prune_all_keeps_entries_when_worktree_enumeration_fails() {
     // would have dropped the entry.
     let fake_common = env.path("broken/.git");
     fs::create_dir_all(&fake_common).unwrap();
+    // Verifiably gone (a missing name in an ordinary, populated directory):
+    // only git's answer stands between this entry and its release, so git
+    // is asked. (For a path whose surroundings keep it anyway, such as one
+    // directly below `/`, git is no longer run at all.)
+    let gone = env.path("gone-worktree");
+    let gone = gone.to_str().unwrap();
     let registry = serde_json::json!({
         "version": 3,
         "range": [17300, 17399],
@@ -1825,7 +1831,7 @@ fn prune_all_keeps_entries_when_worktree_enumeration_fails() {
             fake_common.to_str().unwrap(): {
                 "name": "broken",
                 "worktrees": {
-                    "/no/such/worktree": {
+                    gone: {
                         "block": [17300, 17304],
                         "generation": 1,
                         "pending_block": null,
@@ -1861,8 +1867,7 @@ fn prune_all_keeps_entries_when_worktree_enumeration_fails() {
     // The entry must still be there.
     let reg = env.registry();
     assert!(
-        reg["projects"][fake_common.to_str().unwrap()]["worktrees"]["/no/such/worktree"]
-            .is_object(),
+        reg["projects"][fake_common.to_str().unwrap()]["worktrees"][gone].is_object(),
         "enumeration failure must not reclaim the entry"
     );
 }

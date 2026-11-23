@@ -40,8 +40,11 @@ pub(crate) fn release_worktree(ctx: &GitCtx) -> Result<bool> {
     let common_dir_key = ctx.common_dir.to_string_lossy().into_owned();
     let worktree_key = ctx.worktree_root.to_string_lossy().into_owned();
 
-    let _lock = lock::acquire(&paths::lock_path()?, LOCK_TIMEOUT)?;
     let registry_path = paths::registry_path()?;
+    // Evidence about other worktrees is gathered before the lock; it is
+    // applied below only on the path that saves the ledger anyway.
+    let sweep = crate::reclaim::plan(&registry_path, None);
+    let _lock = lock::acquire(&paths::lock_path()?, LOCK_TIMEOUT)?;
     let mut registry = match store::load_strict(&registry_path)? {
         Some(registry) => registry,
         None => {
@@ -67,6 +70,10 @@ pub(crate) fn release_worktree(ctx: &GitCtx) -> Result<bool> {
             .expect("has_entry checked above")
             .worktrees
             .remove(&worktree_key);
+        // After the removal above, so a vanished worktree still reports
+        // `Freed` here rather than being swept first; the sweep rides on
+        // the same save.
+        sweep.apply(&mut registry);
         store::save(&registry_path, &mut registry)?;
     }
     Ok(has_entry)

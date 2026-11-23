@@ -1,15 +1,17 @@
 //! `portool prune` (spec §8.2, §8.3, frozen decision 13): explicit GC,
 //! either for the current project or (`--all`) across the whole ledger.
+//!
+//! The rules are the automatic sweep's ([`crate::reclaim`]); this command
+//! adds a report, and `--forget-unverifiable`, the one way to drop an entry
+//! whose worktree can never be verified as gone (a volume that will not be
+//! mounted again, a repository git can no longer read).
 
-use crate::error::Result;
-use crate::gc;
-use crate::gitctx::{self, GitCtx};
+use crate::error::{Error, Result};
+use crate::gitctx::GitCtx;
 use crate::lock;
 use crate::paths;
-use crate::ports;
-use crate::registry::{ProjectEntry, Registry};
+use crate::reclaim::{self, Event, Scope};
 use crate::store;
-use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -19,151 +21,124 @@ const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 /// discards it. Both modes are fail-closed on a corrupt, unsupported, or
 /// unreadable ledger: reclamation must never run against a placeholder
 /// empty registry.
-pub fn run(all: bool, dry_run: bool) -> Result<()> {
+pub fn run(all: bool, dry_run: bool, forget_unverifiable: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
+    let registry_path = paths::registry_path()?;
 
-    if dry_run {
-        // Read-only, lock-free.
-        let mut registry = match store::load_strict(&paths::registry_path()?)? {
-            Some(registry) => registry,
-            None => return Ok(()), // no ledger -> nothing to prune
-        };
-        if all {
-            prune_all(&mut registry, true);
-        } else {
-            let ctx = GitCtx::discover(&cwd)?;
-            prune_current(&mut registry, &ctx, true)?;
+    // Files and git are examined before the lock is taken, for this
+    // project as for the others: a dead network mount must not stall every
+    // other portool command.
+    let Some(snapshot) = store::load_strict(&registry_path)? else {
+        return Ok(()); // no ledger -> nothing to prune
+    };
+    let current = match all {
+        true => None,
+        false => Some(
+            GitCtx::discover(&cwd)?
+                .common_dir
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    };
+    let scope = match &current {
+        Some(key) => Scope::Only(key),
+        None => Scope::All,
+    };
+    let plan = reclaim::plan_manual(&snapshot, scope, forget_unverifiable);
+    if current.is_some() {
+        // In its own project a git that cannot list the worktrees is the
+        // command's error, `--forget-unverifiable` or not.
+        if let Some((_, reason)) = plan.git_failed().first() {
+            return Err(Error::General(reason.clone()));
         }
-        return Ok(());
     }
 
-    let _lock = lock::acquire(&paths::lock_path()?, LOCK_TIMEOUT)?;
-    let mut registry = match store::load_strict(&paths::registry_path()?)? {
+    let _lock = if dry_run {
+        None // read-only, lock-free
+    } else {
+        Some(lock::acquire(&paths::lock_path()?, LOCK_TIMEOUT)?)
+    };
+    let mut registry = match store::load_strict(&registry_path)? {
         Some(registry) => registry,
         None => return Ok(()),
     };
 
-    let changed = if all {
-        prune_all(&mut registry, false)
-    } else {
-        let ctx = GitCtx::discover(&cwd)?;
-        prune_current(&mut registry, &ctx, false)?
-    };
+    for (key, reason) in plan.git_failed() {
+        eprintln!(
+            "portool: prune: skipping project {}: listing worktrees failed \
+             ({reason}); its entries were kept",
+            crate::display::text(key)
+        );
+    }
+    let events = plan.apply_reporting(&mut registry);
 
-    if changed {
-        store::save(&paths::registry_path()?, &mut registry)?;
+    if report(&events, dry_run, forget_unverifiable) && !dry_run {
+        store::save(&registry_path, &mut registry)?;
+    }
+    // What could not be checked at all is not "nothing to prune": say what,
+    // and fail, after what could be decided has been done.
+    let unchecked = plan.unchecked();
+    if !unchecked.is_empty() {
+        for line in unchecked {
+            eprintln!("portool: prune: could not check {line}; its entries were kept");
+        }
+        return Err(Error::General(format!(
+            "prune is incomplete: {} check(s) did not finish (limit: {}s)",
+            unchecked.len(),
+            reclaim::MANUAL_BUDGET.as_secs()
+        )));
     }
     Ok(())
 }
 
-fn prune_current(registry: &mut Registry, ctx: &GitCtx, dry_run: bool) -> Result<bool> {
-    let key = ctx.common_dir.to_string_lossy().into_owned();
-    let live = ctx.worktree_list()?;
-    match registry.projects.get_mut(&key) {
-        Some(project) => Ok(reclaim_project_worktrees(project, &live, dry_run)),
-        None => Ok(false),
-    }
-}
-
-/// Spec §8.2 `--all`: for every project, if its `common_dir` still exists,
-/// apply the same per-worktree reclamation as the default mode; if the
-/// `common_dir` itself is gone (the whole repository was deleted), reclaim
-/// each unpinned worktree entry whose ports are confirmed unused, and drop
-/// the project entry itself once no worktrees remain. Pinned entries are
-/// exempt, same as every other GC path.
-fn prune_all(registry: &mut Registry, dry_run: bool) -> bool {
+/// Prints one line per event; returns whether the ledger changed.
+fn report(events: &[Event], dry_run: bool, forced: bool) -> bool {
+    let verb = if dry_run { "would prune" } else { "pruned" };
     let mut changed = false;
-    let keys: Vec<String> = registry.projects.keys().cloned().collect();
-    let mut projects_to_remove = Vec::new();
-
-    for key in &keys {
-        if !Path::new(key).exists() {
-            let project = registry
-                .projects
-                .get_mut(key)
-                .expect("key came from registry.projects.keys()");
-            // The repository is gone, but the pin contract still holds: pinned
-            // entries are exempt from every GC path, so reclaim only unpinned
-            // entries whose ports (block + pending) are confirmed unused, and
-            // drop the project entry only once nothing remains.
-            let reclaimable: Vec<String> = project
-                .worktrees
-                .iter()
-                .filter(|(_, w)| {
-                    !w.pinned
-                        && ports::block_free(w.block)
-                        && w.pending_block.map(ports::block_free).unwrap_or(true)
-                })
-                .map(|(path, _)| path.clone())
-                .collect();
-            let verb = if dry_run { "would prune" } else { "pruned" };
-            for path in &reclaimable {
-                let block = project.worktrees[path].block;
+    for event in events {
+        match event {
+            Event::Released {
+                path,
+                block,
+                forced,
+            } => {
+                changed = true;
+                let note = match forced {
+                    Some(why) => {
+                        format!(" -- unverifiable, forgotten on request: {}", why.describe())
+                    }
+                    None => String::new(),
+                };
                 println!(
-                    "{verb} {} (block {}-{})",
+                    "{verb} {} (block {}-{}){note}",
                     crate::display::text(path),
                     block.0,
                     block.1
                 );
-                project.worktrees.remove(path);
-                changed = true;
             }
-            if project.worktrees.is_empty() {
+            Event::Project { name, key } => {
+                changed = true;
                 println!(
                     "{verb} project {} ({})",
-                    crate::display::text(&project.name),
+                    crate::display::text(name),
                     crate::display::text(key)
                 );
-                projects_to_remove.push(key.clone());
-                changed = true;
             }
-            continue;
-        }
-
-        let live = match gitctx::worktree_list_at(Path::new(key)) {
-            Ok(live) => live,
-            Err(err) => {
-                // Fail-closed (external review P0-2): a Git failure is not
-                // "this project has zero worktrees". Reclaiming on that
-                // misreading could free blocks that live worktrees' env
-                // files still hand out. Keep every entry and move on.
+            Event::Kept { path, block, why } => {
+                let hint = if why.overridable() && !forced {
+                    "; 'portool prune --forget-unverifiable' drops it if it is never coming back"
+                } else {
+                    ""
+                };
                 eprintln!(
-                    "portool: prune: skipping project {}: listing worktrees failed \
-                     ({err}); its entries were kept",
-                    crate::display::text(key)
+                    "portool: prune: kept {} (block {}-{}), whose directory is missing: {}{hint}",
+                    crate::display::text(path),
+                    block.0,
+                    block.1,
+                    why.describe()
                 );
-                continue;
             }
-        };
-        let project = registry
-            .projects
-            .get_mut(key)
-            .expect("key came from registry.projects.keys()");
-        if reclaim_project_worktrees(project, &live, dry_run) {
-            changed = true;
         }
     }
-
-    for key in projects_to_remove {
-        registry.projects.remove(&key);
-    }
-
     changed
-}
-
-fn reclaim_project_worktrees(project: &mut ProjectEntry, live: &[PathBuf], dry_run: bool) -> bool {
-    let dir_exists = |p: &Path| p.exists();
-    let block_unused = |b: (u16, u16)| ports::block_free(b);
-    let reclaimed = gc::collect(project, live, &dir_exists, &block_unused);
-
-    let verb = if dry_run { "would prune" } else { "pruned" };
-    for (path, block) in &reclaimed {
-        println!(
-            "{verb} {} (block {}-{})",
-            crate::display::text(path),
-            block.0,
-            block.1
-        );
-    }
-    !reclaimed.is_empty()
 }

@@ -5,6 +5,100 @@ All notable changes to portool are documented here. The format is based on
 [Semantic Versioning](https://semver.org/) (pre-1.0: a breaking change bumps
 the minor version).
 
+## [Unreleased]
+
+### Changed
+
+- Allocations of worktrees that are gone are released, for all projects, by
+  the commands that save the ledger (`sync` slow path, `reallocate`,
+  `release` of an existing allocation, `pin`, `unpin`, `reserve`,
+  `unreserve`), not only by `portool prune --all` or by `sync` for the
+  current project. A command path that did not write the ledger before still
+  does not, and a problem in this check is a warning line, never the
+  command's failure -- except, as before, that `sync` and `prune` fail when
+  git cannot list the worktrees of the very project they run in.
+- The rule for "gone" is stricter, and the same in `sync`, `prune`,
+  `prune --all` and the automatic check: the worktree directory must not
+  exist; the nearest existing directory above it must be an ordinary,
+  non-empty directory (not a mount point, not holding mount points, not
+  `/Volumes`, `/mnt`, `/media`, `/net`, `/Network`, `/run/media`,
+  `/run/media/<user>` or directly below one of these);
+  git must no longer list the worktree, or list it as `prunable` and not
+  `locked`; and its ports must be unused. Consequences:
+  - a worktree removed with `rm -rf` is released without `git worktree
+    prune` (git 2.31 or later);
+  - a repository that is gone no longer drops all of its entries: each one
+    needs its own directory gone, so renaming or re-cloning the main clone
+    keeps the allocations of linked worktrees that still exist;
+  - a worktree on a volume that is not mounted, wherever it is mounted, is
+    kept. A worktree removed with `rm -rf` (git still lists it, as
+    `prunable`) whose parent directory is left empty looks the same and is
+    kept until `git worktree prune` or `git worktree remove`; one that git
+    no longer lists at all is released, empty parent or not -- where git
+    lists every checkout of the repository, that is in an ordinary
+    repository without `core.worktree` and in a bare one. The main checkout
+    of a repository made with `--separate-git-dir`, reached through a `.git`
+    file, checked out as a submodule or placed by `core.worktree` is never
+    in `git worktree list`, so in such a repository an unlisted entry below
+    an empty directory or a mount point is kept (it may be that checkout on
+    a volume that is away) until `prune --forget-unverifiable`;
+  - the directory is looked at once more under the ledger lock: a worktree
+    re-created while the check was running keeps its allocation;
+  - a path git lists in another letter case or another Unicode
+    normalisation (git prints NFC on macOS) is not taken for "not listed";
+  - `prune --all` no longer drops entries it cannot verify. The new
+    `prune --forget-unverifiable` does, listing each with the reason it had
+    been kept; `prune` prints the entries it keeps although their directory
+    is missing.
+- Every project, the one the command runs in included, is examined before
+  the ledger lock is taken, with limits: git for a project is killed after
+  2 seconds (10 for `prune`), the whole check gives up after 3 seconds (30
+  for `prune`), and a project that could not be checked is reported once
+  and not asked again for an hour (remembered in `stale-check-failed.json`
+  in the state directory, which is removed when it expires). A project the
+  time simply did not reach, or a problem on this side (no temporary
+  directory), is not remembered. Git is not run at all for a project whose
+  missing worktrees are kept whatever it says (below `/Volumes`, `/mnt`
+  ..., or next to other mounts).
+- `prune` and `prune --all` that could not check something within their
+  limit say what, and exit 1 after doing what they could decide; they no
+  longer look like "nothing to prune".
+- The "is this port unused" probe that guards allocation, in-place growth
+  and release now sees a listener on any address: `0.0.0.0` (published
+  container ports), `::`, `::1` and the host's other addresses, not only
+  `127.0.0.1`. A block something listens on is no longer handed out or
+  released on macOS because the listener was bound to another address. A
+  port whose server has just stopped still reads as free at once, as it did
+  in 0.13 (the connections the kernel keeps for 30 to 60 seconds are told
+  apart from a listener). One exception, on Linux: after a server that did
+  not set `SO_REUSEADDR` itself, the port reads as in use until those
+  connections are gone, up to a minute.
+- **Behaviour change on macOS:** when a manifest grows beyond the
+  worktree's block and the block cannot grow in place, `sync` refuses to
+  move it while anything listens on it. It now also sees a stack published
+  on `0.0.0.0` or `::` (a container's published ports); 0.13 on macOS did
+  not and moved the block under the running stack. `sync` fails with
+  "the manifest now needs N ports but block A-B cannot grow in place, and
+  something is still listening on it (on Linux a port can also read as in
+  use for up to a minute after a server that does not set SO_REUSEADDR has
+  stopped); stop those processes and re-run 'portool sync', or run
+  'portool reallocate' to move this worktree explicitly". Do one of the two: stop the stack and run `portool sync`,
+  or run `portool reallocate` and restart the stack on the new ports. On
+  Linux this was already the behaviour for IPv4 listeners. The
+  opt-in check of a worktree's own block (`exec --check-ports`, `--strict`,
+  `--reallocate-on-conflict`) and `doctor`'s "ports in use" report are
+  unchanged and still look from `127.0.0.1`.
+- `registry.json.corrupt-*` copies are removed 7 days after the repair that
+  made them, at the next ledger save; never by count and never by the
+  command that made them (before: every repair deleted all but the newest
+  copy, which could be the one it had just printed, or the only copy of the
+  other projects' allocations after `--abandon-other-projects`).
+- Temp files of atomic writes are named `.portool-tmp-<pid>-<random>` (they
+  were `.tmpXXXXXX`), and a crash leftover whose owner is dead and that is 10
+  minutes old is removed by the next write to the same directory.
+- The registry file format is unchanged; 0.13.0 and this version read each
+  other's ledgers.
+
 ## [0.13.0] - 2026-11-22
 
 Library callers can select the registry and the config a child process

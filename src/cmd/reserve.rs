@@ -15,8 +15,9 @@ const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 pub fn reserve(spec: &str, label: Option<String>) -> Result<()> {
     let block = parse_block(spec)?;
     let config = Config::load()?;
-    let _lock = lock::acquire(&paths::lock_path()?, LOCK_TIMEOUT)?;
     let registry_path = paths::registry_path()?;
+    let sweep = crate::reclaim::plan(&registry_path, None);
+    let _lock = lock::acquire(&paths::lock_path()?, LOCK_TIMEOUT)?;
     let mut registry =
         store::load_strict(&registry_path)?.unwrap_or_else(|| Registry::empty(config.range));
 
@@ -24,6 +25,7 @@ pub fn reserve(spec: &str, label: Option<String>) -> Result<()> {
         if label.is_some() && label != existing.label {
             existing.label = label;
             registry.validate()?;
+            sweep.apply(&mut registry);
             store::save(&registry_path, &mut registry)?;
             println!(
                 "portool: {}-{} was already reserved; label updated",
@@ -47,6 +49,7 @@ pub fn reserve(spec: &str, label: Option<String>) -> Result<()> {
         pinned: true,
     });
     registry.validate()?;
+    sweep.apply(&mut registry);
     store::save(&registry_path, &mut registry)?;
     println!("portool: reserved {}-{}", block.0, block.1);
     Ok(())
@@ -59,8 +62,9 @@ pub fn unreserve(spec: &str) -> Result<()> {
     // can never containment-match and remove a wider reservation (e.g.
     // "19000-19009"). Only a bare PORT spec (no '-') containment-matches.
     let single_port = !spec.contains('-');
-    let _lock = lock::acquire(&paths::lock_path()?, LOCK_TIMEOUT)?;
     let registry_path = paths::registry_path()?;
+    let sweep = crate::reclaim::plan(&registry_path, None);
+    let _lock = lock::acquire(&paths::lock_path()?, LOCK_TIMEOUT)?;
     let mut registry = store::load_strict(&registry_path)?
         .ok_or_else(|| Error::General("no registry exists; nothing is reserved".to_string()))?;
 
@@ -74,6 +78,7 @@ pub fn unreserve(spec: &str) -> Result<()> {
     match index {
         Some(index) => {
             let removed = registry.reservations.remove(index);
+            sweep.apply(&mut registry);
             store::save(&registry_path, &mut registry)?;
             println!(
                 "portool: unreserved {}-{}",
