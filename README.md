@@ -581,12 +581,23 @@ two worktrees, so an entry is released only when **all** of this holds:
    keeps `/Volumes` on the root device, so only the name identifies it).
    Anything else may be a volume that is only unmounted, and the entry is
    kept. One exception, so that removing the last worktree of a worktrees
-   directory frees its ports: when the repository is alive and git does not
-   list the worktree at all (`git worktree remove`, or a prune, took its
-   registration away -- an unmounted volume alone never does, git then says
-   `prunable`), an *empty* nearest directory or one that is a mount point
-   does not count against it. The named mount directories and a directory
-   holding other mounts still do.
+   directory frees its ports: when the repository is alive, git lists every
+   checkout the repository can have, and this worktree is not among them
+   (`git worktree remove`, or a prune, took its registration away -- an
+   unmounted volume alone never does, git then says `prunable`), an *empty*
+   nearest directory or one that is a mount point does not count against
+   it. A worktree git has forgotten cannot be used again without `git
+   worktree repair`, even if its files come back. The named mount
+   directories and a directory holding other mounts still count.
+
+   Git lists every checkout only in an ordinary repository (`<main>/.git`
+   is a directory, `core.worktree` unset) and in a bare one. The main
+   checkout of a repository made with `git init --separate-git-dir`,
+   reached through a `.git` file, checked out as a submodule, or placed by
+   `core.worktree` never appears in `git worktree list`. In such a
+   repository "not listed" proves nothing, so the exception does not
+   apply: an unlisted entry below an empty directory or a mount point is
+   kept until `prune --forget-unverifiable`.
 3. Git agrees: the worktree is no longer listed by `git worktree list`, or
    is listed as `prunable` (what `rm -rf` of a worktree leaves; needs git
    2.31 or later -- an older git keeps listing it until `git worktree
@@ -594,7 +605,11 @@ two worktrees, so an entry is released only when **all** of this holds:
    there is no git to ask, and rule 2 decides for each entry on its own: a
    repository that was renamed or re-cloned does not release worktrees that
    still exist.
-4. None of its ports is in use.
+4. None of its ports is in use, and its directory is still missing at the
+   moment the ledger is changed.
+
+Git is asked only when its answer could release something: not for an
+entry rule 2 keeps whatever git says.
 
 A project's entry is dropped when its repository is gone and its last
 worktree entry has been released.
@@ -602,9 +617,19 @@ worktree entry has been released.
 `prune` prints each entry it keeps although its directory is missing, with
 the reason, on stderr.
 
+Files and git are examined before the ledger lock is taken, with limits: 10
+seconds for one project's git, 30 seconds in all. What could not be checked
+within them (a filesystem that does not answer, projects not reached in
+time) is named on stderr and `prune` exits 1, after releasing what it
+could decide. A project whose git fails is reported and skipped by
+`--all`; without `--all`, in the project `prune` runs in, it is the
+command's error -- also with `--forget-unverifiable`, which can therefore
+drop the entries of a repository git cannot read only as `prune --all
+--forget-unverifiable`.
+
 | Flag | Effect |
 |---|---|
-| `--all` | Operate across every project instead of just the current one. Other projects are examined before the ledger lock is taken; a project whose git does not answer within 10 seconds is skipped and reported. |
+| `--all` | Operate across every project instead of just the current one. A project whose git fails or does not answer within 10 seconds is skipped and reported. |
 | `--dry-run` | Print what would be reclaimed without touching the ledger. |
 | `--forget-unverifiable` | Also drop entries that fail only rule 2's "verifiably" or rule 3's "git agrees" because nothing can be verified: a volume that will never be mounted again, a repository git can no longer read. The directory must still be missing, the entry unpinned, the worktree not listed as live or locked, and its ports unused. Each dropped entry is printed with the reason it had been kept; combine with `--dry-run` to see the list first. Only this flag does this; nothing automatic ever does. |
 
@@ -715,7 +740,10 @@ is taken (or reserved — see
 outside the ledger is already listening on it), `portool` scans forward,
 wrapping, for the next free and bindable slot. "Bindable" means nothing
 listens on the port on any address: `127.0.0.1`, `0.0.0.0` (a published
-container port), `::` or `::1`. Whether a worktree's *own* block is in use
+container port), `::`, `::1` or another address of the host. A port whose
+server has just stopped is bindable at once (on Linux only if that server
+had set `SO_REUSEADDR`, as most do; otherwise up to a minute later).
+Whether a worktree's *own* block is in use
 is only checked when you opt in at
 [`portool exec`](#portool-exec) time (`--check-ports` / `--strict` /
 `--reallocate-on-conflict`); run `portool reallocate` to move a worktree
@@ -777,8 +805,8 @@ that already write the same place.
 | What | Where | Kept how long / how much | Removed by |
 |---|---|---|---|
 | Ledger `registry.json`, lock `registry.json.lock` | state dir | one each, for as long as the ledger is used (every command reads them) | never; the ledger is the product, the empty lock file is its fixed-size companion |
-| Allocation entries | in the ledger | until the worktree is verifiably gone and its ports are unused -- the four rules under [`portool prune`](#portool-prune); pinned entries are exempt. An entry that can never be verified (its volume never returns, its repository is unreadable) stays until `prune --forget-unverifiable` | the commands that save the ledger, when they save it: `sync` slow path, `reallocate`, `release` of an existing allocation, `pin`, `unpin`, `reserve`, `unreserve` -- for **all** projects; also `prune`. Cost per command: one read of the ledger and one `lstat` per unpinned entry, before the lock is taken; git is asked only for a project with a missing directory, and for another project it is killed after 2 seconds. The whole check gives up after 3 seconds. On a command path that ends without saving the ledger (`release` with no allocation, a `reserve` that changes nothing, an error) the check has still run, but nothing is written: no ledger, and no `stale-check-failed.json` |
-| `stale-check-failed.json` | state dir | exists only while some project could not be checked (git failed or did not answer, its filesystem did not answer): one entry per such project, so that it is not asked again by every command. Each entry counts for 1 hour, then the project is checked (and, on failure, reported) again. Written only by a command that saves the ledger | rewritten or removed by the next ledger-saving command once entries expire; removed by the next ledger save once the file is 1 hour old |
+| Allocation entries | in the ledger | until the worktree is verifiably gone and its ports are unused -- the four rules under [`portool prune`](#portool-prune); pinned entries are exempt. An entry that can never be verified (its volume never returns, its repository is unreadable) stays until `prune --forget-unverifiable`; so does an unlisted entry below an empty directory or a mount point in a repository whose main checkout git never lists (rule 2) | the commands that save the ledger, when they save it: `sync` slow path, `reallocate`, `release` of an existing allocation, `pin`, `unpin`, `reserve`, `unreserve` -- for **all** projects; also `prune`. Cost per command: one read of the ledger and one `lstat` per unpinned entry, before the lock is taken; git is asked only for a project with a missing directory that its answer could release, and is killed after 2 seconds. The whole check gives up after 3 seconds. Under the lock: one more `lstat` and a port probe per entry about to be released. On a command path that ends without saving the ledger (`release` with no allocation, a `reserve` that changes nothing, an error) the check has still run, but nothing is written: no ledger, and no `stale-check-failed.json` |
+| `stale-check-failed.json` | state dir | exists only while some project could not be checked (git failed or did not answer within its 2 seconds, its filesystem did not answer): one entry per such project, so that it is not asked again by every command. A project the 3 seconds merely did not reach is not entered. Each entry counts for 1 hour, then the project is checked (and, on failure, reported) again. Written only by a command that saves the ledger | rewritten or removed by the next ledger-saving command once entries expire; removed by the next ledger save once the file is 1 hour old |
 | `registry.json.bak` | state dir | one; the last saved ledger, read by `doctor --repair` | overwritten by every save |
 | `registry.json.corrupt-<nanos>-<pid>` | state dir | one per `doctor --repair` that set a ledger aside, for 7 days from that repair (so: as many as there were repairs in the last 7 days). Read by a human; after `--abandon-other-projects` it is the only copy of the other projects' allocations, so copies are never removed by count, nor by the command that made them | the first ledger save after the copy is 7 days old |
 | Crash temp files `.portool-tmp-<pid>-*` | next to the file being written: state dir, worktree root (`.env.portool`), hook directories | none in normal operation; after a crash until the next write to the same directory, and only if the owner pid is dead and the file is 10 minutes old | the next write to that directory; the state dir also clears pre-0.14 `.tmpXXXXXX` files (every writer there holds the lock). Pre-0.14 `.tmpXXXXXX` files left in a worktree root are not portool-only names and are never touched |

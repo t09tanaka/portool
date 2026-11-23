@@ -292,9 +292,12 @@ fn slow_path(ctx: &GitCtx, config: &Config, quiet: bool) -> Result<SyncOutcome> 
                     if !ports::block_free(entry.block) {
                         return Err(Error::General(format!(
                             "the manifest now needs {} ports but block {}-{} cannot \
-                             grow in place, and something is still listening on it; \
-                             stop those processes and re-run 'portool sync', or run \
-                             'portool reallocate' to move this worktree explicitly",
+                             grow in place, and something is still listening on it \
+                             (on Linux a port can also read as in use for up to a \
+                             minute after a server that does not set SO_REUSEADDR \
+                             has stopped); stop those processes and re-run \
+                             'portool sync', or run 'portool reallocate' to move \
+                             this worktree explicitly",
                             block_size, entry.block.0, entry.block.1
                         )));
                     }

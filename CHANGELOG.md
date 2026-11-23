@@ -14,8 +14,9 @@ the minor version).
   `release` of an existing allocation, `pin`, `unpin`, `reserve`,
   `unreserve`), not only by `portool prune --all` or by `sync` for the
   current project. A command path that did not write the ledger before still
-  does not, and a problem in this check is one warning line, never the
-  command's failure.
+  does not, and a problem in this check is a warning line, never the
+  command's failure -- except, as before, that `sync` and `prune` fail when
+  git cannot list the worktrees of the very project they run in.
 - The rule for "gone" is stricter, and the same in `sync`, `prune`,
   `prune --all` and the automatic check: the worktree directory must not
   exist; the nearest existing directory above it must be an ordinary,
@@ -33,31 +34,55 @@ the minor version).
     kept. A worktree removed with `rm -rf` (git still lists it, as
     `prunable`) whose parent directory is left empty looks the same and is
     kept until `git worktree prune` or `git worktree remove`; one that git
-    no longer lists at all is released, empty parent or not;
+    no longer lists at all is released, empty parent or not -- where git
+    lists every checkout of the repository, that is in an ordinary
+    repository without `core.worktree` and in a bare one. The main checkout
+    of a repository made with `--separate-git-dir`, reached through a `.git`
+    file, checked out as a submodule or placed by `core.worktree` is never
+    in `git worktree list`, so in such a repository an unlisted entry below
+    an empty directory or a mount point is kept (it may be that checkout on
+    a volume that is away) until `prune --forget-unverifiable`;
+  - the directory is looked at once more under the ledger lock: a worktree
+    re-created while the check was running keeps its allocation;
+  - a path git lists in another letter case or another Unicode
+    normalisation (git prints NFC on macOS) is not taken for "not listed";
   - `prune --all` no longer drops entries it cannot verify. The new
     `prune --forget-unverifiable` does, listing each with the reason it had
     been kept; `prune` prints the entries it keeps although their directory
     is missing.
-- Other projects are examined before the ledger lock is taken, with limits:
-  `git worktree list` for another project is killed after 2 seconds (10 for
-  `prune --all`), the whole check gives up after 3 seconds, and a project
-  that could not be checked is reported once and not asked again for an
-  hour (remembered in `stale-check-failed.json` in the state directory,
-  which is removed when it expires).
+- Every project, the one the command runs in included, is examined before
+  the ledger lock is taken, with limits: git for a project is killed after
+  2 seconds (10 for `prune`), the whole check gives up after 3 seconds (30
+  for `prune`), and a project that could not be checked is reported once
+  and not asked again for an hour (remembered in `stale-check-failed.json`
+  in the state directory, which is removed when it expires). A project the
+  time simply did not reach, or a problem on this side (no temporary
+  directory), is not remembered. Git is not run at all for a project whose
+  missing worktrees are kept whatever it says (below `/Volumes`, `/mnt`
+  ..., or next to other mounts).
+- `prune` and `prune --all` that could not check something within their
+  limit say what, and exit 1 after doing what they could decide; they no
+  longer look like "nothing to prune".
 - The "is this port unused" probe that guards allocation, in-place growth
   and release now sees a listener on any address: `0.0.0.0` (published
-  container ports), `::` and `::1`, not only `127.0.0.1`. A block something
-  listens on is no longer handed out or released on macOS because the
-  listener was bound to another address.
+  container ports), `::`, `::1` and the host's other addresses, not only
+  `127.0.0.1`. A block something listens on is no longer handed out or
+  released on macOS because the listener was bound to another address. A
+  port whose server has just stopped still reads as free at once, as it did
+  in 0.13 (the connections the kernel keeps for 30 to 60 seconds are told
+  apart from a listener). One exception, on Linux: after a server that did
+  not set `SO_REUSEADDR` itself, the port reads as in use until those
+  connections are gone, up to a minute.
 - **Behaviour change on macOS:** when a manifest grows beyond the
   worktree's block and the block cannot grow in place, `sync` refuses to
   move it while anything listens on it. It now also sees a stack published
   on `0.0.0.0` or `::` (a container's published ports); 0.13 on macOS did
   not and moved the block under the running stack. `sync` fails with
   "the manifest now needs N ports but block A-B cannot grow in place, and
-  something is still listening on it; stop those processes and re-run
-  'portool sync', or run 'portool reallocate' to move this worktree
-  explicitly". Do one of the two: stop the stack and run `portool sync`,
+  something is still listening on it (on Linux a port can also read as in
+  use for up to a minute after a server that does not set SO_REUSEADDR has
+  stopped); stop those processes and re-run 'portool sync', or run
+  'portool reallocate' to move this worktree explicitly". Do one of the two: stop the stack and run `portool sync`,
   or run `portool reallocate` and restart the stack on the new ports. On
   Linux this was already the behaviour for IPv4 listeners. The
   opt-in check of a worktree's own block (`exec --check-ports`, `--strict`,

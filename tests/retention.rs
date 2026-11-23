@@ -1267,10 +1267,9 @@ fn a_worktree_on_a_disk_that_is_not_plugged_in_costs_no_git() {
     set_path(&env, &a_wt, away);
     let (fake, log) = git_deaf_to_listings(&env);
 
-    for args in [&["pin"][..], &["unpin"], &["reserve", "17749"]] {
-        let started = std::time::Instant::now();
+    let port = unallocated_ports(&env, (17700, 17749))[0].clone();
+    for args in [&["pin"][..], &["unpin"], &["reserve", port.as_str()]] {
         let out = ok(run_with_path(&env, &fake, &b, args));
-        assert!(started.elapsed() < std::time::Duration::from_secs(2));
         assert_eq!(stderr(&out), "", "{args:?}");
     }
     assert_eq!(

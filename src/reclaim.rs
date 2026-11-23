@@ -630,9 +630,10 @@ pub fn examine(project: &ProjectIn, world: &World, force: bool) -> ProjectOut {
 /// Whether two paths could name the same directory although their bytes
 /// differ: letter case (a case-insensitive filesystem) and the Unicode
 /// normalisation of non-ASCII names (git prints NFC on macOS where the
-/// ledger may hold NFD). Deliberately generous -- components that are both
-/// non-ASCII always match -- because a wrong "same" only keeps an entry,
-/// while a wrong "different" could release a live one.
+/// ledger may hold NFD). Without normalisation tables this errs towards
+/// "same": two non-ASCII components match when the ASCII letters of one
+/// are, in order, among those of the other (NFD turns `é` into `e` plus a
+/// combining mark; it never removes or reorders ASCII letters).
 fn could_be_same(a: &Path, b: &Path) -> bool {
     let mut left = a.components();
     let mut right = b.components();
@@ -640,14 +641,14 @@ fn could_be_same(a: &Path, b: &Path) -> bool {
         match (left.next(), right.next()) {
             (None, None) => return true,
             (Some(x), Some(y)) => {
-                let (x, y) = (
-                    x.as_os_str().to_string_lossy(),
-                    y.as_os_str().to_string_lossy(),
-                );
+                let x = x.as_os_str().to_string_lossy().to_lowercase();
+                let y = y.as_os_str().to_string_lossy().to_lowercase();
                 let same = if x.is_ascii() || y.is_ascii() {
-                    x.to_lowercase() == y.to_lowercase()
+                    x == y
                 } else {
-                    true
+                    let ascii = |s: &str| s.chars().filter(char::is_ascii).collect::<String>();
+                    let (x, y) = (ascii(&x), ascii(&y));
+                    within_in_order(&x, &y) || within_in_order(&y, &x)
                 };
                 if !same {
                     return false;
@@ -658,17 +659,48 @@ fn could_be_same(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// What git's listing says about the worktree at `path`: the exact entry,
-/// else one that [`could_be_same`]. "Not listed" has to be certain, and
-/// even then says nothing about a checkout git never lists.
+/// Whether the characters of `short` appear in `long`, in order.
+fn within_in_order(short: &str, long: &str) -> bool {
+    let mut rest = long.chars();
+    short.chars().all(|c| rest.any(|d| d == c))
+}
+
+/// What git's listing says about the worktree at `path`.
+///
+/// An exact entry decides. Without one, entries that only
+/// [`could_be_same`] make "not listed" uncertain, but they may also be
+/// other worktrees, so their state is not taken over as it stands: the
+/// answer is `Locked` if one of them is locked (a lock must hold), else
+/// `Prunable` -- no objection from git to releasing a directory that is
+/// verifiably gone, and no setting aside of a doubt about it. Even a
+/// certain "not listed" says nothing about a checkout git never lists.
 fn view(listing: &[Listed], path: &str) -> GitView {
-    let same = |w: &&Listed| w.path.as_path() == Path::new(path);
-    let alike = |w: &&Listed| could_be_same(&w.path, Path::new(path));
-    match listing.iter().find(same).or(listing.iter().find(alike)) {
-        None => GitView::MaybeUnlistedMain,
-        Some(w) if w.locked => GitView::Locked,
-        Some(w) if w.prunable => GitView::Prunable,
-        Some(_) => GitView::Live,
+    let state = |w: &Listed| match (w.locked, w.prunable) {
+        (true, _) => GitView::Locked,
+        (false, true) => GitView::Prunable,
+        (false, false) => GitView::Live,
+    };
+    if let Some(exact) = listing.iter().find(|w| w.path.as_path() == Path::new(path)) {
+        return state(exact);
+    }
+    let mut alike = listing
+        .iter()
+        .filter(|w| could_be_same(&w.path, Path::new(path)))
+        .peekable();
+    if alike.peek().is_none() {
+        return GitView::MaybeUnlistedMain;
+    }
+    // Letter case alone is not in doubt: that is the same directory.
+    let lower = path.to_lowercase();
+    if let Some(same) = listing
+        .iter()
+        .find(|w| w.path.to_string_lossy().to_lowercase() == lower)
+    {
+        return state(same);
+    }
+    match alike.any(|w| w.locked) {
+        true => GitView::Locked,
+        false => GitView::Prunable,
     }
 }
 
@@ -2187,10 +2219,43 @@ mod tests {
         let nfc = "/w/caf\u{e9}/wt";
         assert_eq!(view(&[listed(nfc, true, false)], nfd), GitView::Prunable);
         assert_eq!(view(&[listed(nfc, false, true)], nfd), GitView::Locked);
-        assert_eq!(view(&[listed(nfd, false, false)], nfc), GitView::Live);
+        // Possibly the same, possibly a sibling: never "not listed" (which
+        // could set a doubt aside), never "live" either (which would hold
+        // a verifiably gone sibling for ever).
+        assert_eq!(view(&[listed(nfd, false, false)], nfc), GitView::Prunable);
         // An exact match wins over a merely possible one.
         let both = [listed(nfc, false, true), listed(nfd, true, false)];
         assert_eq!(view(&both, nfd), GitView::Prunable);
+        let both = [listed(nfd, false, false), listed(nfc, false, true)];
+        assert_eq!(view(&both, nfd), GitView::Live);
+        // Siblings whose ASCII letters differ are different worktrees.
+        let a = "/w/\u{6a5f}\u{80fd}A";
+        let b = "/w/\u{6a5f}\u{80fd}B";
+        assert_eq!(
+            view(&[listed(b, false, false)], a),
+            GitView::MaybeUnlistedMain
+        );
+        // Without any ASCII letter nothing tells them apart: the gone one
+        // is still released on verified absence, though a live sibling is
+        // listed, and is kept while its surroundings are in doubt.
+        let (x, y) = ("/w/\u{6a5f}\u{80fd}", "/w/\u{8a2d}\u{5b9a}");
+        let seen = view(&[listed(y, false, false)], x);
+        assert_eq!(seen, GitView::Prunable);
+        assert_eq!(
+            judge(false, Presence::Gone, seen, false),
+            Verdict::Release { forced: None }
+        );
+        assert_eq!(
+            judge(
+                false,
+                Presence::Unverifiable(Doubt::EmptyDirectory),
+                seen,
+                false
+            ),
+            Verdict::Keep(Why::Doubt(Doubt::EmptyDirectory))
+        );
+        assert!(within_in_order("caf", "cafe") && !within_in_order("cafe", "caf"));
+        assert!(within_in_order("", "x") && !within_in_order("ab", "ba"));
         // Different ASCII components, or a different depth, are different.
         assert_eq!(
             view(&[listed("/w/caf\u{e9}/other", false, false)], nfd),
